@@ -1,0 +1,99 @@
+import hashlib,json,struct,tempfile,unittest
+from pathlib import Path
+from unittest.mock import patch
+from native_first_person import NearPass,Discovery,DefinitionCache,surface_key,discovery_matches
+from live_probe import ROOT,SceneReadChanged
+from test_pose_frame import header
+
+
+class NearPassLaneTests(unittest.TestCase):
+    def test_cached_rebinding_checks_real_converted_surface_and_never_substitutes_a_different_mesh(self):
+        def check(lane,r,base):
+            surface=dict(asset='geometry-content',texture='textures/owned.png',alpha_mode='opaque',shading=dict(lit=True,fog=True,sky=False,emissive=[0,0,0]))
+            lane.rows[0]['reuse']=surface_key(surface);cache=DefinitionCache(r);cache.ingest(lane.definition,'epoch')
+            r.read=lambda p,n:header((3,0))[:n]
+            graph=dict(shapes=[dict(id='0x20000',model='0x3',skin='0x0',parents=[0x70000],texture='owned.dds')])
+            with patch('game_assets.Assets')as assets,patch('native_attributes.discover',return_value=None),patch('material_values.discover',return_value=None),patch('native_materials.discover',return_value=None):
+                assets.return_value.out=__import__('native_first_person').ROOT/'local/assets';assets.return_value.meshes={};assets.return_value.mesh.return_value=surface
+                rebound=cache.prepare(graph,lane.definition,base);self.assertIsNotNone(rebound);self.assertTrue(rebound.rebound)
+                self.assertEqual(rebound.rows[0]['asset'],'mesh');self.assertEqual(rebound.rows[0]['parents'],[0x70000,0x20000])
+                assets.return_value.mesh.return_value={**surface,'asset':'different-native-geometry'}
+                self.assertIsNone(cache.prepare(graph,lane.definition,base))
+                assets.return_value.mesh.return_value={**surface,'shading':{**surface['shading'],'lit':False}}
+                self.assertIsNone(cache.prepare(graph,lane.definition,base))
+                cache.ingest({**lane.definition,'rows':[]},'new-epoch');self.assertFalse(cache.entries)
+        self.run_fixture(check)
+
+    def test_first_person_readiness_waits_for_real_topology_but_third_person_still_refreshes(self):
+        from geometry_stream import weapon_signature
+        base=dict(first_person_active=True,view_revision='actual-nodes',player=dict(weapon_ready=False,magic_ready=False))
+        before=weapon_signature(base);base['player']['weapon_ready']=True;self.assertEqual(weapon_signature(base),before)
+        base['view_revision']='new-nodes';self.assertNotEqual(weapon_signature(base),before)
+        base['first_person_active']=False;before=weapon_signature(base);base['player']['weapon_ready']=False;self.assertNotEqual(weapon_signature(base),before)
+
+    def test_real_near_graph_changes_request_discovery_even_with_unchanged_weapon_readiness(self):
+        r=self.memory();r.u32=lambda p:0x60000
+        with patch('scene_reader.SceneReader')as scene:
+            d=Discovery(r);shape=dict(id='0x20000',model='0x3',skin='0x0',parents=[0x70000],alpha_mode='opaque')
+            d.scene.collect.return_value=dict(shapes=[shape]);base=dict(world='0x10000',player_ref='0x50000')
+            definition=dict(item_root='0x70000',rows=[dict(ptr=0x20000,identity=[3,0])])
+            self.assertIsNone(d.poll(base,definition));d.last=0
+            d.scene.collect.return_value=dict(shapes=[shape,dict(shape,id='0x21000')])
+            signature=d.poll(base,definition);self.assertEqual(len(signature),64);d.last=0
+            self.assertIsNone(d.poll(base,definition));d.last=0;r.items=False
+            self.assertIsNone(d.poll(base,definition))
+            d.last=0;r.items=True;self.assertEqual(d.poll(base,definition),signature,'Reused native addresses after sheathing must be discoverable again')
+
+    def test_discovery_requests_cannot_cross_sessions_epochs_processes_or_freshness(self):
+        good=dict(protocol='uemw.view.discovery',version=1,pid=42,session='session',scene_epoch='epoch',signature='a'*64,unix_ns=1_000_000_000)
+        self.assertTrue(discovery_matches(good,42,'session','epoch',1_100_000_000))
+        for change in(dict(pid=43),dict(session='other'),dict(scene_epoch='other'),dict(signature='../x'),dict(unix_ns=0),dict(unix_ns=2_000_000_000),dict(version=2)):
+            self.assertFalse(discovery_matches({**good,**change},42,'session','epoch',1_100_000_000))
+
+    def layout(self,folder):
+        data=json.dumps(dict(protocol='uemw.view.layout',version=1,catalog='owned-catalog',root='0x60000',item_root='0x70000',
+            rows=[dict(id='weapon',asset='mesh',ptr=0x20000,identity=[3,0],parents=[])],node_identities={'131072':[0,0]},switches=[],shape_gates=[[]])).encode()
+        name='view-'+hashlib.sha256(data).hexdigest()+'.json';(folder/'local/assets').mkdir(parents=True);(folder/'local/assets'/name).write_bytes(data)
+        return NearPass(name)
+
+    def memory(self):
+        class Memory:
+            def __init__(self):
+                self.shape=header((3,0));self.mode=True;self.items=True;self.item='0x70000';self.unstable=False;self.reads=0
+                self.camera=bytearray(0x128);struct.pack_into('<13f',self.camera,0x40,1,0,0,0,1,0,0,0,1,0,0,0,1)
+                struct.pack_into('<3f',self.camera,0xdc,0,1,0);struct.pack_into('<3f',self.camera,0xe8,0,0,1);struct.pack_into('<6f',self.camera,0x100,-1,1,1,-1,1,1000)
+            def player_render_state(self,w):return dict(reference='0x50000',first_person=self.mode,items_active=self.items,item_root=self.item)
+            def u32(self,p):return {0x10158:0x60000,0x10160:0x40000}[p]
+            def capture_many(self,plan):
+                self.reads+=1;shape=bytearray(self.shape)
+                if self.unstable:struct.pack_into('<f',shape,0x64,self.reads)
+                return {0x20000:bytes(shape),0x40000:bytes(self.camera)}
+        return Memory()
+
+    def run_fixture(self,check):
+        scratch=ROOT/'local/test-temp';scratch.mkdir(parents=True,exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch)as tmp,patch('native_first_person.time.sleep'):
+            with patch('native_first_person.ROOT',Path(tmp)):
+                check(self.layout(Path(tmp)),self.memory(),dict(world='0x10000',player_ref='0x50000'))
+
+    def test_independent_capture_needs_no_world_pose_and_keeps_actual_native_transform(self):
+        def check(lane,r,base):
+            value=lane.capture(r,base);self.assertEqual(r.reads,2);self.assertTrue(value['states'][0]['visible']);self.assertEqual(value['states'][0]['transform'][-1],1)
+            self.assertEqual(value['catalog'],'owned-catalog');self.assertEqual(value['camera']['position'],(0,0,0))
+        self.run_fixture(check)
+
+    def test_unstable_bones_are_never_published_as_a_partial_weapon(self):
+        def check(lane,r,base):
+            r.unstable=True
+            with self.assertRaisesRegex(SceneReadChanged,'still updating'):lane.capture(r,base)
+            self.assertEqual(r.reads,4)
+        self.run_fixture(check)
+
+    def test_native_pass_and_item_readiness_hide_immediately_but_replaced_meshes_fail_closed(self):
+        def check(lane,r,base):
+            r.items=False;self.assertFalse(lane.capture(r,base)['states'][0]['visible'])
+            r.items=True;r.mode=False;self.assertFalse(lane.capture(r,base)['states'][0]['visible'])
+            r.mode=True;r.item='0x80000'
+            with self.assertRaisesRegex(SceneReadChanged,'equipment'):lane.capture(r,base)
+            r.item='0x70000';r.shape=header((9,0));self.assertFalse(lane.capture(r,base)['states'][0]['visible'])
+        self.run_fixture(check)

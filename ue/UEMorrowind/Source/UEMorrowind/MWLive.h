@@ -1,0 +1,367 @@
+#pragma once
+#include "CoreMinimal.h"
+#include "GameFramework/Actor.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/HUD.h"
+#include "MWMaterials.h"
+#include "MWFrame.h"
+#include "MWRain.h"
+#include "MWLive.generated.h"
+
+class UCameraComponent;
+class UStaticMeshComponent;
+class UPrimitiveComponent;
+class UStaticMesh;
+class UInstancedStaticMeshComponent;
+class UMWNativeSkinComponent;
+class UProceduralMeshComponent;
+class UMaterial;
+class UMaterialInterface;
+class UMaterialInstanceDynamic;
+class UTexture2D;
+class UTexture2DArray;
+class USceneCaptureComponent2D;
+class UTextureRenderTarget2D;
+class FJsonObject;
+struct FMWFrameReader;
+struct FMWCameraReader;
+struct FMWCameraSample;
+struct FMWGeometryState;
+struct FMWCatalogLoader;
+class FMWBackgroundView;
+class UDirectionalLightComponent;
+class UMWNativeSkyComponent;
+struct FMWPresentationSamples;
+class ULightComponent;
+struct FMWEnvironmentState;
+
+struct FMWMeshData {
+    TArray<FVector> Vertices;
+    TArray<FVector> Normals;
+    TArray<FVector2D> UVs;
+    TArray<FLinearColor> Colors;
+    TArray<int32> Triangles;
+    FString Texture;
+    FString TextureFrameGroup;
+    FString MaterialValueGroup;
+    TArray<FString> TextureFrames;
+    TArray<FVector2D> SkinUVs;
+    TArray<FVector4f> SkinWeights;
+    int32 SkinBones=0;
+    bool Lit=true,Fog=true,Sky=false,Background=false,Water=false,Rain=false,BlendNativeOpacity=true;
+    bool NativeVertices=false,NativeColors=false,NativeUVs=false;
+    FLinearColor Emissive=FLinearColor::Black;
+    float Roughness=.82f,Specular=.3f,Metallic=0,DetailStrength=0,RoughnessVariation=0;
+    bool Masked=false,Foliage=false,Terrain=false,FirstPerson=false;
+    int32 Character=0;
+    int32 EffectKind=0;
+    int32 CelestialKind=0;
+    float SoftDistance=0;
+    bool NativeParticle=false,Glass=false,BlendFiltered=false,Transparent=false;
+    TArray<FString> NativeLightSet;
+    bool HaveNativeLightSet=false,NativeSunActive=true;
+};
+struct FMWBinding {FString Id,Asset,Cell;};
+struct FMWRigidSlot {FString Asset;int32 Id;};
+struct FMWVertexPose {TArray<float> Points,Colors,UVs;};
+struct FMWResourceJob {
+    uint8 Kind=0; // shared mesh, rigid batch, skin instance, CPU instance, retired instance
+    FString Key,Id,Asset;
+    FVector4f Bound=FVector4f(0,0,0,1);
+};
+
+UCLASS()
+class AMWLive : public AActor {
+    GENERATED_BODY()
+public:
+    AMWLive();
+    virtual ~AMWLive() override;
+    virtual void BeginPlay() override;
+    virtual void EndPlay(const EEndPlayReason::Type Reason) override;
+    virtual void Tick(float Delta) override;
+    TSharedPtr<FMWPresentationSamples,ESPMode::ThreadSafe> PresentationSamples;
+    // Definition/instance selection changes only when their native identities
+    // change. Live poses, texture indices and material values are never cached.
+    TSet<FString> ViewAssets,FrameAssets,ValueAssets;
+    TMap<FString,FString> ViewInstances,FrameInstances,ValueInstances;
+    FString RenderSelectionCatalog;
+    int32 RenderSelectionMeshes=-1,RenderSelectionInstances=-1;
+    bool RenderSelectionDirty=true;
+    bool TargetedRenderUpdates=true; // full-scan diagnostic is opt-in only
+    bool RainInterpolationEnabled=true;
+    TMap<FString,FMWRainPose> RainPoses;
+    void UpdateRainInterpolation();
+    void EnsureRenderSelection();
+    bool CanReflectPrimitive(UPrimitiveComponent* Component,const FString& Asset) const;
+    UPROPERTY() UCameraComponent* Camera;
+    UPROPERTY() TMap<FString,UStaticMeshComponent*> Markers;
+    UPROPERTY() TMap<FString,UProceduralMeshComponent*> GeometryComponents;
+    UPROPERTY() TMap<FString,UStaticMesh*> SharedMeshes;
+    UPROPERTY() TMap<FString,UInstancedStaticMeshComponent*> RigidBatches;
+    UPROPERTY() TMap<FString,UMWNativeSkinComponent*> SkinnedComponents;
+    UPROPERTY() TMap<FString,UMaterialInstanceDynamic*> SkinMaterials;
+    UPROPERTY() TMap<FString,UTexture2D*> WeightTextures;
+    UPROPERTY() TMap<FString,UTexture2D*> PaletteTextures;
+    UPROPERTY() TMap<FString,UMaterialInterface*> SkinBaseMaterials;
+    UPROPERTY() UTexture2D* EnvironmentTexture=nullptr;
+    UPROPERTY() UMaterialInstanceDynamic* WaterFogMaterial=nullptr;
+    int32 WaterFogMode=1; // 0 bypass, 1 native fog, 2 opt-in depth diagnostic
+    bool WaterAtmosphereEnabled=true;
+    bool CharacterFidelityEnabled=true;
+    bool EffectFidelityEnabled=true;
+    UPROPERTY() USceneCaptureComponent2D* WaterReflectionCapture=nullptr;
+    UPROPERTY() UTextureRenderTarget2D* WaterReflectionTarget=nullptr;
+    bool WaterReflectionEnabled=true,WaterReflectionActive=false,NativeReflectionHasWater=false;
+    double NativeReflectionHeight=0,LastWaterReflection=0;
+    uint64 WaterReflectionRequests=0;
+    int32 WaterReflectionComponents=0;
+    FString WaterReflectionEpoch;
+    FLinearColor NativeReflectionSky=FLinearColor::Black;
+    UPROPERTY() UDirectionalLightComponent* NativeSun=nullptr;
+    UPROPERTY() UMWNativeSkyComponent* NativeAmbientSky=nullptr;
+    UPROPERTY() UMWNativeSkyComponent* NativeOutdoorSky=nullptr;
+    UPROPERTY() UMWNativeSkyComponent* NativeInteriorSky=nullptr;
+    bool AmbientProbeActive=false;
+    bool OutdoorLightingEnabled=true,OutdoorAmbientActive=false;
+    bool SurfaceReflectionsEnabled=true,SurfaceReflectionsApplied=false;
+    int32 OutdoorLightingApplied=-1;
+    void UpdateOutdoorLighting();
+    bool InteriorLightingEnabled=true,InteriorProbeActive=false;
+    bool AmbientProbeEnabled=true;
+    bool LightingFidelityEnabled=true,StableLightingEnabled=true;
+    bool NativeShadowMapsEnabled=true;
+    void SetNativeShadowMaps(bool Enabled);
+    bool ExteriorFidelityEnabled=true,ExteriorFogEnabled=true;
+    bool ExteriorFidelityActive() const;
+    void SetExteriorFidelity(bool Enabled);
+    void SetExteriorFog(bool Enabled);
+    UPROPERTY() TMap<FString,UMaterialInstanceDynamic*> NativeLightFunctions;
+    UPROPERTY() UMaterialInterface* NativeAttenuationMaterial=nullptr;
+    void SetLightingFidelity(bool Enabled);
+    void SetStableLighting(bool Enabled);
+    void ApplyNativeLightSet(UMaterialInstanceDynamic* Material,const FMWMeshData& Mesh) const;
+    int32 NativeLightSetInterior=-1;
+    int32 NativeLightSetExterior=-1;
+    bool BackgroundGeometryVisible=true; // explicit opt-in visual diagnostic
+    UPROPERTY() TArray<ULightComponent*> NativeLights;
+    TArray<FString> NativeLightIds,NativeShadowIds;
+    FString LightingEpoch;
+    uint64 ShadowSelectionChanges=0;
+    bool LightingSceneVisible=false,LightingReady=false;
+    int32 ActiveNativeLights=0,ShadowedNativeLights=0;
+    TSet<FString> VisibleInstances;
+    int32 InstanceCount() const;
+    UPROPERTY() TMap<FString,UMaterialInstanceDynamic*> GeometryMaterials;
+    UPROPERTY() TMap<FString,UTexture2D*> GeometryTextures;
+    UPROPERTY() TMap<FString,UTexture2D*> MaskedTextures;
+    UPROPERTY() TMap<FString,UTexture2D*> BlendTextures;
+    UPROPERTY() TMap<FString,UTexture2D*> DetailTextures;
+    TSet<FString> UpgradedTextureKeys;
+    FString TextureUpgradeStatus=TEXT("originals");
+    double PeakTextureWorkMs=0,PeakTextureUploadMs=0;
+    int32 TextureUpgradeFallbacks=0,TextureUpgradeBudgetSkipped=0;
+    int64 TextureUpgradeReservedBytes=0;
+    UPROPERTY() UTexture2DArray* TerrainColorPool=nullptr;
+    UPROPERTY() UTexture2DArray* TerrainDetailPool=nullptr;
+    UPROPERTY() UTexture2D* TerrainTileMap=nullptr;
+    UPROPERTY() UTexture2D* TerrainFinishes=nullptr;
+    UPROPERTY() UTexture2DArray* PendingTerrainColorPool=nullptr;
+    UPROPERTY() UTexture2DArray* PendingTerrainDetailPool=nullptr;
+    FString TerrainSignature,TerrainPoolSignature;
+    FVector4f TerrainLayout=FVector4f(0,0,0,0);
+    bool TerrainBlendEnabled=true;
+    int32 TerrainLayers=0,TerrainTiles=0;
+    int64 TerrainPoolBytes=0;
+    FString TerrainStatus=TEXT("original tile fallback");
+    double PeakTerrainUploadMs=0;
+    void BindTerrainMaterial(UMaterialInstanceDynamic* Material) const;
+    void SetTerrainBlend(bool Enabled);
+    UPROPERTY() UMaterialInterface* GeometryBaseMaterial=nullptr;
+    UPROPERTY() UMaterialInterface* GeometryMaskedMaterial=nullptr;
+    UPROPERTY() UMaterialInterface* GeometryTranslucentMaterial=nullptr;
+    UPROPERTY() TMap<FString,UMaterialInterface*> GeometryBaseMaterials;
+    bool GeometryActive=false;
+    bool NativeUnderwater=false;
+    FString Status=TEXT("WAITING FOR ORIGINAL MORROWIND");
+    FString Session, Cell;
+    FString FocusName;
+    FString InputHint=TEXT("Keep the original Morrowind window focused");
+    int32 ObjectCount=0;
+    int64 Sequence=-1;
+    uint32 SourcePid=0;
+    double ReadMs=0;
+    bool HavePlayerStats=false;
+    bool NativeMenuOpen=true;
+    bool GameplayHudVisible() const;
+    FVector2D Health,Magicka,Fatigue;
+private:
+    friend class FMWRainInterpolationTest;
+    friend class FMWRenderSelectionTest;
+    friend class FMWOutdoorMaterialTest;
+    friend class FMWLightingTest;
+    friend class FMWTerrainBlendTest;
+    friend class FMWCatalogProgressTest;
+    friend class FMWNativeMaterialTest;
+    friend class FMWMaterialValueTest;
+    friend class FMWVertexAttributeTest;
+    friend class FMWResourceProgressTest;
+    friend class FMWRigidReuseTest;
+    friend class FMWStreamingTest;
+    friend class FMWWitnessTest;
+    friend class FMWNativePoseReuseTest;
+    friend class FMWCameraLaneTest;
+    friend class FMWCatalogTest;
+    FString DataRoot;
+    FString SnapshotPath;
+    FString AssetsPath, Catalog, SceneEpoch;
+    FName GeometryTextureParameter;
+    TMap<FString,FMWMeshData> MeshData;
+    TArray<FMWBinding> GeometryBindings;
+    TMap<FString,FString> InstanceAssets;
+    TMap<FString,FString> InstanceCells;
+    FString ActiveCellKey;
+    TMap<FString,TArray<double>> LastRigidTransforms;
+    TMap<FString,FMWRigidSlot> RigidSlots;
+    TMap<FString,TMap<int32,FTransform>> RigidRows;
+    TSet<FString> DirtyRigidAssets;
+    int32 NextRigidId=0,PerfRigidSubmissions=0,PerfRigidProxyCreations=0;
+    TSet<TWeakObjectPtr<UPrimitiveComponent>> NativeHiddenPrimitives;
+    TSet<FString> RigidVisible;
+    FString ReconciledCatalog;
+    TArray<FMWResourceJob> ResourceJobs;
+    TSet<FString> QueuedResources;
+    TMap<FString,FString> ResourceBindings;
+    int32 ResourceJobIndex=0,PerfResourceBuilds=0;
+    FString ResourceCatalog,ResourceError;
+    FString RequestedCatalog;
+    bool GeometryPartial=false;
+    int32 PendingGeometryInstances=0,PerfPendingGeometryMax=0;
+    TArray<double> PerfResourceMs;
+    bool EnsureGeometryResources(const TArray<FMWGeometryState>& States,const TBitArray<>* Unchanged=nullptr);
+    void QueueGeometryResource(uint8 Kind,const FString& Id,const FString& Asset,const FVector4f& Bound);
+    TSet<FString> ViewCachedAssets;
+    TArray<FMWGeometryState> AppliedNativeStates;
+    FString AppliedNativeCatalog;
+    bool NativePoseValid=false;
+    bool NativePoseReuseEnabled=true; // headless comparisons can exercise the original full-walk path
+    int32 PerfNativeStateReused=0,PerfNativeStateChanged=0;
+    bool GeometryResourceReady(const FMWBinding& Binding,const FMWGeometryState& State) const;
+    bool CatalogStaging() const;
+    void HideInstance(const FString& Id);
+    void AdvanceGeometryResources(double Budget=.003,int32 MaxJobs=64);
+    void PrepareResourceIdentity(const FString& Id,const FString& Asset);
+    void RemoveRigid(const FString& Id);
+    void HideRigid(const FString& Id);
+    void FlushRigidBatches();
+    void SetPrimitiveShown(UPrimitiveComponent* Component,bool Shown);
+    void ClearPrimitiveFilters();
+    FMWFrameReader* FrameReader=nullptr;
+    FMWCameraReader* CameraReader=nullptr;
+    FMWCatalogLoader* CatalogLoader=nullptr;
+    bool GeometryLoading=false;
+    TMap<FString,int32> CurrentMaterialFrames,AppliedMaterialFrames;
+    TMap<FString,FMWMaterialValue> CurrentMaterialValues,AppliedMaterialValues;
+    TMap<FString,TArray<float>> UploadedBonePalettes;
+    TMap<FString,FMWVertexPose> UploadedVertexPoses;
+    int32 PerfBonePoseUpdates=0,PerfTextureFrameUpdates=0,PerfMaterialValueUpdates=0,PerfVertexPoseUpdates=0;
+    bool ApplyMaterialFrames(const TMap<FString,int32>& Frames);
+    bool ApplyMaterialValues(const TMap<FString,FMWMaterialValue>& Values);
+    double LastDiagnostic=0;
+    double LastHealthLog=0;
+    int32 HealthFrames=0;
+    double HealthMaxDelta=0;
+    // Actor ticks and accepted native states; neither measures displayed frames.
+    TArray<double> PerfAgeMs,PerfPollMs,PerfApplyMs,PerfDecodeMs,PerfStageMs,PerfTickMs,PerfCameraAgeMs,PerfPartialAgeMs,PerfPartialApplyMs;
+    TArray<double> PerfFrameIntervalMs,PerfGPUFrameMs;
+    TArray<double> PerfManifestReadMs,PerfManifestJsonMs,PerfBodyReadMs,PerfBodyHashMs,PerfBodyDecodeMs,PerfDecodeOtherMs;
+    TArray<double> PerfChannelReadMs;
+    int32 PerfPolls=0,PerfBodies=0,PerfRepeats=0;
+    int32 PerfCameraSamples=0,PerfCameraChanges=0;
+    FString CameraSession,CameraEpoch;
+    int64 CameraSequence=-1;
+    double LastCameraStamp=0;
+    bool ViewPoseCameraValid=false;
+    double ViewPoseStamp=0;
+    FString ViewLaneCatalog;
+    double ViewLaneStamp=0,ViewLaneReadMs=0;
+    int32 ViewLaneUpdates=0;
+    TSet<FString> ViewLaneIds;
+    TMap<FString,FString> ViewLaneAssets;
+    FVector BackgroundPoseOrigin=FVector::ZeroVector;
+    bool BackgroundPoseValid=false;
+    FTransform ViewPoseCamera;
+    TMap<FString,FVector4f> ViewPoseBounds;
+    int32 ViewCorrectedMaterials=0;
+    int32 BackgroundAnchoredMaterials=0;
+    FTransform ViewCorrection=FTransform::Identity;
+    void UpdateViewCorrection();
+    void ApplyCameraLane();
+    void ApplyFirstPersonLane(const FMWCameraSample& Sample,double Now);
+    bool InstanceSubmitted(const FString& Id) const;
+    double LightingCpuMs=0;
+    TMap<FString,double> GeometryCpuMs;
+    bool ApplyNativeCamera(const FVector& Position,const FVector& Forward,const FVector& Up,double Fov,double Stamp);
+    void RecordPoseApplication(double Stamp,double ApplyStarted);
+    FString AcceptedSnapshotText;
+    double AcceptedSnapshotStamp=0;
+    double SourcePacketStamp=0;
+    double CaptureStarted=0,LastRecordCapture=0;
+    int32 RecordSeconds=0,RecordFrame=0;
+    FString CaptureFolder;
+    bool PresentationConfigured=false;
+    bool DiagnosticScreenshots=false;
+    TSharedPtr<FMWBackgroundView,ESPMode::ThreadSafe> BackgroundView;
+    bool Overlay=false;
+    bool ManagedPresentation=false;
+    double LastPresentationState=0;
+    int32 PresentationAlpha=-1;
+    void* VisualWindow=nullptr;
+    void* OriginalWindow=nullptr;
+    void ConfigurePresentation();
+    void UpdatePresentation(const TSharedPtr<FJsonObject>& Packet);
+    void PublishPresentationState();
+    void PublishStateWitness();
+    TSharedPtr<FJsonObject> BuildStateWitness(const TArray<FString>& Ids,double Now) const;
+    FString LastWitnessRequest;
+    double LastWitnessPoll=0;
+    void HideScene();
+    void ShowScene();
+    void RejectGeometry();
+    void ResetScene();
+    bool UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native=nullptr,const TMap<FString,int32>* MaterialFrames=nullptr,const TMap<FString,FMWMaterialValue>* MaterialValues=nullptr,const TArray<FMWBinding>* IncomingBindings=nullptr);
+    bool LoadCatalog(const FString& Name);
+    void CreateGeometryMaterial();
+    void SetVisualReference(bool Reference);
+    void ApplyVisualParameters(UMaterialInstanceDynamic* Material) const;
+    bool FoliageFidelityEnabled=true;
+    void SetFoliageFidelity(bool Enabled);
+    bool CelestialFidelityEnabled=true,CelestialShaftsActive=false;
+    float CelestialSunPeak=0;
+    TArray<FString> CelestialSunIds;
+    void SetCelestialFidelity(bool Enabled);
+    void UpdateCelestialShafts();
+    void SetWaterAtmosphere(bool Enabled);
+    void SetCharacterFidelity(bool Enabled);
+    void SetEffectFidelity(bool Enabled);
+    void UpdateWaterReflection();
+    void InvalidateWaterReflection();
+    void SetWaterReflectionActive(bool Active);
+    bool VisualReference=false;
+    void UpdateNativeLighting(const FMWEnvironmentState& Environment);
+    void SetLightingVisible(bool Visible);
+};
+
+UCLASS()
+class AMWHud : public AHUD {
+    GENERATED_BODY()
+public:
+    virtual void DrawHUD() override;
+};
+
+UCLASS()
+class AMWGameMode : public AGameModeBase {
+    GENERATED_BODY()
+public:
+    AMWGameMode();
+    virtual void BeginPlay() override;
+};

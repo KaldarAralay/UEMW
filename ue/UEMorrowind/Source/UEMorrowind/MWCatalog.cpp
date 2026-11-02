@@ -1,0 +1,289 @@
+#include "MWCatalog.h"
+#include "MWCelestial.h"
+#include "MWLighting.h"
+#include "MWTransparency.h"
+#include "MWSkin.h"
+#include "MWTexture.h"
+#include "ImageUtils.h"
+#include "Misc/FileHelper.h"
+#include "HAL/FileManager.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+static bool ReadCatalogText(const FString& Path,FString& Text) {
+    const int64 Size=IFileManager::Get().FileSize(*Path);
+    return Size>0 && Size<=8*1024*1024 && FFileHelper::LoadFileToString(Text,*Path);
+}
+static bool TextField(const TSharedPtr<FJsonObject>& Obj,const TCHAR* Key,int32 Max=512) {
+    FString Value;return Obj->TryGetStringField(Key,Value) && Value.Len()<=Max;
+}
+bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FString& AssetsPath,TArray<FMWBinding>& Out) {
+    if(!Name.StartsWith(TEXT("catalog-")) || !Name.EndsWith(TEXT(".json")) || Name.Len()>64 || Name.Contains(TEXT("/")) || Name.Contains(TEXT("\\")) || Name.Contains(TEXT(":")) || Name.Contains(TEXT("..")) || Digest.Len()!=32)return false;
+    for(TCHAR C:Digest)if(!FChar::IsHexDigit(C))return false;
+    FString Text,Actual,Format;double Version=0;TSharedPtr<FJsonObject> Root;
+    if(!MWReadSnapshot(AssetsPath/Name,Text,8*1024*1024,&Actual) || !Actual.Equals(Digest,ESearchCase::IgnoreCase) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text),Root) || !Root.IsValid() ||
+        !Root->TryGetStringField(TEXT("format"),Format) || Format!=TEXT("uemw.assets") || !Root->TryGetNumberField(TEXT("version"),Version) || Version!=1)return false;
+    const TArray<TSharedPtr<FJsonValue>>* Rows=nullptr;const TSharedPtr<FJsonObject>* Definitions=nullptr;
+    if(!Root->TryGetArrayField(TEXT("bindings"),Rows) || Rows->Num()>16384 || !Root->TryGetObjectField(TEXT("meshes"),Definitions) || !Definitions->IsValid() || (*Definitions)->Values.Num()>8192)return false;
+    TArray<FMWBinding> Result;TSet<FString> Ids;
+    for(const auto& Value:*Rows) {
+        const TSharedPtr<FJsonObject>* Row=nullptr;FMWBinding B;
+        if(!Value->TryGetObject(Row) || !Row->IsValid() || !(*Row)->TryGetStringField(TEXT("id"),B.Id) || B.Id.IsEmpty() || B.Id.Len()>64 ||
+            !(*Row)->TryGetStringField(TEXT("asset"),B.Asset) || B.Asset.IsEmpty() || B.Asset.Len()>160 || !(*Definitions)->HasField(B.Asset) || Ids.Contains(B.Id))return false;
+        if((*Row)->HasField(TEXT("cell_key")) && (!(*Row)->TryGetStringField(TEXT("cell_key"),B.Cell) || B.Cell.Len()>64))return false;
+        Ids.Add(B.Id);Result.Add(MoveTemp(B));
+    }
+    Out=MoveTemp(Result);return true;
+}
+bool MWRemapRetainedGeometry(const TArray<FMWBinding>& Bindings,const TArray<FMWGeometryState>& Incoming,const TArray<FMWBinding>& Retained,TArray<FMWGeometryState>& Out,int32& Missing) {
+    if(Bindings.Num()!=Incoming.Num() || Bindings.Num()>16384 || Retained.Num()>16384)return false;
+    TMap<FString,int32> Index;int32 Pending=0;
+    for(int32 I=0;I<Bindings.Num();++I){if(Index.Contains(Bindings[I].Id))return false;Index.Add(Bindings[I].Id,I);Pending+=Incoming[I].Visible?1:0;}
+    TArray<FMWGeometryState> Result;Result.SetNum(Retained.Num());
+    for(int32 I=0;I<Retained.Num();++I)if(const int32* J=Index.Find(Retained[I].Id))if(Retained[I].Asset==Bindings[*J].Asset){Result[I]=Incoming[*J];Pending-=Incoming[*J].Visible?1:0;}
+    Out=MoveTemp(Result);Missing=Pending;return true;
+}
+TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder,FMWTextureUpgradePtr Upgrades,const FString& KnownTerrain,const FString& KnownTerrainPool) {
+    auto Result=MakeShared<FMWCatalogData,ESPMode::ThreadSafe>();
+    Result->UpgradeIndex=Upgrades.IsValid()?Upgrades:MWReadTextureUpgradeIndex(UpgradeFolder);
+    if(!Name.StartsWith(TEXT("catalog-")) || !Name.EndsWith(TEXT(".json")) || Name.Len()>64 || Name.Contains(TEXT("/")) || Name.Contains(TEXT("\\"))) return nullptr;
+    FString Text;
+    if(!ReadCatalogText(AssetsPath/Name,Text)) return nullptr;
+    TSharedPtr<FJsonObject> Root;
+    FString Format;double Version=0;const TSharedPtr<FJsonObject>* Definitions=nullptr;
+    if(!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text),Root) || !Root.IsValid() ||
+       !Root->TryGetStringField(TEXT("format"),Format) || Format!=TEXT("uemw.assets") ||
+       !Root->TryGetNumberField(TEXT("version"),Version) || Version!=1 ||
+       !Root->TryGetObjectField(TEXT("meshes"),Definitions) || !Definitions->IsValid() || (*Definitions)->Values.Num()>8192)return nullptr;
+    TArray<FMWBinding> NewBindings;
+    TSet<FString> CellKeys;
+    const TArray<TSharedPtr<FJsonValue>>* Cells=nullptr;
+    if(Root->HasField(TEXT("cells"))) {
+        if(!Root->TryGetArrayField(TEXT("cells"),Cells) || Cells->Num()>9)return nullptr;
+        for(const auto& Value:*Cells) {
+            const TSharedPtr<FJsonObject>* Item=nullptr;const TArray<TSharedPtr<FJsonValue>>* Grid=nullptr;FString Key;
+            if(!Value->TryGetObject(Item) || !Item->IsValid() || !(*Item)->TryGetStringField(TEXT("key"),Key) ||
+               !(*Item)->TryGetArrayField(TEXT("grid"),Grid) || Grid->Num()!=2)return nullptr;
+            double X,Y;if(!(*Grid)[0]->TryGetNumber(X) || !(*Grid)[1]->TryGetNumber(Y) || !FMath::IsFinite(X) || !FMath::IsFinite(Y) ||
+                FMath::Abs(X)>32768 || FMath::Abs(Y)>32768 || X!=(int32)X || Y!=(int32)Y ||
+                Key!=FString::Printf(TEXT("exterior:%d,%d"),(int32)X,(int32)Y) || CellKeys.Contains(Key))return nullptr;
+            CellKeys.Add(Key);
+        }
+    } else {CellKeys.Add(TEXT("exterior:-2,-9"));CellKeys.Add(TEXT("exterior:-2,-8"));}
+    const TArray<TSharedPtr<FJsonValue>>* Bindings=nullptr;
+    if(Root->TryGetArrayField(TEXT("bindings"),Bindings)) {
+        if(Bindings->Num()>16384)return nullptr;
+        TSet<FString> Ids;
+        for(const auto& Value:*Bindings) {
+            const TSharedPtr<FJsonObject>* Item=nullptr;FMWBinding Binding;
+            if(!Value->TryGetObject(Item) || !Item->IsValid() || !TextField(*Item,TEXT("id"),64) || !TextField(*Item,TEXT("asset"),160))return nullptr;
+            Binding.Id=(*Item)->GetStringField(TEXT("id"));Binding.Asset=(*Item)->GetStringField(TEXT("asset"));
+            if(Ids.Contains(Binding.Id) || !(*Definitions)->HasField(Binding.Asset))return nullptr;Ids.Add(Binding.Id);
+            if((*Item)->HasField(TEXT("cell_key"))) {
+                if(!(*Item)->TryGetStringField(TEXT("cell_key"),Binding.Cell) || !CellKeys.Contains(Binding.Cell))return nullptr;
+            }
+            NewBindings.Add(MoveTemp(Binding));
+        }
+    }
+    TSet<FString> WantedAssets,WantedTextures;
+    TArray<FMWTerrainTile> TerrainTiles;
+    TMap<FString,TArray<FString>> AnimationGroups;
+    for(const auto& Definition:(*Definitions)->Values) {
+        WantedAssets.Add(Definition.Key);
+        const TSharedPtr<FJsonObject>* Item=nullptr;FString File,TextureName,AlphaMode=TEXT("opaque");
+        if(!Definition.Value->TryGetObject(Item) || !Item->IsValid() ||
+           !(*Item)->TryGetStringField(TEXT("file"),File) || !(*Item)->TryGetStringField(TEXT("texture"),TextureName))return nullptr;
+        if((*Item)->HasField(TEXT("alpha_mode")) && (!(*Item)->TryGetStringField(TEXT("alpha_mode"),AlphaMode) || (AlphaMode!=TEXT("opaque") && AlphaMode!=TEXT("masked") && AlphaMode!=TEXT("translucent") && AlphaMode!=TEXT("additive") && AlphaMode!=TEXT("premultiplied") && AlphaMode!=TEXT("modulate"))))return nullptr;
+        bool BlendNativeOpacity=true;
+        if((*Item)->HasField(TEXT("blend_native_opacity")) && (!(*Item)->HasTypedField<EJson::Boolean>(TEXT("blend_native_opacity")) || !(*Item)->TryGetBoolField(TEXT("blend_native_opacity"),BlendNativeOpacity)))return nullptr;
+        if(!File.StartsWith(TEXT("meshes/")) || !File.EndsWith(TEXT(".umesh")) || File.Contains(TEXT("..")) || File.Contains(TEXT(":")) || File.Contains(TEXT("\\"))) return nullptr;
+        if(!TextureName.IsEmpty() && (!TextureName.StartsWith(TEXT("textures/")) || !TextureName.EndsWith(TEXT(".png")) || TextureName.Contains(TEXT("..")) || TextureName.Contains(TEXT(":")) || TextureName.Contains(TEXT("\\"))))return nullptr;
+        if(!TextureName.IsEmpty())WantedTextures.Add(TextureName);
+        FString FrameGroup,ValueGroup;TArray<FString> FrameTextures;
+        bool NativeVertices=false,NativeColors=false,NativeUVs=false;
+        if((*Item)->HasField(TEXT("dynamic_attributes"))) {
+            const TSharedPtr<FJsonObject>* Attributes=nullptr;
+            if(!(*Item)->TryGetObjectField(TEXT("dynamic_attributes"),Attributes) || !Attributes->IsValid() ||
+               !(*Attributes)->TryGetBoolField(TEXT("positions"),NativeVertices) || !NativeVertices || !(*Attributes)->TryGetBoolField(TEXT("colors"),NativeColors))return nullptr;
+            if((*Attributes)->HasField(TEXT("uvs")) && !(*Attributes)->TryGetBoolField(TEXT("uvs"),NativeUVs))return nullptr;
+        }
+        if((*Item)->HasField(TEXT("material_state")) && (!(*Item)->TryGetStringField(TEXT("material_state"),ValueGroup) || ValueGroup.IsEmpty() || ValueGroup.Len()>96))return nullptr;
+        if((*Item)->HasField(TEXT("texture_animation"))) {
+            const TSharedPtr<FJsonObject>* Animation=nullptr;const TArray<TSharedPtr<FJsonValue>>* Frames=nullptr;
+            if(!(*Item)->TryGetObjectField(TEXT("texture_animation"),Animation) || !Animation->IsValid() ||
+                !(*Animation)->TryGetStringField(TEXT("id"),FrameGroup) || FrameGroup.IsEmpty() || FrameGroup.Len()>96 ||
+                !(*Animation)->TryGetArrayField(TEXT("frames"),Frames) || !Frames->Num() || Frames->Num()>256)return nullptr;
+            for(const auto& Value:*Frames) {
+                FString Path;
+                if(!Value->TryGetString(Path) || !Path.StartsWith(TEXT("textures/")) || !Path.EndsWith(TEXT(".png")) || Path.Len()>512 ||
+                    Path.Contains(TEXT("..")) || Path.Contains(TEXT(":")) || Path.Contains(TEXT("\\")))return nullptr;
+                FrameTextures.Add(Path);WantedTextures.Add(Path);
+            }
+            if(FrameTextures[0]!=TextureName)return nullptr;
+            if(auto* Previous=AnimationGroups.Find(FrameGroup)){if(*Previous!=FrameTextures)return nullptr;}
+            else AnimationGroups.Add(FrameGroup,FrameTextures);
+        }
+        FString SourceTexture;FMWFinish Finish;
+        if((*Item)->TryGetStringField(TEXT("source_texture"),SourceTexture))Finish=MWArtworkFinish(SourceTexture);
+        bool Terrain=false;
+        if((*Item)->HasField(TEXT("terrain_tile"))) {
+            const TArray<TSharedPtr<FJsonValue>>* Tile=nullptr;double X=0,Y=0;
+            if(TextureName.IsEmpty() || AlphaMode!=TEXT("opaque") || !FrameGroup.IsEmpty() || !(*Item)->TryGetArrayField(TEXT("terrain_tile"),Tile) || Tile->Num()!=2 ||
+               !(*Tile)[0]->TryGetNumber(X) || !(*Tile)[1]->TryGetNumber(Y) || FMath::Abs(X)>1048576 || FMath::Abs(Y)>1048576 || X!=FMath::FloorToDouble(X) || Y!=FMath::FloorToDouble(Y))return nullptr;
+            Terrain=true;TerrainTiles.Add({FIntPoint((int32)X,(int32)Y),TextureName,SourceTexture});
+        }
+        const TSharedPtr<FJsonObject>* SurfaceShading=nullptr;
+        bool SolidLit=true,Excluded=false,Particle=false,FirstPerson=false;
+        if((*Item)->TryGetObjectField(TEXT("shading"),SurfaceShading)) {
+            (*SurfaceShading)->TryGetBoolField(TEXT("lit"),SolidLit);
+            if((*SurfaceShading)->HasField(TEXT("native_particle")) && !(*SurfaceShading)->TryGetBoolField(TEXT("native_particle"),Particle))return nullptr;
+            (*SurfaceShading)->TryGetBoolField(TEXT("first_person"),FirstPerson);
+            for(const TCHAR* Flag:{TEXT("sky"),TEXT("background"),TEXT("water")}){bool V=false;(*SurfaceShading)->TryGetBoolField(Flag,V);Excluded|=V;}
+        }
+        // Named static vegetation is a deliberate cutout rendering interpretation.
+        // Other native transparency and all animated effects retain their path.
+        const bool Foliage=Finish.Foliage && SolidLit && !Excluded && !Particle && !FirstPerson && FrameGroup.IsEmpty() && (AlphaMode==TEXT("masked") || AlphaMode==TEXT("translucent"));
+        const bool Hair=Finish.Character==2 && SolidLit && !Excluded && FrameGroup.IsEmpty() && (AlphaMode==TEXT("masked") || AlphaMode==TEXT("translucent"));
+        if(Foliage || Hair)AlphaMode=TEXT("masked");
+        const auto Transparent=MWTransparentFinish(SourceTexture,AlphaMode,Particle,FirstPerson,Excluded);
+        const bool FilterBlend=!Excluded && BlendNativeOpacity && (AlphaMode==TEXT("translucent") || AlphaMode==TEXT("additive"));
+        const bool Detail=SolidLit && !Excluded && FrameGroup.IsEmpty() && Finish.DetailStrength>0 && (AlphaMode==TEXT("opaque") || AlphaMode==TEXT("masked"));
+        if(!TextureName.IsEmpty()) {
+            if(AlphaMode==TEXT("masked")){Result->WantedMaskedTextures.Add(TextureName);for(const auto& Frame:FrameTextures)Result->WantedMaskedTextures.Add(Frame);}
+            if(Detail)Result->WantedDetailTextures.Add(TextureName);
+            if(FilterBlend){Result->WantedBlendTextures.Add(TextureName);for(const auto& Frame:FrameTextures)Result->WantedBlendTextures.Add(Frame);}
+        }
+        Result->AlphaModes.Add(Definition.Key,AlphaMode);
+        if(KnownMeshes.Contains(Definition.Key))continue;
+        if(Cancelled)return nullptr;
+        TArray<uint8> Bytes;
+        const int64 MeshBytes=IFileManager::Get().FileSize(*(AssetsPath/File));
+        if(MeshBytes<12 || MeshBytes>8*1024*1024)return nullptr;
+        if(!FFileHelper::LoadFileToArray(Bytes,*(AssetsPath/File)) || Bytes.Num()<12 || Bytes.Num()>8*1024*1024)return nullptr;
+        const bool HasNormals=FMemory::Memcmp(Bytes.GetData(),"UEM3",4)==0;
+        const bool HasColors=HasNormals || FMemory::Memcmp(Bytes.GetData(),"UEM2",4)==0;
+        if(!HasColors && FMemory::Memcmp(Bytes.GetData(),"UEM1",4)!=0)return nullptr;
+        uint32 Count,IndexCount;
+        FMemory::Memcpy(&Count,Bytes.GetData()+4,4);
+        FMemory::Memcpy(&IndexCount,Bytes.GetData()+8,4);
+        const int32 Stride=HasNormals?36:HasColors?24:20;
+        if(Count==0 || Count>65535 || IndexCount==0 || IndexCount>65535*3 || IndexCount%3 || Bytes.Num()!=12+(int64)Count*Stride+(int64)IndexCount*2) return nullptr;
+        FMWMeshData Data;
+        Data.Terrain=Terrain;
+        Data.Roughness=Finish.Roughness;Data.Specular=Finish.Specular;Data.Metallic=Finish.Metallic;
+        Data.DetailStrength=Detail?Finish.DetailStrength:0;Data.RoughnessVariation=Detail?Finish.RoughnessVariation:0;
+        Data.Masked=AlphaMode==TEXT("masked");Data.Foliage=Foliage;
+        Data.Character=!Excluded && SolidLit?Finish.Character:0;
+        Data.NativeParticle=Particle;Data.EffectKind=Transparent.Kind;Data.SoftDistance=Transparent.SoftDistance;
+        Data.Glass=Transparent.Glass && SolidLit;Data.BlendFiltered=FilterBlend;
+        Data.Transparent=!Excluded && (AlphaMode==TEXT("translucent") || AlphaMode==TEXT("additive") || AlphaMode==TEXT("premultiplied") || AlphaMode==TEXT("modulate"));
+        Data.BlendNativeOpacity=BlendNativeOpacity;
+        Data.TextureFrameGroup=FrameGroup;Data.TextureFrames=MoveTemp(FrameTextures);
+        Data.MaterialValueGroup=ValueGroup;
+        Data.NativeVertices=NativeVertices;Data.NativeColors=NativeColors;Data.NativeUVs=NativeUVs;
+        Data.Vertices.SetNumUninitialized(Count);
+        if(HasNormals)Data.Normals.SetNumUninitialized(Count);
+        Data.UVs.SetNumUninitialized(Count);
+        Data.Colors.SetNumUninitialized(Count);
+        Data.Triangles.SetNumUninitialized(IndexCount);
+        for(uint32 i=0;i<Count;++i) {
+            float P[3],UV[2];
+            FMemory::Memcpy(P,Bytes.GetData()+12+i*12,12);
+            FMemory::Memcpy(UV,Bytes.GetData()+12+Count*(HasNormals?24:12)+i*8,8);
+            for(float V:P)if(!FMath::IsFinite(V) || FMath::Abs(V)>1e8)return nullptr;
+            for(float V:UV)if(!FMath::IsFinite(V))return nullptr;
+            Data.Vertices[i]=FVector(P[0],P[1],P[2]);
+            if(HasNormals) {
+                float N[3];FMemory::Memcpy(N,Bytes.GetData()+12+Count*12+i*12,12);
+                for(float V:N)if(!FMath::IsFinite(V) || FMath::Abs(V)>1e8)return nullptr;
+                Data.Normals[i]=FVector(N[0],N[1],N[2]);
+            }
+            Data.UVs[i]=FVector2D(UV[0],UV[1]);
+            if(HasColors) {
+                const uint8* C=Bytes.GetData()+12+Count*(HasNormals?32:20)+i*4;
+                Data.Colors[i]=FLinearColor(C[0]/255.f,C[1]/255.f,C[2]/255.f,C[3]/255.f);
+            } else Data.Colors[i]=FLinearColor::White;
+        }
+        for(uint32 i=0;i<IndexCount;i+=3) {
+            uint16 Indices[3];
+            FMemory::Memcpy(Indices,Bytes.GetData()+12+Count*Stride+i*2,6);
+            if(Indices[0]>=Count || Indices[1]>=Count || Indices[2]>=Count) return nullptr;
+            Data.Triangles[i]=Indices[0];Data.Triangles[i+1]=Indices[2];Data.Triangles[i+2]=Indices[1];
+        }
+        Data.Texture=TextureName;
+        const TSharedPtr<FJsonObject>* Shading=nullptr;
+        if((*Item)->TryGetObjectField(TEXT("shading"),Shading)) {
+            const TArray<TSharedPtr<FJsonValue>>* Emission=nullptr;
+            if(!(*Shading)->TryGetBoolField(TEXT("lit"),Data.Lit) || !(*Shading)->TryGetBoolField(TEXT("fog"),Data.Fog) || !(*Shading)->TryGetBoolField(TEXT("sky"),Data.Sky) ||
+                !(*Shading)->TryGetArrayField(TEXT("emissive"),Emission) || Emission->Num()!=3)return nullptr;
+            float E[3];for(int32 i=0;i<3;++i){double V;if(!(*Emission)[i]->TryGetNumber(V) || !FMath::IsFinite(V) || FMath::Abs(V)>32)return nullptr;E[i]=V;}
+            Data.Emissive=FLinearColor(E[0],E[1],E[2],1);
+            if((*Shading)->HasField(TEXT("background")) && !(*Shading)->TryGetBoolField(TEXT("background"),Data.Background))return nullptr;
+            if((*Shading)->HasField(TEXT("water")) && !(*Shading)->TryGetBoolField(TEXT("water"),Data.Water))return nullptr;
+            if((*Shading)->HasField(TEXT("first_person")) && !(*Shading)->TryGetBoolField(TEXT("first_person"),Data.FirstPerson))return nullptr;
+            if((*Shading)->HasField(TEXT("rain")) && !(*Shading)->TryGetBoolField(TEXT("rain"),Data.Rain))return nullptr;
+            if((*Shading)->HasField(TEXT("native_lights"))) {
+                const TArray<TSharedPtr<FJsonValue>>* Lights=nullptr;
+                if(!(*Shading)->TryGetArrayField(TEXT("native_lights"),Lights) || Lights->Num()>128 || !(*Shading)->TryGetBoolField(TEXT("native_sun"),Data.NativeSunActive))return nullptr;
+                for(const auto& L:*Lights){FString Id;if(!L->TryGetString(Id) || !Id.StartsWith(TEXT("0x")) || Id.Len()>10 || Data.NativeLightSet.Contains(Id))return nullptr;Data.NativeLightSet.Add(Id);}
+                Data.HaveNativeLightSet=true;
+            }
+        }
+        Data.CelestialKind=MWCelestialKind(SourceTexture,Data.Background,Data.Sky);
+        FString SkinFile;
+        if((*Item)->TryGetStringField(TEXT("skin_file"),SkinFile)) {
+            double Bones=0;
+            if(!SkinFile.StartsWith(TEXT("meshes/")) || !SkinFile.EndsWith(TEXT(".uskin")) || SkinFile.Contains(TEXT("..")) || SkinFile.Contains(TEXT(":")) || SkinFile.Contains(TEXT("\\")) ||
+                !MWLoadSkin(AssetsPath/SkinFile,Data) || !(*Item)->TryGetNumberField(TEXT("skin_bones"),Bones) || Bones!=Data.SkinBones)return nullptr;
+        }
+        if(!Data.Texture.IsEmpty())WantedTextures.Add(Data.Texture);
+        if(!Data.Texture.IsEmpty() && (!Data.Texture.StartsWith(TEXT("textures/")) || !Data.Texture.EndsWith(TEXT(".png")) || Data.Texture.Contains(TEXT("..")) || Data.Texture.Contains(TEXT(":")) || Data.Texture.Contains(TEXT("\\")))) return nullptr;
+        Result->Meshes.Add(Definition.Key,MoveTemp(Data));
+    }
+
+    if(WantedTextures.Num()>4096)return nullptr;
+    Result->TerrainSignature=MWTerrainSignature(TerrainTiles);Result->TerrainChanged=Result->TerrainSignature!=KnownTerrain;
+    if(Result->TerrainChanged && TerrainTiles.Num())Result->Terrain=MWBuildTerrain(TerrainTiles,AssetsPath,*Result->UpgradeIndex,Cancelled,KnownTerrainPool);
+    const double TextureBegan=FPlatformTime::Seconds();
+    const auto SelectedUpgrades=MWChooseTextureUpgrades(*Result->UpgradeIndex,WantedTextures,KnownTextures,Result->UpgradeReservedBytes);
+    for(const auto& Key:WantedTextures)if(Result->UpgradeIndex->Entries.Contains(Key) && !SelectedUpgrades.Contains(Key))++Result->UpgradeBudgetSkipped;
+    int64 DecodedBytes=0;
+    for(const FString& Texture:WantedTextures) {
+        const bool NeedColor=!KnownTextures.Contains(Texture),NeedMask=Result->WantedMaskedTextures.Contains(Texture) && !KnownTextures.Contains(Texture+TEXT("|masked")),NeedDetail=Result->WantedDetailTextures.Contains(Texture) && !KnownTextures.Contains(Texture+TEXT("|detail"));
+        const bool KnownUpgrade=KnownTextures.Contains(Texture+TEXT("|hd"));
+        if(KnownUpgrade)Result->UpgradedTextures.Add(Texture);
+        const bool NeedBlend=Result->WantedBlendTextures.Contains(Texture) && !KnownTextures.Contains(Texture+TEXT("|blend"));
+        if(!NeedColor && !NeedMask && !NeedDetail && !NeedBlend)continue;
+        if(Cancelled)return nullptr;
+        TArray<uint8> Bytes;FImage Image;
+        const FString Path=AssetsPath/Texture;const int64 Size=IFileManager::Get().FileSize(*Path);
+        if(Size<24 || Size>64*1024*1024 || !FFileHelper::LoadFileToArray(Bytes,*Path))return nullptr;
+        // The converter emits PNG. Bound IHDR before allocating decoded pixels.
+        const auto* P=Bytes.GetData();
+        const uint32 Width=((uint32)P[16]<<24)|((uint32)P[17]<<16)|((uint32)P[18]<<8)|P[19];
+        const uint32 Height=((uint32)P[20]<<24)|((uint32)P[21]<<16)|((uint32)P[22]<<8)|P[23];
+        if(FMemory::Memcmp(P,"\x89PNG\r\n\x1a\n",8) || !Width || !Height || Width>8192 || Height>8192 || (uint64)Width*Height>16*1024*1024)return nullptr;
+        if(!FImageUtils::DecompressImage(Bytes.GetData(),Bytes.Num(),Image) || Image.SizeX!=Width || Image.SizeY!=Height || Image.NumSlices!=1)return nullptr;
+        Image.GammaSpace=EGammaSpace::sRGB; // Installed PNG colour always remains albedo.
+        FImage DetailSource;if(NeedDetail)Image.CopyTo(DetailSource,ERawImageFormat::BGRA8,EGammaSpace::sRGB);
+        if((NeedColor || KnownUpgrade) && SelectedUpgrades.Contains(Texture)) {
+            FImage Enhanced;
+            const auto& Upgrade=Result->UpgradeIndex->Entries[Texture];
+            int32 DW=Upgrade.Width,DH=Upgrade.Height;while(FMath::Max(DW,DH)>512){DW=FMath::Max(1,DW/2);DH=FMath::Max(1,DH/2);}
+            const int64 Cost=MWTextureMipBytes(Upgrade.Width,Upgrade.Height)+(NeedDetail?MWTextureMipBytes(DW,DH):0);
+            if(DecodedBytes+Cost<=512ll*1024*1024 && MWTryTextureUpgrade(*Result->UpgradeIndex,Texture,Bytes,Image,Enhanced)) {Image=MoveTemp(Enhanced);Result->UpgradedTextures.Add(Texture);}
+            else ++Result->UpgradeFallbacks;
+        }
+        FMWTextureImages Images;
+        if(!MWBuildTextureMips(Image,Images.Color,&Cancelled))return nullptr;
+        if(NeedMask && !MWBuildTextureMips(Image,Images.Masked,&Cancelled,MWMaskCutoff))return nullptr;
+        if(NeedBlend && !MWBuildTextureMips(Image,Images.Blend,&Cancelled,-1,true))return nullptr;
+        if(NeedDetail){TArray<FImage> OriginalMips;if(!MWBuildTextureMips(DetailSource,OriginalMips,&Cancelled) || !MWBuildSurfaceDetail(OriginalMips,Images.Detail,&Cancelled))return nullptr;}
+        if(!NeedColor)Images.Color.Empty();
+        for(const auto* Chain:{&Images.Color,&Images.Masked,&Images.Detail,&Images.Blend})for(const auto& Mip:*Chain)DecodedBytes+=Mip.RawData.Num();
+        if(DecodedBytes>512*1024*1024)return nullptr;
+        Result->Images.Add(Texture,MoveTemp(Images));
+    }
+    Result->Bindings=MoveTemp(NewBindings);Result->WantedAssets=MoveTemp(WantedAssets);Result->WantedTextures=MoveTemp(WantedTextures);
+    Result->TextureWorkMs=(FPlatformTime::Seconds()-TextureBegan)*1000;
+    return Result;
+}
