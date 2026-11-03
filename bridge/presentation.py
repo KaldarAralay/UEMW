@@ -180,6 +180,13 @@ def frame_ready(source, render, game_pid, renderer_pid, now):
     except (KeyError, TypeError, ValueError):
         return False, False
 
+def recovery_identity(source,render,ui,game_pid,renderer_pid,now):
+    """Only a complete current scene and its matching native UI can recover."""
+    if(frame_ready(source,render,game_pid,renderer_pid,now)!=(True,True)or
+       not ui_ready(render,source,ui,now)or render.get('partial_geometry')is not False or
+       render.get('pending_native_instances')!=0):return None
+    return(game_pid,renderer_pid,source['session'],source['scene_epoch'],tuple(ui['active_menus']))
+
 def poll_json(path,previous,errors,key):
     try:return read_json(path)
     except BlockingIOError as failure:
@@ -258,7 +265,8 @@ def run(args):
                     minimized=not valid_game or bool(U.IsIconic(game)), ui_known=error is None,
                     native_ui=ui.get('native_ui', True), source_live=source_live, renderer_live=render_live,
                     ui_mirrored=mirrored,ui_transition=holding,native_loading=loading)
-                visible,reason=latch.apply(generation,mode,visible,reason)
+                identity=recovery_identity(source,render,ui,args.pid,args.renderer,now)if error is None and not loading else None
+                visible,reason=latch.apply(generation,mode,visible,reason,now=time.monotonic(),ready_key=identity)
                 # Reset transparency cache on all exceptional paths below.
                 if mode != last_mode:
                     previous_style = U.GetWindowLongPtrW(window, -20)
@@ -296,6 +304,7 @@ def run(args):
                         'source_live': bool(source_live), 'renderer_live': bool(render_live),
                         'ui': ui, 'error': error, 'input_events_sent': 0,
                         'ui_mirrored':mirrored,'native_ui_regions':regions,
+                        'fallback_cause':latch.cause,'recovery_count':latch.recoveries,
                         'file_errors': file_errors,
                         'source_state': {k:source.get(k)for k in ('status','session','sequence','sample_unix_ns','scene_epoch','pid')},
                         'renderer_state': render,
@@ -307,6 +316,7 @@ def run(args):
                         last_event = tick
                     last_log = tick; last_reason = (mode, reason)
             except (OSError, ValueError) as failure:
+                latch.interrupt()
                 if window and U.IsWindow(window) and owner(window) == args.renderer:
                     set_visible(window,False)
                 last_apply = None

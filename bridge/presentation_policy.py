@@ -1,4 +1,5 @@
 """Pure visibility policy. Input is never forwarded or synthesized here."""
+import math
 
 def separate_rect(game,work,aspect,preferred=(768,576)):
     """Fit a view into free desktop space without covering native UI."""
@@ -57,18 +58,32 @@ def window_style(previous,separate):
 
 
 class OverlayLatch:
-    """A failed live overlay stays uncovered until an explicit launch/rearm.
+    """Uncover faults immediately, recover only after verified stable readiness.
 
-    Native menus and ordinary focus changes still uncover/recover normally.
-    A freshness fault after presentation began must never cause oscillation.
+    The caller supplies a current ownership/epoch/UI identity after its full
+    freshness checks. An old pose, unsupported menu or isolated good poll cannot
+    re-cover the original. Calls without that evidence retain manual rearming.
     """
-    def __init__(self):self.generation=None;self.shown=False;self.fault=False
-    def apply(self,generation,mode,visible,reason):
+    def __init__(self):
+        self.generation=None;self.shown=False;self.fault=False;self.cause=None
+        self.candidate=None;self.since=None;self.last_good=None;self.recoveries=0
+    def interrupt(self):self.candidate=self.since=self.last_good=None
+    def apply(self,generation,mode,visible,reason,*,now=None,ready_key=None):
         if generation!=self.generation:
-            self.generation=generation;self.shown=False;self.fault=False
+            self.generation=generation;self.shown=False;self.fault=False;self.cause=None;self.interrupt()
         if mode!='overlay':return visible,reason
         if self.shown and reason in ('source_unavailable','renderer_unavailable','ui_unavailable','native_ui'):
+            if not self.fault:self.cause=reason
             self.fault=True
-        if self.fault:return False,'fallback_latched_restart_overlay'
+        if self.fault:
+            clock=type(now)in(int,float)and math.isfinite(now)
+            if not(clock and visible and ready_key is not None and reason in('ue_play_view','ue_native_ui')):
+                self.interrupt()
+                return False,'fallback_waiting_for_fresh_state'if clock else 'fallback_latched_restart_overlay'
+            if self.candidate!=ready_key or self.last_good is None or not 0<=now-self.last_good<=.25:
+                self.candidate=ready_key;self.since=now
+            self.last_good=now
+            if now-self.since<.5:return False,'recovering_overlay'
+            self.fault=False;self.cause=None;self.recoveries+=1;self.interrupt()
         if visible:self.shown=True
         return visible,reason

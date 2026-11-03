@@ -3,10 +3,52 @@ import struct
 import unittest
 from native_ui import inspect_ui
 from presentation_policy import decide,OverlayLatch,separate_rect,separate_desktop_rect,preferred_size
-from presentation import frame_ready,poll_json
+from presentation import frame_ready,poll_json,recovery_identity
 from unittest.mock import patch
 
 class OverlayRecoveryTests(unittest.TestCase):
+    def current(self,now,epoch='after-travel',menus=()):
+        s=dict(protocol='uemw.live',version=5,state_metadata_version=1,pid=42,status='live',geometry_version=6,sample_unix_ns=now*1e9,session='same',scene_epoch=epoch)
+        r=dict(version=1,live=True,pid=42,renderer_pid=84,session='same',scene_epoch=epoch,unix_ns=now*1e9,partial_geometry=False,pending_native_instances=0,ui_ready=True,ui_sample_unix_ns=now*1e9,ui_native_menu=bool(menus),ui_menus=list(menus))
+        return s,r,dict(native_ui=bool(menus),active_menus=list(menus))
+    def test_travel_recovery_waits_for_matching_complete_fresh_scene_and_ui(self):
+        latch=OverlayLatch();latch.apply('launch','overlay',True,'ue_play_view')
+        latch.apply('launch','overlay',False,'source_unavailable',now=10)
+        for t in(11,11.15,11.3,11.45,11.6):
+            s,r,u=self.current(t);key=recovery_identity(s,r,u,42,84,t)
+            result=latch.apply('launch','overlay',True,'ue_play_view',now=t,ready_key=key)
+            self.assertEqual(result[0],t==11.6)
+        self.assertEqual(latch.recoveries,1)
+        # An interior departure and a same-epoch rest/menu failure recover on
+        # the same controller without an explicit launcher generation change.
+        for start,epoch,menus in((20,'interior',()),(30,'interior',('MenuRest',))):
+            latch.apply('launch','overlay',False,'ui_unavailable',now=start)
+            for dt in(0,.15,.3,.45,.6):
+                t=start+1+dt;s,r,u=self.current(t,epoch,menus)
+                visible,_=latch.apply('launch','overlay',True,'ue_native_ui'if menus else'ue_play_view',now=t,ready_key=recovery_identity(s,r,u,42,84,t))
+                self.assertEqual(visible,dt==.6)
+        self.assertEqual(latch.recoveries,3)
+    def test_bad_or_partial_state_cannot_authorize_recovery(self):
+        s,r,u=self.current(10)
+        for bad in(dict(scene_epoch='old'),dict(session='other'),dict(pid=43),dict(renderer_pid=85),dict(unix_ns=9e9),dict(ui_sample_unix_ns=9e9),dict(ui_menus=['MenuDialog']),dict(partial_geometry=True),dict(pending_native_instances=1)):
+            with self.subTest(bad=bad):self.assertIsNone(recovery_identity(s,{**r,**bad},u,42,84,10.1))
+        self.assertIsNone(recovery_identity({**s,'sample_unix_ns':9e9},r,u,42,84,10.1))
+    def test_repeated_faults_epoch_changes_and_poll_gaps_reset_stability(self):
+        latch=OverlayLatch();latch.apply('x','overlay',True,'ue_play_view');latch.apply('x','overlay',False,'renderer_unavailable',now=1)
+        for i in range(12):
+            t=2+i*.15;key=('epoch',i//2)
+            self.assertFalse(latch.apply('x','overlay',True,'ue_play_view',now=t,ready_key=key)[0])
+        latch.interrupt()
+        self.assertFalse(latch.apply('x','overlay',True,'ue_play_view',now=5,ready_key=('e',))[0])
+        self.assertFalse(latch.apply('x','overlay',True,'ue_play_view',now=6,ready_key=('e',))[0])
+        for t in(6.15,6.3,6.45):self.assertFalse(latch.apply('x','overlay',True,'ue_play_view',now=t,ready_key=('e',))[0])
+        self.assertTrue(latch.apply('x','overlay',True,'ue_play_view',now=6.6,ready_key=('e',))[0])
+    def test_resource_hold_and_unsupported_ui_do_not_count_as_good_polls(self):
+        latch=OverlayLatch();latch.apply('x','overlay',True,'ue_play_view');latch.apply('x','overlay',False,'native_ui',now=1)
+        for t in(2,2.2,2.4,2.6):
+            self.assertFalse(latch.apply('x','overlay',True,'native_ui_resource_transition',now=t,ready_key=('e',))[0])
+        for t in(3,3.2,3.4,3.6):
+            self.assertFalse(latch.apply('x','overlay',False,'ui_unknown',now=t,ready_key=('e',))[0])
     def test_busy_shared_copy_keeps_exact_prior_timestamp_until_real_expiry(self):
         previous=dict(sample_unix_ns=10e9,session='same');errors={}
         with patch('presentation.read_json',side_effect=BlockingIOError('Shared channel copy busy')):
