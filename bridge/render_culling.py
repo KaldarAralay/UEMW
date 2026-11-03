@@ -14,6 +14,12 @@ def unit(a):
     if not math.isfinite(size) or size<1e-8:raise ValueError('Degenerate camera basis')
     return tuple(v/size for v in a)
 
+def reflected_camera(camera,plane):
+    """A second rendering view of the same captured original geometry."""
+    if not math.isfinite(plane)or abs(plane)>1e8:raise ValueError('Invalid native reflection plane')
+    p=camera['position'];f=camera['forward'];u=camera['up']
+    return {**camera,'position':[p[0],p[1],2*plane-p[2]],'forward':[f[0],f[1],-f[2]],'up':[-u[0],-u[1],u[2]]}
+
 class View:
     def __init__(self,camera):
         self.planes=[]

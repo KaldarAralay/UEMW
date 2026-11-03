@@ -62,10 +62,11 @@ def clear_material(m):
     raise RuntimeError('Material expression cleanup exceeded its bounded passes')
 foliage_model=next((getattr(u.MaterialShadingModel,n)for n in dir(u.MaterialShadingModel)if n.startswith('MSM_')and 'FOLIAGE'in n),None)
 if foliage_model is None:raise RuntimeError('Installed engine has no two-sided foliage shading model')
-for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BLEND_MASKED),('Foliage',u.BlendMode.BLEND_MASKED),('Translucent',u.BlendMode.BLEND_TRANSLUCENT),
-                    ('Additive',u.BlendMode.BLEND_ADDITIVE),('Premultiplied',u.BlendMode.BLEND_ALPHA_COMPOSITE),('Modulate',u.BlendMode.BLEND_MODULATE),('Water',u.BlendMode.BLEND_OPAQUE),('Terrain',u.BlendMode.BLEND_OPAQUE),('Hair',u.BlendMode.BLEND_MASKED),('Glass',u.BlendMode.BLEND_TRANSLUCENT)]:
+policies=[('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BLEND_MASKED),('Foliage',u.BlendMode.BLEND_MASKED),('Translucent',u.BlendMode.BLEND_TRANSLUCENT),
+          ('Additive',u.BlendMode.BLEND_ADDITIVE),('Premultiplied',u.BlendMode.BLEND_ALPHA_COMPOSITE),('Modulate',u.BlendMode.BLEND_MODULATE),('Water',u.BlendMode.BLEND_OPAQUE),('Terrain',u.BlendMode.BLEND_OPAQUE),('Hair',u.BlendMode.BLEND_MASKED),('Glass',u.BlendMode.BLEND_TRANSLUCENT)]
+for label,blend,environment_map in [(label,blend,env)for label,blend in policies for env in ((False,)if label in ('Water','Terrain')else(False,True))]:
   for skin in (False,True):
-    name='MW_'+label+('_Skin' if skin else '')
+    name='MW_'+label+('_Env'if environment_map else'')+('_Skin' if skin else '')
     path=D+'/'+name
     m=u.load_asset(path)
     if m is not None and not isinstance(m,u.Material):
@@ -108,10 +109,36 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
     vertex_linear=custom_node(m,'native_atmosphere_color.hlsl',('Color','Active'))
     link(vertex_rgb,'',vertex_linear,'Color');link(colour_active,'',vertex_linear,'Active')
     vertex_alpha=expression(m,u.MaterialExpressionMultiply);link(color,'A',vertex_alpha,'A');link(tint,'A',vertex_alpha,'B')
-    rgb=expression(m,u.MaterialExpressionMultiply)
+    stage_uv0=expression(m,u.MaterialExpressionTextureCoordinate,coordinate_index=0)
+    stage_uv1=expression(m,u.MaterialExpressionTextureCoordinate,coordinate_index=2)
+    stage_uv2=expression(m,u.MaterialExpressionTextureCoordinate,coordinate_index=3)
+    stage_samples={}
+    for slot in ((0,1,2,3,4,5,6)if environment_map else(0,1,2,4,6)):
+        slot_value=expression(m,u.MaterialExpressionConstant,r=slot)
+        source=expression(m,u.MaterialExpressionTextureObjectParameter,parameter_name='SpriteTexture'if slot==0 else f'NativeStage{slot}',texture=u.load_asset('/Engine/EngineResources/WhiteSquareTexture'))
+        settings=expression(m,u.MaterialExpressionVectorParameter,parameter_name=f'NativeStage{slot}Settings',default_value=u.LinearColor(0,3,2,0))
+        settings4=expression(m,u.MaterialExpressionAppendVector);link(settings,'',settings4,'A');link(settings,'A',settings4,'B')
+        sample=custom_node(m,'native_stage_sample.hlsl',('T','UV0','UV1','UV2','Settings','Slot','Bias'));sample.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT4)
+        bias=mip_bias if slot==0 else expression(m,u.MaterialExpressionConstant,r=0.)
+        for e,n in ((source,'T'),(stage_uv0,'UV0'),(stage_uv1,'UV1'),(stage_uv2,'UV2'),(settings4,'Settings'),(slot_value,'Slot'),(bias,'Bias')):link(e,'',sample,n)
+        stage_samples[slot]=sample
+    base_rgb=expression(m,u.MaterialExpressionComponentMask,r=True,g=True,b=True);link(stage_samples[0],'',base_rgb,'')
+    base_alpha=expression(m,u.MaterialExpressionComponentMask,r=False,g=False,b=False,a=True);link(stage_samples[0],'',base_alpha,'')
+    rgb=custom_node(m,'native_stage_colour.hlsl',('A','B','Alpha','Dark','Detail','Decal','Apply','Active'))
+    apply_mode=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeTextureApply',default_value=2.)
+    stages_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeStagesActive',default_value=0.)
+    for e,n in ((base_alpha,'Alpha'),(stage_samples[1],'Dark'),(stage_samples[2],'Detail'),(stage_samples[6],'Decal'),(apply_mode,'Apply'),(stages_active,'Active')):link(e,'',rgb,n)
     alpha=expression(m,u.MaterialExpressionMultiply)
-    link(tex,'RGB',rgb,'A');link(vertex_linear,'',rgb,'B')
-    link(tex,'A',alpha,'A');link(vertex_alpha,'',alpha,'B')
+    link(base_rgb,'',rgb,'A');link(vertex_linear,'',rgb,'B')
+    link(base_alpha,'',alpha,'A');link(vertex_alpha,'',alpha,'B')
+    if label=='Terrain':
+        # The source terrain decal uses its original vertex-alpha gradient.
+        # A ready continuous tile atlas already includes this transition.
+        terrain_switch=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeTerrainBlend',default_value=0.)
+        source_blend=expression(m,u.MaterialExpressionOneMinus);link(terrain_switch,'',source_blend,'')
+        decal_alpha=expression(m,u.MaterialExpressionMultiply);link(vertex_alpha,'',decal_alpha,'A');link(source_blend,'',decal_alpha,'B')
+        decal_rgb=expression(m,u.MaterialExpressionComponentMask,r=True,g=True,b=True);link(stage_samples[6],'',decal_rgb,'')
+        terrain_decal=expression(m,u.MaterialExpressionAppendVector);link(decal_rgb,'',terrain_decal,'A');link(decal_alpha,'',terrain_decal,'B');link(terrain_decal,'',rgb,'Decal')
     native_opacity=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeBlendOpacity',default_value=1.)
     blend_alpha=expression(m,u.MaterialExpressionLinearInterpolate,const_a=1.)
     link(alpha,'',blend_alpha,'B');link(native_opacity,'',blend_alpha,'Alpha')
@@ -132,12 +159,15 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
     else:
         world_position=expression(m,u.MaterialExpressionWorldPosition,world_position_shader_offset=u.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS)
         normal_node=expression(m,u.MaterialExpressionVertexNormalWS);normal_pin=''
+    original_world_position=world_position;original_normal=normal_node;original_normal_pin=normal_pin
     view=custom_node(m,'native_view.hlsl',('Position','Normal','Origin','Target','Row0','Row1','Row2','Active','DepthScale'))
     view_normal=u.CustomOutput();view_normal.set_editor_property('output_name','NativeNormal');view_normal.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT3)
     view.set_editor_property('additional_outputs',[view_normal])
     link(world_position,'',view,'Position');link(normal_node,normal_pin,view,'Normal')
+    view_parameters={}
     for name,value in (('Origin',(0,0,0,0)),('Target',(0,0,0,0)),('Row0',(1,0,0,0)),('Row1',(0,1,0,0)),('Row2',(0,0,1,0))):
         e=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeView'+name,default_value=u.LinearColor(*value));link(e,'',view,name)
+        view_parameters[name]=e
     view_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeViewActive',default_value=0.);link(view_active,'',view,'Active')
     depth_scale=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeViewDepthScale',default_value=1.);link(depth_scale,'',view,'DepthScale')
     view_position=expression(m,u.MaterialExpressionAdd);link(world_position,'',view_position,'A');link(view,'',view_position,'B')
@@ -181,7 +211,7 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
             native_specular=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeSpecular',default_value=.3)
             active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeTerrainBlend',default_value=0.)
             layers=expression(m,u.MaterialExpressionScalarParameter,parameter_name='TerrainLayers',default_value=0.)
-            for e,pin,name in ((detail_position,'','Position'),(tex,'RGB','BaseRGB'),(packed,'RGBA','BasePacked'),(roughness,'','BaseRoughness'),(native_specular,'','BaseSpecular'),(strength,'','BaseStrength'),(variation,'','BaseVariation'),(active,'','Active'),(layers,'','Layers')):link(e,pin,terrain,name)
+            for e,pin,name in ((detail_position,'','Position'),(base_rgb,'','BaseRGB'),(packed,'RGBA','BasePacked'),(roughness,'','BaseRoughness'),(native_specular,'','BaseSpecular'),(strength,'','BaseStrength'),(variation,'','BaseVariation'),(active,'','Active'),(layers,'','Layers')):link(e,pin,terrain,name)
             link(terrain,'',rgb,'A')
         resolution=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeDetailResolution',default_value=u.LinearColor(512,512,0,0))
         normal_detail=custom_node(m,'native_surface_detail.hlsl',('Packed','Position','UV','Normal','Strength','Quality','Roughness','Variation','Resolution'))
@@ -208,7 +238,35 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
         link(surface_position,'',solar_base,'Position')
     shaded=expression(m,u.MaterialExpressionMultiply);link(rgb,'',shaded,'A');link(surface,'',shaded,'B')
     emission=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeEmission',default_value=u.LinearColor(0,0,0,1))
-    emitted=expression(m,u.MaterialExpressionMultiply);link(tex,'RGB',emitted,'A');link(emission,'',emitted,'B')
+    emitted_base=expression(m,u.MaterialExpressionMultiply);link(base_rgb,'',emitted_base,'A');link(emission,'',emitted_base,'B')
+    glow_rgb=expression(m,u.MaterialExpressionComponentMask,r=True,g=True,b=True);link(stage_samples[4],'',glow_rgb,'')
+    emitted=expression(m,u.MaterialExpressionAdd);link(emitted_base,'',emitted,'A');link(glow_rgb,'',emitted,'B')
+    if environment_map:
+        native_camera=expression(m,u.MaterialExpressionCameraPositionWS)
+        original_camera=expression(m,u.MaterialExpressionLinearInterpolate);link(native_camera,'',original_camera,'A');link(view_parameters['Origin'],'',original_camera,'B');link(view_active,'',original_camera,'Alpha')
+        reflect_uv=custom_node(m,'native_environment_uv.hlsl',('Position','Normal','CameraPosition','Row0','Row1'))
+        reflect_uv.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT2)
+        for e,pin,n in ((original_world_position,'','Position'),(original_normal,original_normal_pin,'Normal'),(original_camera,'','CameraPosition')):link(e,pin,reflect_uv,n)
+        for row in (0,1):
+            value=expression(m,u.MaterialExpressionVectorParameter,parameter_name=f'NativeEnvRow{row}',default_value=u.LinearColor(0,0,0,0))
+            value4=expression(m,u.MaterialExpressionAppendVector);link(value,'',value4,'A');link(value,'A',value4,'B');link(value4,'',reflect_uv,f'Row{row}')
+        reflect_interpolated=expression(m,u.MaterialExpressionVertexInterpolator);link(reflect_uv,'',reflect_interpolated,'VS')
+        bump_matrix=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeBumpMatrix',default_value=u.LinearColor(0,0,0,0))
+        bump_matrix4=expression(m,u.MaterialExpressionAppendVector);link(bump_matrix,'',bump_matrix4,'A');link(bump_matrix,'A',bump_matrix4,'B')
+        bump_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeBumpActive',default_value=0.)
+        perturbed=custom_node(m,'native_environment_bump.hlsl',('UV','Bump','Matrix','Active'));perturbed.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT2)
+        for e,n in ((reflect_interpolated,'UV'),(stage_samples[5],'Bump'),(bump_matrix4,'Matrix'),(bump_active,'Active')):link(e,'',perturbed,n)
+        reflected_texture=expression(m,u.MaterialExpressionTextureObjectParameter,parameter_name='NativeEnvironmentMap',texture=u.load_asset('/Engine/EngineResources/WhiteSquareTexture'))
+        reflect_settings=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeEnvSettings',default_value=u.LinearColor(0,3,2,0))
+        reflect_settings4=expression(m,u.MaterialExpressionAppendVector);link(reflect_settings,'',reflect_settings4,'A');link(reflect_settings,'A',reflect_settings4,'B')
+        reflected_sample=custom_node(m,'native_stage_sample.hlsl',('T','UV0','UV1','UV2','Settings','Slot','Bias'));reflected_sample.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT4)
+        reflected_slot=expression(m,u.MaterialExpressionConstant,r=7.);reflected_bias=expression(m,u.MaterialExpressionConstant,r=0.)
+        for e,n in ((reflected_texture,'T'),(perturbed,'UV0'),(perturbed,'UV1'),(perturbed,'UV2'),(reflect_settings4,'Settings'),(reflected_slot,'Slot'),(reflected_bias,'Bias')):link(e,'',reflected_sample,n)
+        reflection_rgb=expression(m,u.MaterialExpressionComponentMask,r=True,g=True,b=True);link(reflected_sample,'',reflection_rgb,'')
+        gloss_rgb=expression(m,u.MaterialExpressionComponentMask,r=True,g=True,b=True);link(stage_samples[3],'',gloss_rgb,'')
+        reflected_masked=expression(m,u.MaterialExpressionMultiply);link(reflection_rgb,'',reflected_masked,'A');link(gloss_rgb,'',reflected_masked,'B')
+        reflected_tinted=expression(m,u.MaterialExpressionMultiply);link(reflected_masked,'',reflected_tinted,'A');link(vertex_linear,'',reflected_tinted,'B')
+        with_reflection=expression(m,u.MaterialExpressionAdd);link(emitted,'',with_reflection,'A');link(reflected_tinted,'',with_reflection,'B');emitted=with_reflection
     final_color=expression(m,u.MaterialExpressionAdd);link(shaded,'',final_color,'A');link(emitted,'',final_color,'B')
     modern=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeModernLighting',default_value=1.)
     effect_kind=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeEffectKind',default_value=0.)
@@ -233,7 +291,8 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
             item=u.CustomOutput();item.set_editor_property('output_name',name);item.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT1);glass_outputs.append(item)
         glass.set_editor_property('additional_outputs',glass_outputs)
         glass_camera=expression(m,u.MaterialExpressionCameraPositionWS)
-        for e,pin,n in ((normal_detail,'','Normal'),(surface_position,'','Position'),(glass_camera,'','CameraPosition'),(environment,'','Environment'),(effect_kind,'','Kind'),(effect_quality,'','Quality'),(character,'','Roughness'),(character,'SpecularOut','Specular')):link(e,pin,glass,n)
+        glass_quality=expression(m,u.MaterialExpressionConstant,r=0.)if environment_map else effect_quality
+        for e,pin,n in ((normal_detail,'','Normal'),(surface_position,'','Position'),(glass_camera,'','CameraPosition'),(environment,'','Environment'),(effect_kind,'','Kind'),(glass_quality,'','Quality'),(character,'','Roughness'),(character,'SpecularOut','Specular')):link(e,pin,glass,n)
         ambient=custom_node(m,'native_ambient.hlsl',('Environment','Position','Lit','Probe','Fidelity'))
         link(fidelity,'',ambient,'Fidelity')
         probe_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeAmbientProbe',default_value=0.)
@@ -269,7 +328,7 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
     if not u.MWBuildLibrary.connect_skin_offset(m,corrected_offset):raise RuntimeError('Native vertex offset connection failed')
     fog_switch=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeFog',default_value=1.)
     sky_switch=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeSky',default_value=0.)
-    for e,pin,n in ((environment,'','Environment'),(fog_position,'','Position'),(camera_position,'','CameraPosition'),(final_color,'','Color'),(tex,'RGB','BaseTexture'),(fog_switch,'','Fog'),(sky_switch,'','Sky'),(background_switch,'','Background')):link(e,pin,fog,n)
+    for e,pin,n in ((environment,'','Environment'),(fog_position,'','Position'),(camera_position,'','CameraPosition'),(final_color,'','Color'),(base_rgb,'','BaseTexture'),(fog_switch,'','Fog'),(sky_switch,'','Sky'),(background_switch,'','Background')):link(e,pin,fog,n)
     celestial_kind=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeCelestialKind',default_value=0.)
     celestial_quality=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeCelestialQuality',default_value=1.)
     celestial=custom_node(m,'native_celestial.hlsl',('Color','Kind','Quality','Visibility'))
@@ -348,6 +407,15 @@ for label,blend in [('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BL
             if parameter!='NativeRoughness':
                 scaled=expression(m,u.MaterialExpressionMultiply);link(node,pin,scaled,'A');link(fade,'',scaled,'B');node=scaled
             output(node,'',m,prop)
+    alpha_settings=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeAlphaTest',default_value=u.LinearColor(0,0,0,0))
+    if transparent:
+        alpha_clip=custom_node(m,'native_alpha_test.hlsl',('Color','Alpha','Settings'))
+        link(composite,'',alpha_clip,'Color');link(alpha,'',alpha_clip,'Alpha');link(alpha_settings,'',alpha_clip,'Settings')
+        output(alpha_clip,'',m,u.MaterialProperty.MP_EMISSIVE_COLOR)
+    if label in ('Masked','Hair','Foliage'):
+        alpha_coverage=custom_node(m,'native_alpha_coverage.hlsl',('Alpha','Opacity','Settings'));alpha_coverage.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT1)
+        for e,n in ((alpha,'Alpha'),(blend_alpha,'Opacity'),(alpha_settings,'Settings')):link(e,'',alpha_coverage,n)
+        output(alpha_coverage,'',m,u.MaterialProperty.MP_OPACITY_MASK)
     L.set_material_usage(m,u.MaterialUsage.MATUSAGE_INSTANCED_STATIC_MESHES)
     L.recompile_material(m)
     if not u.EditorAssetLibrary.save_loaded_asset(m,False):raise RuntimeError('Unable to save '+path)
@@ -404,5 +472,5 @@ for identity,pin in ((u.SceneTextureId.PPI_POST_PROCESS_INPUT0,'Scene'),(u.Scene
 output(node,'',m,u.MaterialProperty.MP_EMISSIVE_COLOR)
 L.recompile_material(m)
 if not u.EditorAssetLibrary.save_loaded_asset(m,False):raise RuntimeError('Unable to save '+path)
-u.log('UEMW generated twenty-two surface materials and completed-water fog successfully')
+u.log('UEMW generated forty surface materials and completed-water fog successfully')
 

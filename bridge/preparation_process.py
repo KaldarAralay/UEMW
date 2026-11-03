@@ -56,13 +56,13 @@ class PreparationPickler(pickle.Pickler):
         if isinstance(obj,ReadPlan):return restore_plan,(obj.groups,None)
         if isinstance(obj,Assets):return AssetSnapshot,(str(obj.out),len(obj.meshes),len(obj.textures),obj.missing)
         if isinstance(obj,Geometry):
-            state={k:v for k,v in obj.__dict__.items()if k not in('scene_read_plan','prepared_definitions','pose_layout')}
+            state={k:v for k,v in obj.__dict__.items()if k not in('scene_read_plan','prepared_definitions','pose_layout','_particle_metadata','_palette_plan')}
             if getattr(obj,'pose_layout',None) is not None:
                 layout=obj.pose_layout
                 state['_pose_transfer']={k:v for k,v in layout.__dict__.items()if k not in('records','read_plan')}
             # Pose publication needs full particle descriptors and the binding
             # identities/roles, not thousands of conversion-only dictionaries.
-            keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights')
+            keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights','texture_effect','native_environment_effect')
             state['shapes']=[s if s.get('particles')else{k:s[k]for k in keys if k in s}for s in obj.shapes]
             state['prepared_definitions']={}
             return restore_geometry,(state,)
@@ -82,6 +82,7 @@ def loads(data,reader):
 def fingerprint_values(g):
     keys=('scope','signature','records','node_identities','native_switches','actor_owners','cell_root_owners','light_pointers','light_owners','native_attributes','material_values','view_pointers','water_pointers','water_visibility_roots','player_pointers','extra_generations','effect_signature','weapon_state','cell_definitions','shadow_caster_pointers','shadow_distance')
     state={k:getattr(g,k,None)for k in keys};state['flips']=g.material_flips.items
+    state['texture_effects']=getattr(getattr(g,'texture_effects',None),'items',{})
     state['native_light_states']=getattr(getattr(g,'pose_layout',None),'native_light_states',{})
     skin_keys={id(v):k for k,v in getattr(g,'skins',{}).items()}
     state['records']=[(p,identity,parents,skin_keys.get(id(skin))if skin is not None else None,owner)for p,identity,parents,skin,owner in(getattr(g,'records',None)or())]
@@ -108,7 +109,8 @@ def layout_patch(g):
     return dict(records=[(p,identity,parents,skin_keys[id(skin)]if skin is not None else None,owner)for p,identity,parents,skin,owner in g.records],
                 node_identities=g.node_identities,read_plan=g.pose_requests,switches=g.pose_layout.switches,
                 shape_gates={s['id']:s.get('switch_gates',())for s in g.shapes},native_light_states=g.pose_layout.native_light_states,
-                shadow_casters=getattr(g,'shadow_caster_pointers',set()),shadow_distance=getattr(g,'shadow_distance',0),view_layout=getattr(g,'view_layout',None))
+                shadow_casters=getattr(g,'shadow_caster_pointers',set()),shadow_distance=getattr(g,'shadow_distance',0),view_layout=getattr(g,'view_layout',None),
+                prepared_layout={k:v for k,v in g.pose_layout.__dict__.items()if k not in('records','read_plan')})
 def apply_layout_patch(g,patch):
     from pose_frame import PoseLayout
     import numpy as np
@@ -134,7 +136,18 @@ def apply_layout_patch(g,patch):
         return
     records=[(p,identity,parents,g.skins[key]if key is not None else None,owner)for p,identity,parents,key,owner in rows]
     casters=patch.get('shadow_casters',getattr(g,'shadow_caster_pointers',set()));distance=patch.get('shadow_distance',getattr(g,'shadow_distance',0))
-    layout=PoseLayout(records,g.view_pointers,read_plan=patch['read_plan'],switches=patch['switches'],water_pointers=g.water_pointers,node_identities=patch['node_identities'],player_pointers=g.player_pointers,water_visibility_roots=g.water_visibility_roots,actor_owners=g.actor_owners,native_light_states=patch.get('native_light_states',{}),shadow_casters=casters,shadow_distance=distance,near_pass_camera=getattr(getattr(g,'pose_layout',None),'near_pass_camera',False),cell_root_owners=getattr(g,'cell_root_owners',{}))
+    if 'prepared_layout'in patch:
+        # The spawned preparation process already built these incidence and
+        # gather arrays. Reconstructing them here can consume several native
+        # frames. This follows the existing full/auxiliary transfer ownership
+        # rule: only inherited private worker pipes may carry these objects.
+        layout=PoseLayout.__new__(PoseLayout);layout.__dict__.update(patch['prepared_layout'])
+        layout.records=records;layout.read_plan=patch['read_plan']
+        expected=np.asarray([r[1]for r in records],dtype='<u4').reshape(-1,2)
+        if layout.shape_indices.shape!=(len(records),)or not np.array_equal(layout.expected,expected)or tuple(layout.pointers[i]for i in layout.shape_indices)!=tuple(r[0]for r in records):
+            raise ValueError('Prepared layout does not match geometry identities')
+    else:
+        layout=PoseLayout(records,g.view_pointers,read_plan=patch['read_plan'],switches=patch['switches'],water_pointers=g.water_pointers,node_identities=patch['node_identities'],player_pointers=g.player_pointers,water_visibility_roots=g.water_visibility_roots,actor_owners=g.actor_owners,native_light_states=patch.get('native_light_states',{}),shadow_casters=casters,shadow_distance=distance,near_pass_camera=getattr(getattr(g,'pose_layout',None),'near_pass_camera',False),cell_root_owners=getattr(g,'cell_root_owners',{}))
     # Commit only after the entire replacement layout has validated.
     g.records=records;g.pose_requests=patch['read_plan'];g.pose_layout=layout;g.node_identities=patch['node_identities'];g.continuity_views={}
     g.shadow_caster_pointers=casters;g.shadow_distance=distance
@@ -178,7 +191,7 @@ def lighting_catalog_patch(old,ready):
     same_records=all((a[0],a[1],a[2],a[4])==(b[0],b[1],b[2],b[4])and ((a[3]is None and b[3]is None)or(a[3]is not None and b[3]is not None and a[3].root==b[3].root and tuple(a[3].bones)==tuple(b[3].bones)))for a,b in zip(old.records,ready.records))
     same_switches=old.pose_layout.switches.definitions==ready.pose_layout.switches.definitions and all(__import__('numpy').array_equal(getattr(old.pose_layout.switches,k),getattr(ready.pose_layout.switches,k))for k in('owners','switches','children'))
     fast=identity_patch(old,ready)if same_records and same_switches else None
-    return dict(layout=None if fast is not None else layout_patch(ready),identity=fast,updates=updates,catalog=ready.catalog,catalog_digest=ready.catalog_digest,
+    return dict(layout=None if fast is not None else layout_patch(ready),identity=fast,updates=updates,catalog=ready.catalog,catalog_digest=ready.catalog_digest,binding_index=getattr(ready,'binding_index',None),
         signature=None if fast is not None and isinstance(getattr(old,'signature',None),tuple)else ready.signature,membership_hash=ready.membership_hash,cell_definitions=ready.cell_definitions)
 
 def apply_lighting_catalog_patch(g,patch):
@@ -207,6 +220,7 @@ def apply_lighting_catalog_patch(g,patch):
         for light in shape.get('native_lights',()):membership.setdefault(int(light,16),[]).append(i)
     target.native_light_membership={p:np.asarray(v,dtype=np.int32)for p,v in membership.items()}
     for key in('catalog','catalog_digest','membership_hash','cell_definitions'):setattr(target,key,patch[key])
+    target.binding_index=patch.get('binding_index')
     if patch['signature']is None:
         entries=list(g.signature[1])
         for i,asset,lights in patch['updates']:
@@ -220,7 +234,7 @@ def auxiliary_patch(old,ready,roles):
     """Reuse validated, unchanged resident bindings across an auxiliary edit."""
     if old is None or old.scope!=ready.scope or old.epoch!=ready.epoch:return None
     indices={s['id']:i for i,s in enumerate(old.shapes)};order=[]
-    keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights')
+    keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights','texture_effect','native_environment_effect')
     for shape,row in zip(ready.shapes,ready.records):
         if shape.get('cell_key')in roles:
             i=indices.get(shape['id'])
@@ -231,8 +245,8 @@ def auxiliary_patch(old,ready,roles):
             order.append(i)
         else:
             order.append((shape if shape.get('particles')else{k:shape[k]for k in keys if k in shape},row))
-    fields=('cell','catalog','catalog_digest','last_refresh','last_world_refresh','scene_key','epoch','stream_cells','membership_hash','cell_definitions',
-            'terrain_count','scope','cell_generations','generation_counter','extra_generations','effect_signature','weapon_state','material_flips','material_values',
+    fields=('cell','catalog','catalog_digest','binding_index','last_refresh','last_world_refresh','scene_key','epoch','stream_cells','membership_hash','cell_definitions',
+            'terrain_count','scope','cell_generations','generation_counter','extra_generations','effect_signature','weapon_state','material_flips','material_values','texture_effects',
             'native_attributes','native_switches','light_pointers','light_owners','shadow_caster_pointers','shadow_distance','actor_owners','cell_root_owners','water_pointers',
             'water_visibility_roots','player_pointers','view_pointers','view_layout')
     return dict(order=order,state={k:getattr(ready,k)for k in fields},nodes={p:v for p,v in ready.node_identities.items()if old.node_identities.get(p)!=v},

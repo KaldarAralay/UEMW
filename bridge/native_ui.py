@@ -1,7 +1,8 @@
 """Bounded read-only vanilla UI inspection for the pinned x86 executable.
 
 Layouts come from the locally inspected MWSE source; no MWSE is loaded.
-Only MenuMulti (the ordinary HUD) is allowed under the visual overlay.
+The independent presentation controller compares these exact menus with the
+native UI geometry lane before allowing unified presentation.
 """
 import struct
 

@@ -7,6 +7,9 @@ class FJsonObject;
 struct FMWEnvironmentState {
     TArray<FVector4f> Pixels;
     TArray<FString> LightIds;
+    // Selection only: unscaled original diffuse peak. Shader pixels retain
+    // the actual dimmer, including native flicker and fade animation.
+    TArray<float> LightNominalPeaks;
     int32 LightCount=0,OmittedLights=0;
 };
 bool MWDecodeEnvironment(const TSharedPtr<FJsonObject>& Json,FMWEnvironmentState& Out);

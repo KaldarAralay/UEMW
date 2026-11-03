@@ -88,6 +88,17 @@ class AsyncTests(unittest.TestCase):
         for _ in range(20):self.a.snapshot({**self.base,'key':'bad'})
         self.assertEqual(len(self.jobs),2)
 
+    def test_light_budget_history_survives_compatible_resources_but_not_a_new_scene(self):
+        self.live();history=(self.a.state.epoch,('0x12345',))
+        self.a.state.environment_light_selection=history
+        base={**self.base,'key':'same-room-new-resources'}
+        self.a.snapshot(base);self.gate.set();self.complete(base)
+        self.assertEqual(self.a.state.environment_light_selection,history)
+        self.gate.clear()
+        base={**self.base,'scope':'room-b','key':'another-room'}
+        self.a.snapshot(base);self.gate.set();self.complete(base)
+        self.assertFalse(hasattr(self.a.state,'environment_light_selection'))
+
     def test_new_native_effect_request_does_not_inherit_a_previous_failure_backoff(self):
         self.live();original=self.a.context
         self.a.state.snapshot_retained=lambda base,excluded:self.a.state.snapshot(base,prepared=True)

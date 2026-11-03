@@ -3,6 +3,7 @@
 #include "MWTextureUpgrade.h"
 #include "MWNativeSky.h"
 #include "Components/DirectionalLightComponent.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "MWFrame.h"
 #include "MWSkin.h"
 #include "Camera/CameraComponent.h"
@@ -60,6 +61,30 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     if(const auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("r.VSync")))Out->SetNumberField(TEXT("present_vsync"),C->GetInt());
     if(const auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("RHI.MaximumFrameLatency")))Out->SetNumberField(TEXT("present_maximum_frame_latency"),C->GetInt());
     Out->SetBoolField(TEXT("native_menu_open"),NativeMenuOpen);
+    Out->SetBoolField(TEXT("native_ui_ready"),UIReady && Now>=UIStamp && Now-UIStamp<=.25);
+    Out->SetStringField(TEXT("native_ui_status"),UIStatus);Out->SetNumberField(TEXT("native_ui_draws"),UIDraws);Out->SetNumberField(TEXT("native_ui_sequence"),UISequence);Out->SetNumberField(TEXT("native_ui_sample_unix_ns"),UIStamp*1e9);
+    Out->SetNumberField(TEXT("native_ui_textures"),UITextures.Num());
+    Out->SetNumberField(TEXT("native_ui_original_regions"),UIRegions.Num());
+    Out->SetStringField(TEXT("distant_status"),DistantStatus);
+    Out->SetBoolField(TEXT("distant_enabled"),DistantEnabled);
+    Out->SetNumberField(TEXT("distant_visible"),DistantVisible);
+    Out->SetNumberField(TEXT("distant_bindings"),DistantBindings);
+    Out->SetNumberField(TEXT("distant_native_sample_unix_ns"),DistantNativeStamp*1e9);
+    TArray<TSharedPtr<FJsonValue>> DistantRows;
+    if(DistantGeometry) {
+        const auto& V=*DistantGeometry;
+        const bool Shown=Live && V.SceneShown && Now>=DistantNativeStamp && Now-DistantNativeStamp<=.5;
+        for(const auto& Id:Ids)if(Id.StartsWith(TEXT("distant:"))) {
+            auto Row=MakeShared<FJsonObject>();Row->SetStringField(TEXT("id"),Id);Row->SetStringField(TEXT("scope"),TEXT("Installed static/LAND derivative with separately sampled native overrides; not a native motion frame"));Row->SetBoolField(TEXT("submitted_visible"),Shown && V.InstanceSubmitted(Id));
+            Row->SetStringField(TEXT("catalog"),V.Catalog);Row->SetStringField(TEXT("cell"),V.InstanceCells.FindRef(Id));
+            const int32 Index=V.GeometryBindings.IndexOfByPredicate([&](const FMWBinding& B){return B.Id==Id;});
+            if(V.AppliedNativeCatalog==V.Catalog && V.AppliedNativeStates.IsValidIndex(Index)) {
+                TArray<TSharedPtr<FJsonValue>> M;for(float Value:V.AppliedNativeStates[Index].Transform)M.Add(MakeShared<FJsonValueNumber>(Value));Row->SetArrayField(TEXT("transform"),M);Row->SetBoolField(TEXT("state_visible"),V.AppliedNativeStates[Index].Visible);
+            }
+            DistantRows.Add(MakeShared<FJsonValueObject>(Row));
+        }
+    }
+    Out->SetArrayField(TEXT("distant_instances"),DistantRows);
     Out->SetBoolField(TEXT("gameplay_hud_visible"),Live && GameplayHudVisible());
     Out->SetBoolField(TEXT("native_underwater"),NativeUnderwater);
     Out->SetBoolField(TEXT("native_sky_geometry_visible"),BackgroundGeometryVisible);
@@ -124,7 +149,22 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("water_reflection_capture_requests"),(double)WaterReflectionRequests);
     Out->SetNumberField(TEXT("water_reflection_components"),WaterReflectionComponents);
     Out->SetNumberField(TEXT("water_reflection_age_ms"),LastWaterReflection>0?FMath::Max(0.,FPlatformTime::Seconds()-LastWaterReflection)*1000:0);
-    Out->SetNumberField(TEXT("water_reflection_cap_hz"),20);
+    Out->SetNumberField(TEXT("water_reflection_cap_hz"),MWWaterReflectionHz);
+    Out->SetNumberField(TEXT("water_reflection_completed"),(double)WaterReflectionCompleted);
+    Out->SetNumberField(TEXT("water_reflection_discarded"),(double)WaterReflectionDiscarded);
+    Out->SetBoolField(TEXT("water_reflection_pending"),WaterReflectionPending);
+    Out->SetBoolField(TEXT("water_reflection_writes_displayed_target"),WaterReflectionPending && WaterReflectionCapture && WaterReflectionCapture->TextureTarget==WaterReflectionTarget);
+    Out->SetNumberField(TEXT("water_reflection_buffers"),WaterReflectionBuffers.Num());
+    Out->SetNumberField(TEXT("water_reflection_transparent_components"),WaterReflectionTransparentComponents);
+    Out->SetNumberField(TEXT("water_reflection_source_sequence"),(double)DisplayedWaterImage.Sequence);
+    Out->SetNumberField(TEXT("water_reflection_source_stamp"),DisplayedWaterImage.SourceStamp);
+    Out->SetNumberField(TEXT("water_reflection_camera_sequence"),(double)DisplayedWaterImage.CameraSequence);
+    Out->SetNumberField(TEXT("water_reflection_camera_stamp"),DisplayedWaterImage.CameraStamp);
+    Out->SetStringField(TEXT("water_reflection_image_epoch"),DisplayedWaterImage.Epoch);
+    Out->SetNumberField(TEXT("water_reflection_width"),WaterReflectionTarget?WaterReflectionTarget->SizeX:0);
+    Out->SetNumberField(TEXT("water_reflection_height"),WaterReflectionTarget?WaterReflectionTarget->SizeY:0);
+    Out->SetBoolField(TEXT("water_reflection_shadows"),WaterReflectionCapture && WaterReflectionCapture->ShowFlags.DynamicShadows);
+    Out->SetBoolField(TEXT("water_reflection_antialiasing"),WaterReflectionCapture && WaterReflectionCapture->ShowFlags.AntiAliasing);
     Out->SetNumberField(TEXT("water_reflection_plane"),NativeReflectionHeight);
     if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("r.Water.SingleLayer.Reflection")))Out->SetNumberField(TEXT("water_reflection_mode"),C->GetInt());
     int32 WaterDefinitions=0;for(const auto& Pair:MeshData)if(Pair.Value.Water)++WaterDefinitions;
@@ -206,6 +246,23 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
             }
         }
         if(const auto* Frame=AppliedMaterialFrames.Find(InstanceAssets.FindRef(Id)))Row->SetNumberField(TEXT("texture_frame"),*Frame);
+        if(auto* Material=SkinMaterials.FindRef(Id)?SkinMaterials.FindRef(Id):GeometryMaterials.FindRef(InstanceAssets.FindRef(Id))) {
+            const auto V=Material->K2_GetVectorParameterValue(TEXT("NativeAlphaTest"));Row->SetArrayField(TEXT("alpha_test"),{MakeShared<FJsonValueNumber>(V.R),MakeShared<FJsonValueNumber>(V.G),MakeShared<FJsonValueNumber>(V.B)});
+        }
+        if(const auto* Data=MeshData.Find(InstanceAssets.FindRef(Id)))if(!Data->TextureEffectGroup.IsEmpty()) {
+            auto* Material=SkinMaterials.FindRef(Id);if(!Material)Material=GeometryMaterials.FindRef(InstanceAssets.FindRef(Id));
+            Row->SetStringField(TEXT("environment_group"),Data->TextureEffectGroup);Row->SetBoolField(TEXT("environment_supported"),Data->TextureEffectSupported);
+            if(Material) {
+                int32 Frame=INDEX_NONE;
+                auto* Texture=Material->K2_GetTextureParameterValue(TEXT("NativeEnvironmentMap"));
+                for(const auto& Stage:Data->TextureStages)if(Stage.Slot==14)for(int32 I=0;I<Stage.Frames.Num();++I)if(GeometryTextures.FindRef(Stage.Frames[I])==Texture){Frame=I;break;}
+                Row->SetNumberField(TEXT("environment_frame"),Frame);
+                TArray<TSharedPtr<FJsonValue>> Mapping;
+                for(int32 I=0;I<3;++I){const auto V=Material->K2_GetVectorParameterValue(*FString::Printf(TEXT("NativeEnvRow%d"),I));for(float F:{V.R,V.G,V.B,V.A})Mapping.Add(MakeShared<FJsonValueNumber>(F));}
+                Row->SetArrayField(TEXT("environment_mapping"),Mapping);
+                const auto Settings=Material->K2_GetVectorParameterValue(TEXT("NativeEnvSettings"));Row->SetArrayField(TEXT("environment_settings"),{MakeShared<FJsonValueNumber>(Settings.R),MakeShared<FJsonValueNumber>(Settings.G),MakeShared<FJsonValueNumber>(Settings.B),MakeShared<FJsonValueNumber>(Settings.A)});
+            }
+        }
         if(const auto* Rain=RainPoses.Find(Id)) {
             double A=1;if(RainInterpolationEnabled)MWRainDisplayDelta(*Rain,LastCameraStamp,&A);
             Row->SetNumberField(TEXT("rain_alpha"),A);Row->SetNumberField(TEXT("rain_previous_stamp"),Rain->PreviousStamp);Row->SetNumberField(TEXT("rain_latest_stamp"),Rain->Stamp);
@@ -243,6 +300,13 @@ void AMWLive::PublishStateWitness() {
         !Request->TryGetNumberField(TEXT("unix_ns"),Stamp) || !FMath::IsFinite(Stamp) || Now<Stamp/1e9 || Now-Stamp/1e9>30 ||
         !Request->TryGetArrayField(TEXT("ids"),Values) || Values->Num()>64)return;
     TArray<FString> Ids;for(const auto& V:*Values){FString Id;if(!V.IsValid() || !V->TryGetString(Id) || Id.IsEmpty() || Id.Len()>96)return;Ids.Add(Id);}
+    if(Request->HasField(TEXT("distant_scenery"))) {
+        bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("distant_scenery"),Enabled))return;DistantEnabled=Enabled;
+    }
+    if(Request->HasField(TEXT("distant_surface_fog"))) {
+        bool Enabled=false;if(!DiagnosticScreenshots || !DistantGeometry || !Request->TryGetBoolField(TEXT("distant_surface_fog"),Enabled))return;
+        for(const auto& Pair:DistantGeometry->GeometryMaterials)if(const auto* Mesh=DistantGeometry->MeshData.Find(Pair.Key))Pair.Value->SetScalarParameterValue(TEXT("NativeFog"),Enabled && Mesh->Fog?1:0);
+    }
     if(Request->HasField(TEXT("rain_interpolation"))) {
         bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("rain_interpolation"),Enabled))return;
         RainInterpolationEnabled=Enabled;

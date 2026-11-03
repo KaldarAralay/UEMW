@@ -16,5 +16,5 @@ struct FMWTerrainData {
 };
 using FMWTerrainPtr=TSharedPtr<FMWTerrainData,ESPMode::ThreadSafe>;
 FString MWTerrainSignature(const TArray<FMWTerrainTile>& Tiles);
-FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& AssetsPath,const FMWTextureUpgradeIndex& Upgrades,const FThreadSafeBool& Cancelled,const FString& KnownPool=FString());
+FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& AssetsPath,const FMWTextureUpgradeIndex& Upgrades,const FThreadSafeBool& Cancelled,const FString& KnownPool=FString(),int32 Resolution=512);
 UTexture2DArray* MWCreateTerrainArray(const TArray<FImage>& Mips);

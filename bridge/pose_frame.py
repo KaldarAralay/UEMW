@@ -6,13 +6,13 @@ All model/skin identities are checked, including hidden/off-camera shapes.
 from collections.abc import Mapping
 import numpy as np
 from live_probe import SceneReadChanged
-from render_culling import View
+from render_culling import View,reflected_camera
 from read_batch import RangeCapture
 
 NODE=np.dtype({'names':['table','flags','parent','bound','transform'],'formats':['<u4','<u2','<u4',('<f4',4),('<f4',13)],'offsets':[0,0x14,0x18,0x1c,0x40],'itemsize':0x74})
 
 class PoseLayout:
-    def __init__(self,records,view_pointers=(),read_plan=None,switches=None,water_pointers=(),node_identities=None,player_pointers=(),water_visibility_roots=(),actor_owners=None,native_light_states=None,shadow_casters=(),shadow_distance=0,near_pass_camera=False,cell_root_owners=None):
+    def __init__(self,records,view_pointers=(),read_plan=None,switches=None,water_pointers=(),node_identities=None,player_pointers=(),water_visibility_roots=(),actor_owners=None,native_light_states=None,shadow_casters=(),shadow_distance=0,near_pass_camera=False,cell_root_owners=None,reflection_excluded=()):
         self.records=records
         self.near_pass_camera=near_pass_camera
         self.switches=switches
@@ -42,6 +42,8 @@ class PoseLayout:
             for p in dependencies:owners.append(i);nodes.append(self.index[p])
         self.identity_shapes=np.asarray(owners,dtype=np.int32);self.identity_nodes=np.asarray(nodes,dtype=np.int32)
         self.first_person=np.asarray([r[0]in view_pointers for r in records],dtype=bool)
+        excluded=set(reflection_excluded)
+        self.reflection_eligible=np.asarray([r[0]not in excluded for r in records],dtype=bool)
         self.player_body=np.asarray([r[0]in player_pointers for r in records],dtype=bool)
         self.water=np.asarray([r[0]in water_pointers for r in records],dtype=bool)
         self.shadow_casters=np.asarray([r[0]in shadow_casters for r in records],dtype=bool)&~self.first_person&~self.water
@@ -71,7 +73,7 @@ class PoseLayout:
             self.light_state_offsets=offsets(self.native_light_states,0x94,4)
 
 class PoseFrame(Mapping):
-    def __init__(self,raw,layout,camera,first_person=True,water_visible=True,first_person_items_active=True):
+    def __init__(self,raw,layout,camera,first_person=True,water_visible=True,first_person_items_active=True,reflection_plane=None):
         self.raw=raw;self.layout=layout
         try:
             # One compact strided buffer avoids thousands of Python unpack
@@ -142,7 +144,12 @@ class PoseFrame(Mapping):
             near_shadow=layout.shadow_casters&(distance2<=reach*reach)
         # The native near pass has its own camera; a stale world-frustum sphere
         # must not retire an otherwise live hand/weapon during camera movement.
-        self.visible=self.unhidden&(self.inside|near_shadow|(layout.first_person if layout.near_pass_camera else False))
+        reflected=np.zeros(len(layout.records),dtype=bool)
+        if reflection_plane is not None and water_visible and camera['position'][2]>reflection_plane+2:
+            reflected=View(reflected_camera(camera,reflection_plane)).includes_many(self.bounds)&~layout.first_person&~layout.water&layout.reflection_eligible
+            reflected&=self.bounds[:,2]+np.maximum(self.bounds[:,3],0)+32>=reflection_plane
+        self.visible=self.unhidden&(self.inside|near_shadow|reflected|(layout.first_person if layout.near_pass_camera else False))
+        self.offscreen_reflections=self.visible&reflected&~self.inside
         self.offscreen_casters=self.visible&~self.inside&layout.shadow_casters
         self.visible_indices=np.flatnonzero(self.visible)
     def __getitem__(self,key):return self.raw[key]
@@ -153,8 +160,11 @@ class PoseFrame(Mapping):
         keys=tuple(sorted(set(pointers)))
         if not keys:return {}
         indices=[self.layout.index[p]for p in keys]
+        matrices=self.world_matrices(indices)
+        return {p:m for p,m in zip(keys,matrices)}
+    def world_matrices(self,indices):
         values=self.nodes['transform'][indices].astype(np.float64)
-        matrices=np.zeros((len(keys),4,4),dtype=np.float64)
+        matrices=np.zeros((len(indices),4,4),dtype=np.float64)
         matrices[:,:3,:3]=values[:,:9].reshape(-1,3,3)*values[:,12,None,None]
         matrices[:,:3,3]=values[:,9:12];matrices[:,3,3]=1
-        return {p:m for p,m in zip(keys,matrices)}
+        return matrices

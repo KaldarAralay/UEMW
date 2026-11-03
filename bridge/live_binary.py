@@ -7,6 +7,7 @@ import math
 import struct
 import uuid
 import numpy as np
+from captured_states import CapturedStates
 
 HEADER=struct.Struct('<4sHH16s16sQdIIII')
 LIMIT=4*1024*1024
@@ -32,7 +33,50 @@ def transform_bytes(values):
     except (TypeError,OverflowError,struct.error)as error:
         raise ValueError('Invalid binary transform')from error
 
-def encode(packet,packed_metadata=False):
+def packed_transforms(states):
+    """Validate this complete frame in one numerical pass, before float32 cast.
+
+    No pose is cached. Bounds are checked at source precision so rounding a
+    slightly out-of-range double into a valid float32 cannot bypass validation.
+    """
+    if isinstance(states,CapturedStates):return states.packed_transforms()
+    values=[]
+    for row in states:
+        if not row or type(row[0])is not bool:raise ValueError('Invalid binary visibility')
+        if row[0]:
+            if not 2<=len(row)<=4:raise ValueError('Invalid binary row')
+            values.append(row[1])
+        elif len(row)!=1:raise ValueError('Invalid hidden binary record')
+    if not values:return b''
+    try:
+        array=np.asarray(values)
+        if array.shape!=(len(values),13)or array.dtype.kind not in 'biuf' or not np.isfinite(array).all()or np.any(array>1e8)or np.any(array< -1e8):
+            raise ValueError('Invalid binary transform block')
+        return array.astype('<f4',copy=False).tobytes()
+    except(TypeError,OverflowError)as error:raise ValueError('Invalid binary transform block')from error
+
+
+def deformation_payload(extra,geometry):
+    if isinstance(extra[0],dict)and 'palette'not in extra[0]:
+        if geometry!=6 or len(extra)!=1:raise ValueError('Native UV records require geometry v6')
+        data=extra[0];points=np.asarray(data['points'],dtype='<f4').reshape(-1)
+        if not 0<len(points)<=65535*3 or len(points)%3:raise ValueError('Invalid native UV vertex count')
+        count=len(points)//3;flags=3 if 'colors'in data else 2
+        payload=struct.pack('<II',count,flags)+floats(points)
+        if flags&1:payload+=floats(data['colors'],count*4,True)
+        return 5,payload+floats(data['uvs'],count*2)
+    if isinstance(extra[0],dict):
+        palette=np.asarray(extra[0]['palette'],dtype='<f4').reshape(-1,12)
+        if len(extra)!=1 or not 1<=len(palette)<=257:raise ValueError('Invalid native bone palette')
+        if len(extra[0]['bound'])!=4 or extra[0]['bound'][3]<0:raise ValueError('Invalid native bound')
+        return 4,struct.pack('<HH',len(palette),0)+floats(extra[0]['bound'],4)+floats(palette)
+    points=np.asarray(extra[0],dtype='<f4').reshape(-1)
+    if not 0<len(points)<=65535*3 or len(points)%3:raise ValueError('Invalid binary vertex count')
+    payload=struct.pack('<I',len(points)//3)+floats(points)
+    if len(extra)==2:payload+=floats(extra[1],len(points)//3*4,True)
+    return 3 if len(extra)==2 else 2,payload
+
+def encode(packet,packed_metadata=False,*,batch_transforms=True):
     states=packet['instance_states'];count=len(states)
     if not 0<count<=16384:raise ValueError('Invalid binary instance count')
     sequence=packet['sequence'];stamp=packet['sample_unix_ns'];pid=packet['pid']
@@ -41,6 +85,15 @@ def encode(packet,packed_metadata=False):
     geometry=packet['geometry_version']
     if geometry not in(5,6):raise ValueError('Unsupported binary geometry version')
     chunks=[HEADER.pack(b'UFB3'if packed_metadata else b'UFB2'if geometry==6 else b'UFB1',3 if packed_metadata else 2 if geometry==6 else 1,0,guid(packet['session']),guid(packet['scene_epoch']),sequence,float(stamp),pid,geometry,count,0)]
+    if batch_transforms and isinstance(states,CapturedStates):
+        chunks.append(states.pack_records(lambda extra:deformation_payload(extra,geometry),LIMIT-HEADER.size))
+        if packed_metadata:
+            from state_metadata import encode as encode_metadata
+            chunks.append(encode_metadata(packet))
+        if sum(map(len,chunks))>LIMIT:raise ValueError('Binary frame with metadata exceeds 4 MiB')
+        return b''.join(chunks)
+    transforms=packed_transforms(states)if batch_transforms and count>=64 else None
+    transform_offset=0
     size=HEADER.size
     for row in states:
         if not row or type(row[0])is not bool:raise ValueError('Invalid binary visibility')
@@ -49,26 +102,12 @@ def encode(packet,packed_metadata=False):
             record=b'\0'
         else:
             if not 2<=len(row)<=4:raise ValueError('Invalid binary row')
-            transform=transform_bytes(row[1])
+            if transforms is None:transform=transform_bytes(row[1])
+            else:transform=transforms[transform_offset:transform_offset+52];transform_offset+=52
             if len(row)==2:record=b'\1'+transform
-            elif isinstance(row[2],dict)and 'palette'not in row[2]:
-                if geometry!=6 or len(row)!=3:raise ValueError('Native UV records require geometry v6')
-                data=row[2];points=np.asarray(data['points'],dtype='<f4').reshape(-1)
-                if not 0<len(points)<=65535*3 or len(points)%3:raise ValueError('Invalid native UV vertex count')
-                count_vertices=len(points)//3;flags=3 if 'colors'in data else 2
-                record=b'\5'+transform+struct.pack('<II',count_vertices,flags)+floats(points)
-                if flags&1:record+=floats(data['colors'],count_vertices*4,True)
-                record+=floats(data['uvs'],count_vertices*2)
-            elif isinstance(row[2],dict):
-                palette=np.asarray(row[2]['palette'],dtype='<f4').reshape(-1,12)
-                if len(row)!=3 or not 1<=len(palette)<=257:raise ValueError('Invalid native bone palette')
-                if len(row[2]['bound'])!=4 or row[2]['bound'][3]<0:raise ValueError('Invalid native bound')
-                record=b'\4'+transform+struct.pack('<HH',len(palette),0)+floats(row[2]['bound'],4)+floats(palette)
             else:
-                points=np.asarray(row[2],dtype='<f4').reshape(-1)
-                if not 0<len(points)<=65535*3 or len(points)%3:raise ValueError('Invalid binary vertex count')
-                record=bytes([3 if len(row)==4 else 2])+transform+struct.pack('<I',len(points)//3)+floats(points)
-                if len(row)==4:record+=floats(row[3],len(points)//3*4,True)
+                kind,payload=deformation_payload(row[2:],geometry)
+                record=bytes([kind])+transform+payload
         size+=len(record)
         if size>LIMIT:raise ValueError('Binary frame exceeds 4 MiB')
         chunks.append(record)

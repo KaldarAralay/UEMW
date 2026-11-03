@@ -3,9 +3,17 @@ import struct
 import unittest
 from native_ui import inspect_ui
 from presentation_policy import decide,OverlayLatch,separate_rect,separate_desktop_rect,preferred_size
-from presentation import frame_ready
+from presentation import frame_ready,poll_json
+from unittest.mock import patch
 
 class OverlayRecoveryTests(unittest.TestCase):
+    def test_busy_shared_copy_keeps_exact_prior_timestamp_until_real_expiry(self):
+        previous=dict(sample_unix_ns=10e9,session='same');errors={}
+        with patch('presentation.read_json',side_effect=BlockingIOError('Shared channel copy busy')):
+            self.assertIs(poll_json('path',previous,errors,'source'),previous)
+        self.assertEqual(previous['sample_unix_ns'],10e9);self.assertIn('source',errors)
+        with patch('presentation.read_json',side_effect=ValueError('invalid source')):
+            self.assertEqual(poll_json('path',previous,errors,'source'),{})
     def test_full_hd_fits_another_display_without_covering_the_native_window(self):
         game=[8,32,1030,797];areas=[[0,0,1920,1040],[-1920,600,0,1680]]
         self.assertEqual(separate_desktop_rect(game,areas,(1920,1080)),[-1920,600,1920,1080])
@@ -34,7 +42,7 @@ class OverlayRecoveryTests(unittest.TestCase):
         self.assertEqual(latch.apply('second','overlay',True,'ue_play_view'),(True,'ue_play_view'))
     def test_native_menus_and_focus_changes_do_not_latch(self):
         latch=OverlayLatch();latch.apply('first','overlay',True,'ue_play_view')
-        for reason in ('native_ui','other_foreground','minimized'):
+        for reason in ('native_loading','other_foreground','minimized'):
             latch.apply('first','overlay',False,reason)
             self.assertEqual(latch.apply('first','overlay',True,'ue_play_view'),(True,'ue_play_view'))
         latch.apply('first','overlay',False,'source_unavailable')
@@ -97,7 +105,7 @@ class PresentationPolicyTests(unittest.TestCase):
         for flags in itertools.product((False,True), repeat=6):
             focused, minimized, known, ui, source, render = flags
             visible, reason = decide('overlay',game_foreground=focused,minimized=minimized,
-                ui_known=known,native_ui=ui,source_live=source,renderer_live=render)
+                ui_known=known,native_ui=ui,source_live=source,renderer_live=render,ui_mirrored=not ui)
             self.assertEqual(visible, focused and not minimized and known and not ui and source and render, flags)
         safe = dict(game_foreground=True,minimized=False,ui_known=True,native_ui=False,source_live=True,renderer_live=True)
         self.assertEqual(decide('bogus',**safe), (False,'invalid_mode'))

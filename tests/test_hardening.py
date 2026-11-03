@@ -32,6 +32,36 @@ class PacketTests(unittest.TestCase):
 
 
 class PoseTests(unittest.TestCase):
+    def test_classification_cannot_invalidate_already_owned_node_capture(self):
+        class R:
+            attempts=0;frame=100
+            def camera_sample(self):self.attempts+=1;return dict(world='0x10000',data='0x20000',cell_ptr='0x30000',frame_ms=100)
+            def read(self,p,n):return bytes(n)
+            def u32(self,p):return self.frame if p==0x10024 else 0x10000 if p==0x7c67dc else 0x30000
+        g=stream.Geometry.__new__(stream.Geometry);g.r=R();g.cell='0x30000';g.shapes=[dict(id='0x40000',parents=())];g.skins={};g.light_pointers=[];g.light_owners={};g.material_flips={};g.material_values={};g.native_attributes={}
+        g.records=[(0x40000,(0,0),(0x40000,),None,None)];g.pose_layout=stream.PoseLayout(g.records)
+        original=stream.PoseFrame
+        class Classify(original):
+            def __init__(self,*args,**kwargs):super().__init__(*args,**kwargs);g.r.frame=101
+        with patch.object(stream,'PoseFrame',Classify),patch.object(stream,'capture_environment',return_value={}):
+            *_,metrics=g.capture_pose(dict(world='0x10000',data='0x20000',cell_ptr='0x30000'))
+        self.assertEqual(g.r.attempts,1);self.assertFalse(metrics['nodes_spanned_frames']);self.assertTrue(metrics['pose_spanned_frames'])
+        self.assertEqual(metrics['nodes_frame_ms_end'],100);self.assertEqual(metrics['pose_frame_ms_end'],101)
+
+    def test_metadata_frame_advance_does_not_recapture_a_completed_pose(self):
+        class R:
+            attempts=0;frame=100
+            def camera_sample(self):self.attempts+=1;return dict(world='0x10000',data='0x20000',cell_ptr='0x30000',frame_ms=100)
+            def read(self,p,n):return bytes(n)
+            def u32(self,p):return self.frame if p==0x10024 else 0x10000 if p==0x7c67dc else 0x30000
+        g=stream.Geometry.__new__(stream.Geometry);g.r=R();g.cell='0x30000';g.shapes=[dict(id='0x40000',parents=())];g.skins={};g.light_pointers=[];g.light_owners={};g.material_flips={};g.material_values={};g.native_attributes={}
+        g.records=[(0x40000,(0,0),(0x40000,),None,None)];g.pose_layout=stream.PoseLayout(g.records)
+        def environment(*args):g.r.frame=101;return {}
+        with patch.object(stream,'capture_environment',side_effect=environment):
+            anchor,raw,particles,attributes,metrics=g.capture_pose(dict(world='0x10000',data='0x20000',cell_ptr='0x30000'))
+        self.assertEqual(g.r.attempts,1);self.assertFalse(metrics['pose_spanned_frames']);self.assertTrue(metrics['sample_spanned_frames'])
+        self.assertEqual(metrics['pose_frame_ms_end'],100);self.assertEqual(metrics['source_frame_ms_end'],101)
+
     def test_slow_spanned_capture_is_not_repeated_as_a_false_atomicity_fix(self):
         clock=[0.]
         class R:

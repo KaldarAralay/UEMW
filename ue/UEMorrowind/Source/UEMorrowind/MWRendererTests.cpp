@@ -4,6 +4,7 @@
 #include "MWChannel.h"
 #include "MWCamera.h"
 #include "MWCatalog.h"
+#include "MWTextureStages.h"
 #include "MWTexture.h"
 #include "MWTerrain.h"
 #include "Engine/Texture2DArray.h"
@@ -18,10 +19,20 @@
 #include "Components/DirectionalLightComponent.h"
 #include "MWTransparency.h"
 #include "MWReflection.h"
+#include "MWLines.h"
+#include "MWDistant.h"
+#include "MWUI.h"
+#include "CanvasTypes.h"
 #include "MWStateMetadata.h"
 #include "MWSkin.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/Material.h"
+#include "Kismet/KismetRenderingLibrary.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "TextureResource.h"
+#include "RenderingThread.h"
+#include "RHI.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "MaterialDomain.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/Engine.h"
@@ -44,6 +55,73 @@
 #include "Misc/AutomationTest.h"
 #if WITH_DEV_AUTOMATION_TESTS
 static FString MWFixtureRoot();
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWUITest,"UEMW.Renderer.NativeUI",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWUITest::RunTest(const FString&) {
+    auto Frame=MWReadUI(MWFixtureRoot()/TEXT("ui-good"));TestTrue(TEXT("Genuine UI carrier and texture pixels load"),Frame->Valid);if(!Frame->Valid)return false;
+    TestTrue(TEXT("Original source and capture time lease the UI"),MWUIFresh(*Frame,42,Frame->Session,1700000000.2));
+    TestFalse(TEXT("Expired UI cannot cover original menus"),MWUIFresh(*Frame,42,Frame->Session,1700000000.501));
+    TestFalse(TEXT("Foreign source UI rejected"),MWUIFresh(*Frame,43,Frame->Session,1700000000.2));
+    TestFalse(TEXT("Reloaded session cannot reuse UI"),MWUIFresh(*Frame,42,TEXT("other"),1700000000.2));
+    TestEqual(TEXT("Original UI target region retained explicitly"),Frame->NativeRegions.Num(),1);
+    for(const TCHAR* Label:{TEXT("nan"),TEXT("index"),TEXT("trailing"),TEXT("identity"),TEXT("path"),TEXT("region"),TEXT("region-menu")})TestFalse(TEXT("Malformed/foreign UI fails closed"),MWReadUI(MWFixtureRoot()/(FString(TEXT("ui-"))+Label))->Valid);
+    UWorld* World=nullptr;for(const auto& C:GEngine->GetWorldContexts())if(C.WorldType==EWorldType::Game && C.World()){World=C.World();break;}if(!World)return false;
+    auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);if(!V)return false;
+    V->AuxiliaryGeometry=true;V->FinishSpawning(FTransform::Identity);V->SourcePid=42;V->Session=Frame->Session;
+    FMWUIView View;View.Pending=Frame;View.NextRead=FPlatformTime::Seconds()+60;Frame->Stamp=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds();View.Update(*V);
+    TestTrue(TEXT("Bounded texture upload promotes actual UI frame"),V->UIReady && V->UITextures.Num()==1 && View.Frame==Frame);
+    if(!GUsingNullRHI) {
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,32,24,RTF_RGBA8,FLinearColor::Green,false);UKismetRenderingLibrary::ClearRenderTarget2D(World,Target,FLinearColor::Green);FlushRenderingCommands();
+        FCanvas Canvas(Target->GameThread_GetRenderTargetResource(),nullptr,World,World->FeatureLevel);auto* UI=NewObject<UCanvas>();UI->Init(32,24,nullptr,&Canvas);
+        Frame->Stamp=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds();TestTrue(TEXT("Actual native UI Canvas path draws"),View.Draw(*V,UI));Canvas.Flush_GameThread();FlushRenderingCommands();
+        TArray<FColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadPixels(Pixels);
+        if(Pixels.Num()!=32*24)AddError(TEXT("UI target readback failed"));else {
+            const auto Back=Pixels[2*32+2],Blend=Pixels[12*32+16];AddInfo(FString::Printf(TEXT("Native UI GPU background=%s blended=%s"),*Back.ToString(),*Blend.ToString()));
+            TestTrue(TEXT("Full-screen alpha-zero UI leaves the scene visible"),Back.G>240 && Back.R<5 && Back.B<5);
+            TestTrue(TEXT("Original texture alpha blends only the real UI inset"),Blend.R>110 && Blend.R<210 && Blend.G>110 && Blend.G<210 && Blend.B<5);
+        }
+        UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+    }else AddInfo(TEXT("UI transparency pixels require the separate D3D11 check."));
+    V->Destroy();return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWDistantTest,"UEMW.Renderer.DistantScenery",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWDistantTest::RunTest(const FString&) {
+    const FString Root=MWFixtureRoot()/TEXT("distant-good");auto S=MWReadDistant(Root);
+    TestTrue(TEXT("Installed-scenery lease loads owned immutable geometry/poses"),S.IsValid() && S->Valid);if(!S || !S->Valid)return false;
+    TestTrue(TEXT("Exact live source identity and fresh capture accepted"),MWDistantMatches(*S,42,S->Session,S->Epoch,1700000000.2));
+    TestFalse(TEXT("Dead source cannot lease old state"),MWDistantMatches(*S,42,S->Session,S->Epoch,1700000000.6));
+    TestFalse(TEXT("Reload fences previous scenery"),MWDistantMatches(*S,42,S->Session,TEXT("other"),1700000000.2));
+    TestFalse(TEXT("Different source process rejected"),MWDistantMatches(*S,43,S->Session,S->Epoch,1700000000.2));
+    TestTrue(TEXT("Nonresident halo cell eligible"),MWDistantEligible(*S,TEXT("distant:3,0"),FIntPoint(0,0),{}));
+    TestFalse(TEXT("Current native neighborhood wins before worker refresh"),MWDistantEligible(*S,TEXT("distant:3,0"),FIntPoint(2,0),{}));
+    TestFalse(TEXT("Retained submitted native cells win too"),MWDistantEligible(*S,TEXT("distant:3,0"),FIntPoint(0,0),{FIntPoint(3,0)}));
+    S->Excluded.Add(FIntPoint(3,0));TestFalse(TEXT("Captured residency wins after asynchronous boundary release"),MWDistantEligible(*S,TEXT("distant:3,0"),FIntPoint(0,0),{}));S->Excluded.Remove(FIntPoint(3,0));
+    for(const TCHAR* Label:{TEXT("nan"),TEXT("visible"),TEXT("trailing"),TEXT("path"),TEXT("hash"),TEXT("count")})TestFalse(TEXT("Malformed/foreign scenery fails closed"),MWReadDistant(MWFixtureRoot()/(FString(TEXT("distant-"))+Label))->Valid);
+    auto Cached=MWReadDistant(Root,S);TestTrue(TEXT("Unchanged immutable poses remain exact under a new lease"),Cached->Valid && MWGeometryStateEqual(Cached->States[0],S->States[0]));
+    auto* World=GEngine->GetWorldContexts()[0].World();if(!World)return false;
+    auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);if(!V)return false;
+    V->AuxiliaryGeometry=true;V->DataRoot=Root;V->AssetsPath=Root/TEXT("local/distant-assets");V->EnvironmentTexture=MWFloatTexture(8,33,{});V->ActiveCellKey=TEXT("exterior:0,0");V->FinishSpawning(FTransform::Identity);
+    TestTrue(TEXT("Auxiliary owner has no source/camera reader, independent tick or active sunlight"),!V->FrameReader && !V->CameraReader && !V->DistantView && !V->IsActorTickEnabled() && V->NativeSun->Intensity==0);
+    V->Session=S->Session;V->SceneEpoch=S->Epoch;
+    auto P=MakeShared<FJsonObject>();P->SetStringField(TEXT("scene_epoch"),S->Epoch);P->SetStringField(TEXT("scene_catalog"),S->Catalog);P->SetStringField(TEXT("scene_catalog_md5"),S->Digest);P->SetNumberField(TEXT("geometry_version"),5);
+    bool Applied=false;const double End=FPlatformTime::Seconds()+5;
+    while(FPlatformTime::Seconds()<End){Applied=V->UpdateGeometry(P,&S->States,nullptr,nullptr,&S->Bindings);V->AdvanceGeometryResources(.001,8);if(Applied && V->InstanceSubmitted(S->Bindings[0].Id))break;FPlatformProcess::Sleep(.001f);}
+    TestTrue(TEXT("Actual terrain/resource pipeline submits distant geometry"),Applied && V->InstanceSubmitted(S->Bindings[0].Id));
+    if(V->AppliedNativeStates.Num())TestEqual(TEXT("Exact original-derived placement reaches the submitted state"),V->AppliedNativeStates[0].Transform[10],20.f);
+    else AddError(FString::Printf(TEXT("Distant apply failed: %s catalog=%s loading=%d"),*V->ResourceError,*V->Catalog,V->GeometryLoading?1:0));
+    TestTrue(TEXT("Separate paint grid uses bounded lower-resolution original texture array"),V->TerrainColorPool && V->TerrainColorPool->GetSizeX()==256);
+    for(const auto& B:V->RigidBatches)TestTrue(TEXT("Distant static batches never own collision, physics or shadow simulation"),!B.Value->CastShadow && B.Value->GetCollisionEnabled()==ECollisionEnabled::NoCollision && !B.Value->IsSimulatingPhysics());
+    if(FApp::CanEverRender() && Applied) {
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,32,32,RTF_RGBA16f,FLinearColor::Black,false);
+        auto* C=NewObject<USceneCaptureComponent2D>(V);C->SetWorldLocationAndRotation(FVector(22,11,530),FRotator(-90,0,0));C->ProjectionType=ECameraProjectionMode::Orthographic;C->OrthoWidth=10;C->TextureTarget=Target;C->CaptureSource=SCS_SceneColorHDRNoAlpha;C->bCaptureEveryFrame=false;C->bCaptureOnMovement=false;C->PrimitiveRenderMode=ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+        C->RegisterComponent();C->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Before;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Before);
+        for(const auto& B:V->RigidBatches)C->ShowOnlyComponents.Add(B.Value);for(const auto& B:V->GeometryComponents)C->ShowOnlyComponents.Add(B.Value);
+        C->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Pixels);int32 Visible=0;
+        for(int32 I=0;I<Pixels.Num();++I)if(Before.IsValidIndex(I))Visible+=FMath::Abs(Pixels[I].R-Before[I].R)+FMath::Abs(Pixels[I].G-Before[I].G)+FMath::Abs(Pixels[I].B-Before[I].B)>.05f;
+        AddInfo(FString::Printf(TEXT("Owned distant geometry GPU pixels=%d"),Visible));TestTrue(TEXT("Actual auxiliary geometry produces GPU pixels"),Visible>10 && Visible<512);
+        C->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+    }
+    V->ShowScene();V->HideScene();TestFalse(TEXT("Disconnect immediately hides the scenery owner"),V->SceneShown);V->Destroy();return true;
+}
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWTerrainBlendTest,"UEMW.Renderer.NativeTerrainBlend",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
 bool FMWTerrainBlendTest::RunTest(const FString&) {
     FThreadSafeBool Cancelled=false;FMWTextureUpgradeIndex Upgrades;
@@ -315,6 +393,9 @@ bool FMWLightingTest::RunTest(const FString&) {
     auto Legacy=MWChooseNativeShadows(Candidates,Previous,false);TestTrue(TEXT("Reference retains nearest-two selection"),Legacy.Contains(TEXT("a")) && Legacy.Contains(TEXT("c")));
     Candidates[2].Distance=60;Stable=MWChooseNativeShadows(Candidates,Previous,true);TestTrue(TEXT("A clearly nearer light can replace an incumbent"),Stable.Contains(TEXT("c")));
     Candidates.RemoveAt(1);Stable=MWChooseNativeShadows(Candidates,Previous,true);TestFalse(TEXT("Retired native lights cannot be retained by hysteresis"),Stable.Contains(TEXT("b")));
+    TArray<FMWShadowCandidate> Energy={{TEXT("dim"),100,.01},{TEXT("bright"),300,1},{TEXT("invalid"),0,NAN}};
+    TestEqual(TEXT("Shadow budget prefers meaningful native irradiance over a nearer dim source"),MWChooseNativeShadows(Energy,{},true,1)[0],FString(TEXT("bright")));
+    TestEqual(TEXT("Invalid native shadow importance cannot enter the budget"),MWChooseNativeShadows(Energy,{},true,4).Num(),2);
     UWorld* World=nullptr;for(const auto& C:GEngine->GetWorldContexts())if(C.WorldType==EWorldType::Game && C.World()){World=C.World();break;}
     if(!World){AddError(TEXT("Lighting test world missing"));return false;}
     auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);if(!V)return false;
@@ -323,7 +404,7 @@ bool FMWLightingTest::RunTest(const FString&) {
     V->NativeAttenuationMaterial=Function;
     auto* Cube=LoadObject<UTextureCube>(nullptr,TEXT("/Game/UEMW/Materials/MW_InteriorAmbientProbe.MW_InteriorAmbientProbe"));TestNotNull(TEXT("Isotropic indoor ambient cube is cooked"),Cube);
     V->NativeInteriorSky->SetCubemap(Cube);V->ActiveCellKey=TEXT("interior");V->SceneEpoch=TEXT("owned-light-test");
-    FMWEnvironmentState E;E.Pixels.SetNumZeroed(8*33);E.Pixels[0]=FVector4f(.1,.2,.3,1);E.LightCount=3;E.LightIds={TEXT("a"),TEXT("b"),TEXT("c")};
+    FMWEnvironmentState E;E.Pixels.SetNumZeroed(8*33);E.Pixels[0]=FVector4f(.1,.2,.3,1);E.Pixels[4].Y=7168;E.LightCount=3;E.LightIds={TEXT("a"),TEXT("b"),TEXT("c")};
     for(int32 I=0;I<3;++I){auto* R=&E.Pixels[(I+1)*8];R[0]=FVector4f(100+I*20,0,20,2);R[1].W=1;R[2]=FVector4f(1,.5,.25,256);R[4].X=1;}
     E.Pixels[16].W=3; // Exercise the shared point/spot path, not only point lights.
     V->UpdateNativeLighting(E);TestTrue(TEXT("Indoor fill uses converted native display ambient"),FMath::IsNearlyEqual(V->NativeInteriorSky->Intensity,MWNativeDisplayToLinear(.3f)));
@@ -348,6 +429,7 @@ bool FMWLightingTest::RunTest(const FString&) {
     TestEqual(TEXT("Object light mask follows reordered native rows without changing source membership"),Surface->K2_GetVectorParameterValue(TEXT("NativeLightMask")).R,6.f);
     E.Pixels[25].W=0;V->UpdateNativeLighting(E);TestEqual(TEXT("A native-disabled light immediately loses intensity"),V->NativeLights[2]->Intensity,0.f);TestFalse(TEXT("Native-disabled light loses its shadow"),V->NativeShadowIds.Contains(TEXT("a")));
     V->ActiveCellKey=TEXT("exterior:0,0");V->UpdateNativeLighting(E);TestFalse(TEXT("Interior ambient never remains active outside"),V->InteriorProbeActive);
+    TestEqual(TEXT("Sun shadow volume follows the actual captured native horizon"),V->NativeSun->DynamicShadowDistanceMovableLight,7168.f);
     TestEqual(TEXT("Exterior keeps its UE directional shadow path"),Surface->K2_GetScalarParameterValue(TEXT("NativeInteriorDiffuse")),0.f);
     if(auto* Point=Cast<UPointLightComponent>(V->NativeLights[0]))TestEqual(TEXT("Exterior source size retains the previous point-light path"),Point->SourceRadius,0.f);
     V->SetLightingFidelity(false);V->UpdateNativeLighting(E);TestEqual(TEXT("Comparison bypass restores previous native ambient interpretation"),V->NativeInteriorSky->Intensity,.3f);TestEqual(TEXT("Bypass detaches all native light functions"),V->NativeLightFunctions.Num(),0);
@@ -755,6 +837,10 @@ bool FMWRenderSelectionTest::RunTest(const FString&) {
     TestFalse(TEXT("First-person geometry remains excluded from reflections"),V->CanReflectPrimitive(Primitive,TEXT("hand")));
     V->MeshData[TEXT("0")].Water=true;
     TestFalse(TEXT("Water does not recursively reflect itself"),V->CanReflectPrimitive(Primitive,TEXT("0")));
+    V->MeshData[TEXT("0")].Water=false;V->MeshData[TEXT("0")].Lit=false;V->MeshData[TEXT("0")].NativeParticle=true;V->MeshData[TEXT("0")].Transparent=true;
+    TestTrue(TEXT("Real unlit flame/smoke transparency can reflect"),V->CanReflectPrimitive(Primitive,TEXT("0")));
+    V->MeshData[TEXT("0")].Rain=true;
+    TestFalse(TEXT("Camera-relative native rain does not leak into the mirrored view"),V->CanReflectPrimitive(Primitive,TEXT("0")));
     Primitive->DestroyComponent();V->ResetScene();V->EnsureRenderSelection();
     TestEqual(TEXT("Scene reset clears previous view identities"),V->ViewAssets.Num(),0);
     TestEqual(TEXT("Scene reset clears previous material identities"),V->FrameInstances.Num(),0);
@@ -1186,12 +1272,12 @@ bool FMWStreamingTest::RunTest(const FString&) {
     const double End=FPlatformTime::Seconds()+3;
     while(V->Catalog!=Name && FPlatformTime::Seconds()<End){V->LoadCatalog(Name);FPlatformProcess::Sleep(.001f);}
     if(V->Catalog!=Name){AddError(TEXT("CPU catalog did not commit"));V->Destroy();return false;}
-    TestEqual(TEXT("Validated bindings commit before any GPU material construction"),V->GeometryBindings.Num(),96);
+    TestEqual(TEXT("Validated bindings commit with their GPU materials ready"),V->GeometryBindings.Num(),96);
     TestEqual(TEXT("Every CPU mesh definition is available"),V->MeshData.Num(),3);
-    TestEqual(TEXT("No placeholder material was constructed during binding adoption"),V->GeometryMaterials.Num(),0);
+    TestEqual(TEXT("All source materials are ready at binding adoption"),V->GeometryMaterials.Num(),3);
     Name=TEXT("catalog-resources-pending.json");V->LoadCatalog(Name);
     while(V->Catalog!=Name && FPlatformTime::Seconds()<End){V->LoadCatalog(Name);FPlatformProcess::Sleep(.001f);}
-    TestEqual(TEXT("Replacement can adopt while old material jobs are unfinished"),V->Catalog,Name);
+    TestEqual(TEXT("Replacement can adopt after staged material work"),V->Catalog,Name);
     while(V->CatalogStaging() && FPlatformTime::Seconds()<End)V->Tick(.016f);
     TestEqual(TEXT("Replacement retains all previously unfinished material work"),V->GeometryMaterials.Num(),3);
     auto P=MakeShared<FJsonObject>();P->SetStringField(TEXT("scene_epoch"),TEXT("11112222-3333-4444-5555-666677778888"));P->SetStringField(TEXT("scene_catalog"),Name);P->SetNumberField(TEXT("geometry_version"),6);V->SceneEpoch=P->GetStringField(TEXT("scene_epoch"));
@@ -1338,6 +1424,7 @@ bool FMWPackedStateTest::RunTest(const FString&) {
     TestEqual(TEXT("Native light count retained"),Actual.Environment.LightCount,32);TestEqual(TEXT("Native omitted-light count retained"),Actual.Environment.OmittedLights,4);
     TestTrue(TEXT("All environment texels match the existing JSON decoder exactly"),Actual.Environment.Pixels==Expected.Environment.Pixels);
     TestTrue(TEXT("Packed production path retains every native light ID in row order"),Actual.Environment.LightIds==Expected.Environment.LightIds && Actual.Environment.LightIds.Num()==Actual.Environment.LightCount);
+    TestTrue(TEXT("Packed and JSON paths preserve identical nominal shadow-budget peaks separately from flickering shader pixels"),Actual.Environment.LightNominalPeaks==Expected.Environment.LightNominalPeaks && Actual.Environment.LightNominalPeaks.Num()==Actual.Environment.LightCount);
     TestEqual(TEXT("Native texture-frame group count"),Actual.MaterialFrames.Num(),76);TestEqual(TEXT("Native material-value group count"),Actual.MaterialValues.Num(),128);
     TestEqual(TEXT("Large native unsigned-radius float survives both decoders"),Actual.Environment.Pixels[10].W,258922080.f);
     Equal=Actual.MaterialFrames.Num()==Expected.MaterialFrames.Num();for(const auto& P:Expected.MaterialFrames){const auto* V=Actual.MaterialFrames.Find(P.Key);Equal&=V && *V==P.Value;}TestTrue(TEXT("Every resolved native texture frame matches"),Equal);
@@ -1393,6 +1480,267 @@ bool FMWEnvironmentTest::RunTest(const FString&) {
     TestTrue(TEXT("Native wind/thunder retained"),State.Pixels[6].Equals(FVector4f(4,2,6,.75),1e-6));
     Json->SetNumberField(TEXT("omitted_lights"),1);TestFalse(TEXT("Mixed light counts rejected"),MWDecodeEnvironment(Json,State));
     Json->SetNumberField(TEXT("omitted_lights"),0);Json->SetNumberField(TEXT("fog_density"),-1);TestFalse(TEXT("Negative fog density rejected"),MWDecodeEnvironment(Json,State));
+    return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWTopologyTest,"UEMW.Renderer.NativeTopology",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWTopologyTest::RunTest(const FString&) {
+    FThreadSafeBool Cancelled=false;
+    auto Data=MWReadCatalog(TEXT("catalog-lines.json"),MWFixtureRoot(),{},{},Cancelled);
+    TestTrue(TEXT("Owned original-format line carrier decodes"),Data.IsValid());if(!Data)return false;
+    TestTrue(TEXT("Line-list topology is retained independently of source blend mode"),Data->Meshes[TEXT("lines")].Lines);
+    TestFalse(TEXT("Malformed line carrier cannot become scene triangles"),MWReadCatalog(TEXT("catalog-lines-invalid.json"),MWFixtureRoot(),{},{},Cancelled).IsValid());
+    UWorld* World=nullptr;for(const auto& C:GEngine->GetWorldContexts())if(C.WorldType==EWorldType::Game && C.World()){World=C.World();break;}
+    if(!World){AddError(TEXT("Line test world missing"));return false;}
+    auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+    V->SceneEpoch=TEXT("owned-line-epoch");V->Catalog=TEXT("catalog-lines.json");V->MeshData=Data->Meshes;V->GeometryBindings=Data->Bindings;
+    auto* Environment=MWFloatTexture(8,33,{});
+    auto* Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/UEMW/Materials/MW_Opaque.MW_Opaque"));
+    auto* Material=UMaterialInstanceDynamic::Create(Base,V);Material->SetTextureParameterValue(TEXT("NativeEnvironment"),Environment);Material->SetScalarParameterValue(TEXT("NativeLit"),0);Material->SetScalarParameterValue(TEXT("NativeFog"),0);Material->SetScalarParameterValue(TEXT("NativeEffectQuality"),0);
+    V->GeometryMaterials.Add(TEXT("lines"),Material);
+    auto P=MakeShared<FJsonObject>();P->SetStringField(TEXT("scene_epoch"),V->SceneEpoch);P->SetStringField(TEXT("scene_catalog"),V->Catalog);P->SetNumberField(TEXT("geometry_version"),3);
+    TArray<FMWGeometryState> States;States.SetNum(1);auto& S=States[0];S.Visible=true;S.Transform[0]=S.Transform[4]=S.Transform[8]=S.Transform[12]=1;
+    V->UpdateGeometry(P,&States);V->AdvanceGeometryResources(1,64);
+    TestTrue(TEXT("Fresh native line pose applies through production resource path"),V->UpdateGeometry(P,&States));
+    auto* Line=Cast<UMWNativeLineComponent>(V->GeometryComponents.FindRef(TEXT("line-instance")));
+    TestNotNull(TEXT("Line list uses a real line-list GPU component"),Line);if(!Line){V->Destroy();return false;}
+    TestFalse(TEXT("Line data cannot enter the triangle instancing path"),V->RigidBatches.Contains(TEXT("lines")) || V->SharedMeshes.Contains(TEXT("lines")));
+    TestEqual(TEXT("Lines retain native authority without UE collision"),Line->GetCollisionEnabled(),ECollisionEnabled::NoCollision);
+    S.Transform[9]=20;TestTrue(TEXT("Current native line transform replaces the old pose"),V->UpdateGeometry(P,&States));
+    TestEqual(TEXT("Line endpoints use the exact native X/Y conversion"),Line->GetProcMeshSection(0)->ProcVertexBuffer[0].Position.Y,-130.0);
+    if(FApp::CanEverRender()) {
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,64,64,RTF_RGBA16f,FLinearColor::Black,false);
+        auto* Capture=NewObject<USceneCaptureComponent2D>(V);Capture->SetWorldLocationAndRotation(FVector(0,0,500),FRotator(-90,0,0));Capture->TextureTarget=Target;Capture->CaptureSource=SCS_SceneColorHDRNoAlpha;Capture->bCaptureEveryFrame=false;Capture->bCaptureOnMovement=false;Capture->PrimitiveRenderMode=ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;Capture->ShowOnlyComponents={Line};Capture->RegisterComponent();
+        Capture->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Pixels);
+        int32 Red=0;for(const auto& C:Pixels)Red+=C.R>.01f && C.G<C.R*.1f && C.B<C.R*.1f;
+        AddInfo(FString::Printf(TEXT("Owned GPU line-list red pixels=%d"),Red));TestTrue(TEXT("Actual GPU line primitives produce visible pixels"),Red>=8 && Red<256);
+        Capture->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+    }
+    S.Visible=false;TestTrue(TEXT("Native line hide applies immediately"),V->UpdateGeometry(P,&States));TestFalse(TEXT("Native-hidden lines cannot remain submitted"),V->InstanceSubmitted(TEXT("line-instance")));
+    V->ResetScene();TestEqual(TEXT("Epoch reset retires line components"),V->GeometryComponents.Num(),0);V->Destroy();return true;
+}
+#endif
+
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWMaterialContinuityTest,"UEMW.Renderer.MaterialResourceContinuity",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWMaterialContinuityTest::RunTest(const FString&) {
+    FString IndexText;TSharedPtr<FJsonObject> IndexFixture;
+    if(!FFileHelper::LoadFileToString(IndexText,*(MWFixtureRoot()/TEXT("binding-index-reference.json"))) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(IndexText),IndexFixture)){AddError(TEXT("Binding index fixture missing"));return false;}
+    const auto Ref=IndexFixture->GetObjectField(TEXT("reference"));const FString IndexCatalog=IndexFixture->GetStringField(TEXT("catalog")),IndexDigest=IndexFixture->GetStringField(TEXT("catalog_md5"));TArray<FMWBinding> FastRows,FullRows;
+    TestTrue(TEXT("Python UBI2 decodes without catalog DOM"),MWReadBindingIndex(Ref,IndexCatalog,IndexDigest,MWFixtureRoot(),FastRows));
+    TestTrue(TEXT("Full catalog independently validates"),MWReadCatalogBindings(IndexCatalog,IndexDigest,MWFixtureRoot(),FullRows));
+    TestTrue(TEXT("Producer and C++ canonical identities match exactly"),MWEqualBindingTables(FastRows,FullRows));
+    if(FullRows.Num()){FullRows[0].Cell=TEXT("wrong-owner");TestFalse(TEXT("Full catalog cross-check rejects mismatched ownership"),MWEqualBindingTables(FastRows,FullRows));}
+    TestFalse(TEXT("UBI2 cannot cross catalogs"),MWReadBindingIndex(Ref,IndexCatalog,FString::ChrN(32,'0'),MWFixtureRoot(),FastRows));
+    const FString IndexFile=MWFixtureRoot()/Ref->GetStringField(TEXT("file"));TArray<uint8> OriginalIndex;FFileHelper::LoadFileToArray(OriginalIndex,*IndexFile);
+    auto RejectIndex=[&](TArray<uint8> Mutated,const TCHAR* Label){
+        FFileHelper::SaveArrayToFile(Mutated,*IndexFile);Ref->SetNumberField(TEXT("bytes"),Mutated.Num());Ref->SetStringField(TEXT("md5"),FMD5::HashBytes(Mutated.GetData(),Mutated.Num()));
+        TestFalse(Label,MWReadBindingIndex(Ref,IndexCatalog,IndexDigest,MWFixtureRoot(),FastRows));
+    };
+    auto BadIndex=OriginalIndex;BadIndex[6]=1;RejectIndex(BadIndex,TEXT("UBI2 reserved flags reject"));
+    BadIndex=OriginalIndex;BadIndex[24]=255;BadIndex[25]=255;RejectIndex(BadIndex,TEXT("UBI2 excessive surface count rejects"));
+    BadIndex=OriginalIndex;BadIndex.RemoveAt(BadIndex.Num()-1);RejectIndex(BadIndex,TEXT("UBI2 truncation rejects even with matching file digest"));
+    BadIndex=OriginalIndex;BadIndex.Add(0);RejectIndex(BadIndex,TEXT("UBI2 trailing bytes reject"));
+    FFileHelper::SaveArrayToFile(OriginalIndex,*IndexFile);Ref->SetNumberField(TEXT("bytes"),OriginalIndex.Num());Ref->SetStringField(TEXT("md5"),FString::ChrN(32,'0'));
+    TestFalse(TEXT("UBI2 content digest is checked"),MWReadBindingIndex(Ref,IndexCatalog,IndexDigest,MWFixtureRoot(),FastRows));
+    FMWContinuityCache IdentityCache;TArray<FMWBinding> CachedRows;
+    auto ReadCached=[&](const FString& Name){TArray<uint8> Bytes;return FFileHelper::LoadFileToArray(Bytes,*(MWFixtureRoot()/Name)) && MWReadCatalogBindings(Name,FMD5::HashBytes(Bytes.GetData(),Bytes.Num()),MWFixtureRoot(),CachedRows,&IdentityCache);};
+    TestTrue(TEXT("Initial parser identities cached"),ReadCached(TEXT("catalog-resources-0.json")));
+    const auto CachedIdentity=IdentityCache.Entries.FindRef(TEXT("rigid")).Identity;
+    TestTrue(TEXT("Next catalog compares complete definition values"),ReadCached(TEXT("catalog-resources-pending.json")));
+    TestTrue(TEXT("Identical definition retains its owned identity without reserialization"),CachedIdentity.IsValid() && CachedIdentity==IdentityCache.Entries.FindRef(TEXT("rigid")).Identity);
+    FString MutationText;TSharedPtr<FJsonObject> Mutation;
+    if(FFileHelper::LoadFileToString(MutationText,*(MWFixtureRoot()/TEXT("catalog-resources-0.json"))) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(MutationText),Mutation)) {
+        Mutation->GetObjectField(TEXT("meshes"))->GetObjectField(TEXT("rigid"))->SetStringField(TEXT("texture"),TEXT("textures/blue.png"));MutationText.Empty();
+        FJsonSerializer::Serialize(Mutation.ToSharedRef(),TJsonWriterFactory<TCHAR,TCondensedJsonPrintPolicy<TCHAR>>::Create(&MutationText));
+        FFileHelper::SaveStringToFile(MutationText,*(MWFixtureRoot()/TEXT("catalog-continuity-mutation.json")),FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+        TestTrue(TEXT("Same asset name with changed data can be parsed"),ReadCached(TEXT("catalog-continuity-mutation.json")));
+        const auto Changed=IdentityCache.Entries.FindRef(TEXT("rigid")).Identity;
+        TestTrue(TEXT("Cached asset name cannot hide changed texture content"),Changed.IsValid() && CachedIdentity.IsValid() && *Changed!=*CachedIdentity);
+    }else AddError(TEXT("Owned cache mutation fixture failed"));
+    auto Definition=MakeShared<FJsonObject>();Definition->SetStringField(TEXT("file"),TEXT("meshes/owned.umesh"));Definition->SetStringField(TEXT("texture"),TEXT("textures/owned.png"));
+    auto Shading=MakeShared<FJsonObject>();Shading->SetBoolField(TEXT("lit"),true);Shading->SetBoolField(TEXT("native_sun"),true);Shading->SetArrayField(TEXT("native_lights"),{MakeShared<FJsonValueString>(TEXT("0x1111"))});Definition->SetObjectField(TEXT("shading"),Shading);
+    const auto Original=MWResourceContinuity(Definition);
+    Shading->SetBoolField(TEXT("native_sun"),false);Shading->SetArrayField(TEXT("native_lights"),{});
+    const auto Relit=MWResourceContinuity(Definition);
+    TestTrue(TEXT("Only original light membership changes preserve surface identity"),Original.IsValid() && Relit.IsValid() && *Original==*Relit);
+    for(const auto* Field:{TEXT("file"),TEXT("texture"),TEXT("skin_file"),TEXT("alpha_mode")}) {
+        FString Previous;const bool Had=Definition->TryGetStringField(Field,Previous);Definition->SetStringField(Field,TEXT("changed"));
+        const auto Changed=MWResourceContinuity(Definition);TestTrue(TEXT("Geometry, weights, textures and blend policy changes cannot qualify"),Changed.IsValid() && *Original!=*Changed);
+        if(Had)Definition->SetStringField(Field,Previous);else Definition->RemoveField(Field);
+    }
+    Shading->SetBoolField(TEXT("lit"),false);TestTrue(TEXT("Shader lighting mode remains an identity fence"),*MWResourceContinuity(Definition)!=*Original);Shading->SetBoolField(TEXT("lit"),true);
+    Definition->SetNumberField(TEXT("precision-probe"),1.0000000001);const auto Precise=MWResourceContinuity(Definition);
+    Definition->SetNumberField(TEXT("precision-probe"),1.0000000002);TestTrue(TEXT("Typed identities retain full numeric distinctions"),*Precise!=*MWResourceContinuity(Definition));
+    Definition->SetNumberField(TEXT("precision-probe"),-0.0);const auto NegativeZero=MWResourceContinuity(Definition);
+    Definition->SetNumberField(TEXT("precision-probe"),0.0);TestTrue(TEXT("Signed zero follows exact numeric cache comparison"),*NegativeZero==*MWResourceContinuity(Definition));Definition->RemoveField(TEXT("precision-probe"));
+    FMWBinding A{TEXT("actor"),TEXT("old"),TEXT("cell"),Original},B{TEXT("actor"),TEXT("new"),TEXT("cell"),Relit};TArray<int32> Indices;
+    TestTrue(TEXT("Validated lighting-only binding is compatible"),MWCompatibleBinding(A,B));
+    MWBuildRetainedRemap({B},{A},Indices);TestEqual(TEXT("Default remap stays strict"),Indices[0],INDEX_NONE);
+    MWBuildRetainedRemap({B},{A},Indices,nullptr,true);TestEqual(TEXT("Explicit current-pose remap accepts a lighting-only variant"),Indices[0],0);
+    MWBuildPoseRemap({A},{B},Indices);TestEqual(TEXT("Old pose cache never gains compatibility reuse"),Indices[0],INDEX_NONE);
+    B.Cell=TEXT("other");TestFalse(TEXT("Compatibility cannot cross cell ownership"),MWCompatibleBinding(A,B));B.Cell=A.Cell;B.Id=TEXT("replacement");TestFalse(TEXT("Compatibility cannot cross object replacement"),MWCompatibleBinding(A,B));
+    UWorld* World=nullptr;for(const auto& C:GEngine->GetWorldContexts())if(C.WorldType==EWorldType::Game && C.World()){World=C.World();break;}
+    if(!World){AddError(TEXT("Runtime world missing"));return false;}
+    auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+    if(!V)return false;V->AssetsPath=MWFixtureRoot();V->CreateGeometryMaterial();V->CurrentMaterialFrames.Add(TEXT("native:flip"),0);
+    const FString Before=TEXT("catalog-resources-0.json"),After=TEXT("catalog-resources-lighting.json");
+    double Until=FPlatformTime::Seconds()+3;while(V->Catalog!=Before && FPlatformTime::Seconds()<Until){V->LoadCatalog(Before);FPlatformProcess::Sleep(.001f);}
+    if(V->Catalog!=Before){AddError(TEXT("Initial continuity catalog failed"));V->Destroy();return false;}
+    auto P=MakeShared<FJsonObject>();P->SetStringField(TEXT("scene_epoch"),TEXT("11112222-3333-4444-5555-666677778888"));P->SetStringField(TEXT("scene_catalog"),Before);P->SetNumberField(TEXT("geometry_version"),6);V->SceneEpoch=P->GetStringField(TEXT("scene_epoch"));
+    TArray<FMWGeometryState> States;States.SetNum(96);TMap<FString,int32> Frames;Frames.Add(TEXT("native:flip"),0);
+    auto Pose=[&](float X){for(int32 I=0;I<96;++I){auto& S=States[I];S=FMWGeometryState();S.Visible=true;S.Transform[0]=S.Transform[4]=S.Transform[8]=S.Transform[12]=1;S.Transform[9]=X+I;if(I%3==1){S.Palette.Init(0,24);for(int32 J=0;J<2;++J){S.Palette[J*12]=S.Palette[J*12+5]=S.Palette[J*12+10]=1;S.Palette[J*12+3]=X+I;}S.Bound=FVector4f(X+I,0,0,5);}if(I%3==2){S.Points={X+I,0,0,X+I+3,0,0,X+I,4,0};S.Colors={1,0,0,1,0,1,0,1,0,0,1,1};S.UVs={0,0,1,0,0,1};}}};
+    Pose(0);V->UpdateGeometry(P,&States,&Frames);V->AdvanceGeometryResources(1,256);TestTrue(TEXT("Initial native resources apply"),V->UpdateGeometry(P,&States,&Frames));TestFalse(TEXT("Initial view is complete"),V->GeometryPartial);
+    V->ShowScene();auto* Skin=V->SkinnedComponents.FindRef(TEXT("resource-1"));auto* CPU=V->GeometryComponents.FindRef(TEXT("resource-2"));auto* MID=V->SkinMaterials.FindRef(TEXT("resource-1"));auto* Palette=V->PaletteTextures.FindRef(TEXT("resource-1"));auto* Shared=V->SharedMeshes.FindRef(TEXT("rigid"));
+    TArray<uint8> CatalogBytes;FFileHelper::LoadFileToArray(CatalogBytes,*(MWFixtureRoot()/After));TArray<FMWBinding> Incoming;
+    if(!MWReadCatalogBindings(After,FMD5::HashBytes(CatalogBytes.GetData(),CatalogBytes.Num()),MWFixtureRoot(),Incoming)){AddError(TEXT("Incoming continuity bindings failed"));V->Destroy();return false;}
+    P->SetStringField(TEXT("scene_catalog"),After);Until=FPlatformTime::Seconds()+3;int32 During=0;float X=100;
+    while(V->Catalog!=After && FPlatformTime::Seconds()<Until) {
+        Pose(X);TestTrue(TEXT("Every staging step applies a fresh compatible native pose"),V->UpdateGeometry(P,&States,&Frames,nullptr,&Incoming));
+        if(V->Catalog!=After){++During;TestTrue(TEXT("Original skin stays submitted while new materials stage"),V->InstanceSubmitted(TEXT("resource-1")));if(const auto* Current=V->UploadedBonePalettes.Find(TEXT("resource-1")))TestEqual(TEXT("Staging never freezes the actor's bones"),(*Current)[3],X+1);}
+        X+=1;FPlatformProcess::Sleep(.001f);
+    }
+    TestTrue(TEXT("Material handoff had a real preparation interval"),During>0);TestEqual(TEXT("Prepared catalog commits"),V->Catalog,After);
+    TestFalse(TEXT("Compatible handoff creates no resource-readiness hole"),V->GeometryPartial);
+    TestTrue(TEXT("Skin component survives the lighting update"),Skin && Skin==V->SkinnedComponents.FindRef(TEXT("resource-1")));
+    TestTrue(TEXT("Skin material updates uniforms in place"),MID && MID==V->SkinMaterials.FindRef(TEXT("resource-1")));
+    TestTrue(TEXT("Native palette texture survives"),Palette && Palette==V->PaletteTextures.FindRef(TEXT("resource-1")));
+    TestTrue(TEXT("Mutable section survives lighting update"),CPU && CPU==V->GeometryComponents.FindRef(TEXT("resource-2")));
+    TestTrue(TEXT("Rigid geometry shares its existing GPU buffer"),Shared && Shared==V->SharedMeshes.FindRef(TEXT("rigid-lighting")));
+    if(MID)TestEqual(TEXT("New native sunlight eligibility applied"),MID->K2_GetScalarParameterValue(TEXT("NativeObjectSun")),0.f);
+    Pose(500);States[1].Visible=false;TestTrue(TEXT("Original hiding still applies after handoff"),V->UpdateGeometry(P,&States,&Frames,nullptr,&Incoming));TestFalse(TEXT("Hidden native actor is excluded"),V->InstanceSubmitted(TEXT("resource-1")));
+    V->ResetScene();V->Destroy();return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWNativeTextureStagesTest,"UEMW.Renderer.NativeTextureStages",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWNativeTextureStagesTest::RunTest(const FString&) {
+    FThreadSafeBool Cancel=false;const FString Name=TEXT("catalog-stages-environment.json");
+    auto CatalogData=MWReadCatalog(Name,MWFixtureRoot(),{},{},Cancel);
+    if(!CatalogData.IsValid()){AddError(TEXT("Owned stage catalog failed to decode"));return false;}
+    const auto& Rigid=CatalogData->Meshes[TEXT("rigid")];
+    TestEqual(TEXT("All original map rows plus environment retained"),Rigid.TextureStages.Num(),6);
+    TestTrue(TEXT("Native UV1 is separate from sparse skin UV1"),Rigid.StageUV1.Num()==3 && Rigid.StageUV1[0]==FVector2D(.25,.5));
+    TestTrue(TEXT("Original UV2 preserved"),Rigid.StageUV2.Num()==3 && Rigid.StageUV2[0]==FVector2D(1,0));
+    FString Text;TSharedPtr<FJsonObject> Json;TMap<FString,FMWTextureEffectState> Effects;
+    if(!FFileHelper::LoadFileToString(Text,*(MWFixtureRoot()/TEXT("texture-effects.json"))) || !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text),Json) || !MWDecodeTextureEffects(Json,Effects)){AddError(TEXT("Native effect fixture failed"));return false;}
+    Json->GetObjectField(TEXT("values"))->SetArrayField(TEXT("bad"),{MakeShared<FJsonValueNumber>(1)});TMap<FString,FMWTextureEffectState> Rejected;
+    TestFalse(TEXT("Incomplete effect matrix rejects without a partial commit"),MWDecodeTextureEffects(Json,Rejected));TestEqual(TEXT("Rejected table stays empty"),Rejected.Num(),0);
+    UWorld* World=nullptr;for(const auto& C:GEngine->GetWorldContexts())if(C.WorldType==EWorldType::Game && C.World()){World=C.World();break;}
+    if(!World){AddError(TEXT("Runtime world missing"));return false;}
+    auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+    if(!V)return false;V->AssetsPath=MWFixtureRoot();V->CreateGeometryMaterial();V->CurrentMaterialFrames={{TEXT("native:flip"),0},{TEXT("native:glow"),0},{TEXT("native:environment"),0}};V->CurrentTextureEffects=Effects;
+    const double Until=FPlatformTime::Seconds()+3;while(V->Catalog!=Name && FPlatformTime::Seconds()<Until){V->LoadCatalog(Name);FPlatformProcess::Sleep(.001f);}
+    if(V->Catalog!=Name){AddError(TEXT("Stage material did not become ready"));V->Destroy();return false;}
+    auto* Template=V->GeometryMaterials.FindRef(TEXT("skin"));
+    if(!Template){AddError(TEXT("Skin environment template missing"));V->Destroy();return false;}
+    TestEqual(TEXT("Native detail uses original secondary UV set"),Template->K2_GetVectorParameterValue(TEXT("NativeStage2Settings")).A,1.f);
+    TestEqual(TEXT("Native effect enabled from captured state"),Template->K2_GetVectorParameterValue(TEXT("NativeEnvSettings")).R,1.f);
+    TestEqual(TEXT("Original projection translation retained"),Template->K2_GetVectorParameterValue(TEXT("NativeEnvRow0")).A,.5f);
+    auto Frames=V->CurrentMaterialFrames;Frames[TEXT("native:glow")]=1;Frames[TEXT("native:environment")]=1;
+    TestTrue(TEXT("Original secondary and environment frames apply"),V->ApplyMaterialFrames(Frames));
+    TestTrue(TEXT("Glow frame uses its own texture parameter"),Template->K2_GetTextureParameterValue(TEXT("NativeStage4"))==V->GeometryTextures.FindRef(TEXT("textures/blue.png")));
+    TestTrue(TEXT("Environment frame uses the independently resolved source index"),Template->K2_GetTextureParameterValue(TEXT("NativeEnvironmentMap"))==V->GeometryTextures.FindRef(TEXT("textures/blue.png")));
+    auto P=MakeShared<FJsonObject>();P->SetStringField(TEXT("scene_epoch"),TEXT("11112222-3333-4444-5555-666677778888"));P->SetStringField(TEXT("scene_catalog"),Name);P->SetNumberField(TEXT("geometry_version"),6);V->SceneEpoch=P->GetStringField(TEXT("scene_epoch"));
+    TArray<FMWGeometryState> States;States.SetNum(2);for(auto& S:States){S.Visible=true;S.Transform[0]=S.Transform[4]=S.Transform[8]=S.Transform[12]=1;}
+    States[1].Palette.Init(0,24);for(int32 I=0;I<2;++I){States[1].Palette[I*12]=States[1].Palette[I*12+5]=States[1].Palette[I*12+10]=1;}States[1].Bound=FVector4f(0,0,0,10);
+    V->UpdateGeometry(P,&States,&Frames,nullptr,nullptr,nullptr,&Effects);V->AdvanceGeometryResources(1,64);
+    TestTrue(TEXT("Native stage geometry applies with current source dependencies"),V->UpdateGeometry(P,&States,&Frames,nullptr,nullptr,nullptr,&Effects));
+    Effects[TEXT("native:environment")].Values[13]=.75f;
+    TestTrue(TEXT("Live original effect matrix changes apply"),V->UpdateGeometry(P,&States,&Frames,nullptr,nullptr,nullptr,&Effects));
+    auto* Skin=V->SkinMaterials.FindRef(TEXT("skin-instance"));TestTrue(TEXT("Current effect reaches existing skin material"),Skin && Skin->K2_GetVectorParameterValue(TEXT("NativeEnvRow0")).A==.75f);
+    // A full selection rebuild must retain stage-only controllers just as
+    // incremental catalog promotion does. Base maps need no flip group.
+    V->RenderSelectionDirty=true;Frames[TEXT("native:environment")]=0;Frames[TEXT("native:glow")]=0;
+    TestTrue(TEXT("Stage-only frames survive a full render selection rebuild"),V->ApplyMaterialFrames(Frames));
+    TestTrue(TEXT("Rebuilt selection updates the existing skin environment palette"),Skin && Skin->K2_GetTextureParameterValue(TEXT("NativeEnvironmentMap"))==V->GeometryTextures.FindRef(Rigid.TextureStages.Last().Frames[0]));
+    TestTrue(TEXT("Rebuilt selection includes rigid and skin stage-only assets"),V->FrameAssets.Contains(TEXT("rigid")) && V->FrameAssets.Contains(TEXT("skin")));
+    TMap<FString,FMWTextureEffectState> Missing;TestFalse(TEXT("A visible environment-mapped object cannot use an absent source effect"),V->UpdateGeometry(P,&States,&Frames,nullptr,nullptr,nullptr,&Missing));
+    V->ResetScene();V->Destroy();return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWNativeAlphaTest,"UEMW.Renderer.NativeAlphaComparison",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWNativeAlphaTest::RunTest(const FString&) {
+    FThreadSafeBool Cancel=false;
+    auto Data=MWReadCatalog(TEXT("catalog-alpha-test.json"),MWFixtureRoot(),{},{},Cancel);
+    if(!Data.IsValid()){AddError(TEXT("Owned alpha-test catalog missing"));return false;}
+    TestFalse(TEXT("Out-of-byte-range alpha reference rejects the whole catalogue"),MWReadCatalog(TEXT("catalog-alpha-test-invalid.json"),MWFixtureRoot(),{},{},Cancel).IsValid());
+    for(const auto& Pair:Data->Meshes)TestTrue(TEXT("Blend plus original alpha comparison retained"),Pair.Value.Transparent && Pair.Value.NativeAlphaTest && Pair.Value.AlphaTestFunction==4 && Pair.Value.AlphaTestReference==137);
+    UWorld* World=nullptr;for(const auto& C:GEngine->GetWorldContexts())if(C.WorldType==EWorldType::Game && C.World()){World=C.World();break;}
+    if(!World)return false;
+    auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+    if(!V)return false;V->AssetsPath=MWFixtureRoot();V->CreateGeometryMaterial();
+    const FString Name=TEXT("catalog-alpha-test.json");const double Until=FPlatformTime::Seconds()+3;
+    while(V->Catalog!=Name && FPlatformTime::Seconds()<Until){V->LoadCatalog(Name);FPlatformProcess::Sleep(.001f);}
+    TestEqual(TEXT("Alpha comparison catalogue becomes renderable"),V->Catalog,Name);
+    for(const auto& Pair:V->GeometryMaterials){const auto P=Pair.Value->K2_GetVectorParameterValue(TEXT("NativeAlphaTest"));TestTrue(TEXT("Source byte reference and function reach material"),P.R==1 && P.G==4 && P.B==137);}
+    if(!GUsingNullRHI) {
+      for(const TCHAR* Policy:{TEXT("translucent"),TEXT("masked")}) {
+        auto* Material=UMaterialInstanceDynamic::Create(V->GeometryBaseMaterials.FindRef(Policy),V);
+        auto* Texture=UTexture2D::CreateTransient(1,1,PF_B8G8R8A8);Texture->SRGB=false;Texture->Filter=TF_Nearest;
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,16,16,RTF_RGBA8,FLinearColor::Black,false);
+        Material->SetTextureParameterValue(TEXT("SpriteTexture"),Texture);Material->SetScalarParameterValue(TEXT("NativeLit"),0);Material->SetScalarParameterValue(TEXT("NativeFog"),0);Material->SetScalarParameterValue(TEXT("NativeSoftParticle"),0);Material->SetScalarParameterValue(TEXT("NativeEffectQuality"),0);
+        const bool Expected[8][3]={{1,1,1},{1,0,0},{0,1,0},{1,1,0},{0,0,1},{1,0,1},{0,1,1},{0,0,0}};
+        for(int32 A=0;A<3;++A) {
+            auto& Mip=Texture->GetPlatformData()->Mips[0];auto* Pixel=(FColor*)Mip.BulkData.Lock(LOCK_READ_WRITE);*Pixel=FColor(255,0,0,127+A);Mip.BulkData.Unlock();Texture->UpdateResource();FlushRenderingCommands();
+            for(int32 F=0;F<8;++F) {
+                Material->SetVectorParameterValue(TEXT("NativeAlphaTest"),FLinearColor(1,F,128,0));
+                UKismetRenderingLibrary::ClearRenderTarget2D(World,Target,FLinearColor::Black);UKismetRenderingLibrary::DrawMaterialToRenderTarget(World,Target,Material);FlushRenderingCommands();
+                TArray<FColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadPixels(Pixels);
+                TestTrue(FString::Printf(TEXT("GPU byte comparison policy=%s function=%d alpha=%d"),Policy,F,127+A),Pixels.Num()==256 && (Pixels[8*16+8].R>10)==Expected[F][A]);
+            }
+        }
+        Texture->ReleaseResource();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+      }
+    }else AddInfo(TEXT("GPU byte-comparison grid requires the separate graphics run; NullRHI verifies metadata and material parameters only."));
+    V->ResetScene();V->Destroy();return true;
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWWaterImageTest,"UEMW.Renderer.WaterImageOwnership",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
+bool FMWWaterImageTest::RunTest(const FString&) {
+    double Next=0;int32 Count=0;
+    for(int32 I=0;I<180;++I)Count+=MWWaterReflectionDue(10.+I/60.,Next)?1:0;
+    TestEqual(TEXT("Thirty captures per second at sixty renderer ticks without rounding loss"),Count,90);
+    TestFalse(TEXT("A second call at the same time cannot duplicate a capture"),MWWaterReflectionDue(10.+179/60.,Next));
+    TestTrue(TEXT("A long renderer stall schedules one new image"),MWWaterReflectionDue(20,Next));
+    TestFalse(TEXT("Missed images are not replayed in a burst"),MWWaterReflectionDue(20,Next));
+    FMWReflectionImage Image;Image.Epoch=TEXT("source-a");Image.Buffer=0;Image.Plane=12;Image.Requested=100;
+    TestTrue(TEXT("Fresh image can commit only with its original plane and source epoch"),MWWaterImageCurrent(Image,TEXT("source-a"),12,100.02));
+    TestFalse(TEXT("A disconnected/new source cannot inherit an old reflection"),MWWaterImageCurrent(Image,TEXT("source-b"),12,100.02));
+    TestFalse(TEXT("Water-plane changes reject a pending image"),MWWaterImageCurrent(Image,TEXT("source-a"),16,100.02));
+    TestFalse(TEXT("A delayed image cannot be refreshed by a later commit time"),MWWaterImageCurrent(Image,TEXT("source-a"),12,100.3));
+    TestFalse(TEXT("Future timestamps cannot commit"),MWWaterImageCurrent(Image,TEXT("source-a"),12,99));
+    Image.Buffer=2;TestFalse(TEXT("Invalid target index cannot commit"),MWWaterImageCurrent(Image,TEXT("source-a"),12,100.02));
+    if(!GUsingNullRHI) {
+        UWorld* World=nullptr;for(const auto& Context:GEngine->GetWorldContexts())if(Context.WorldType==EWorldType::Game && Context.World()){World=Context.World();break;}
+        if(!World)return false;
+        auto* Owner=World->SpawnActor<AActor>();
+        // Runtime materials bind a typed environment table. The base asset's
+        // white placeholder is not valid environment data (it looks like
+        // underwater fog), so use an owned disabled table in this fixture.
+        auto* Environment=MWFloatTexture(8,33,{});
+        auto MakeMaterial=[&](const TCHAR* Label,FLinearColor Tint) {
+            const FString Path=FString::Printf(TEXT("/Game/UEMW/Materials/MW_%s.MW_%s"),Label,Label);
+            auto* Base=LoadObject<UMaterialInterface>(nullptr,*Path);auto* M=UMaterialInstanceDynamic::Create(Base,Owner);
+            M->SetTextureParameterValue(TEXT("NativeEnvironment"),Environment);M->SetVectorParameterValue(TEXT("NativeTint"),Tint);M->SetScalarParameterValue(TEXT("NativeLit"),0);M->SetScalarParameterValue(TEXT("NativeFog"),0);M->SetScalarParameterValue(TEXT("NativeEffectQuality"),0);return M;
+        };
+        FMWMeshData Quad;Quad.Vertices={FVector(-500,-500,0),FVector(500,-500,0),FVector(500,500,0),FVector(-500,500,0)};Quad.UVs={FVector2D(0,0),FVector2D(1,0),FVector2D(1,1),FVector2D(0,1)};Quad.Colors.Init(FLinearColor::White,4);Quad.Triangles={0,1,2,0,2,3};
+        auto* Green=MakeMaterial(TEXT("Opaque"),FLinearColor(0,1,0,1));auto* Red=MakeMaterial(TEXT("Translucent"),FLinearColor(1,0,0,.5));
+        auto* Mesh=MWBuildMesh(Owner,Quad,Green);if(!Mesh)return false;
+        auto Component=[&](UMaterialInterface* Material,float Z) {
+            auto* P=NewObject<UStaticMeshComponent>(Owner);P->SetStaticMesh(Mesh);P->SetMaterial(0,Material);P->SetCollisionEnabled(ECollisionEnabled::NoCollision);P->SetWorldLocation(FVector(0,0,Z));P->RegisterComponent();return P;
+        };
+        auto* Back=Component(Green,0);auto* Front=Component(Red,50);
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,32,32,RTF_RGBA16f,FLinearColor::Black,false);
+        auto* Capture=NewObject<USceneCaptureComponent2D>(Owner);Capture->SetWorldLocationAndRotation(FVector(0,0,500),FRotator(-90,0,0));Capture->TextureTarget=Target;Capture->CaptureSource=SCS_SceneColorHDRNoAlpha;Capture->bCaptureEveryFrame=false;Capture->bCaptureOnMovement=false;Capture->PrimitiveRenderMode=ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;Capture->ShowFlags.SetSeparateTranslucency(false);Capture->RegisterComponent();
+        auto Pixel=[&]() {
+            Capture->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Pixels);return Pixels.IsValidIndex(16*32+16)?Pixels[16*32+16]:FLinearColor::Black;
+        };
+        Capture->ShowOnlyComponents={Back};const auto Before=Pixel();
+        Capture->ShowOnlyComponents.Add(Front);const auto After=Pixel();
+        AddInfo(FString::Printf(TEXT("Owned HDR background=%s blended=%s capture=%s back=%s front=%s"),*Before.ToString(),*After.ToString(),*Capture->GetComponentLocation().ToString(),*Back->Bounds.Origin.ToString(),*Front->Bounds.Origin.ToString()));
+        TestTrue(TEXT("HDR capture contains the owned opaque background"),Before.G>.01f && Before.R<Before.G*.05f);
+        TestTrue(TEXT("HDR reflection actually composites translucent colour into captured pixels"),After.R>Before.G*.2f && After.G>Before.G*.2f && After.G<Before.G*.8f);
+        Capture->DestroyComponent();Front->DestroyComponent();Back->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);Owner->Destroy();
+    }else AddInfo(TEXT("HDR transparency pixels require the separate D3D11 run."));
     return true;
 }
 #endif

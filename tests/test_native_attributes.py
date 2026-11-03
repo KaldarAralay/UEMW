@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import numpy as np
-from native_attributes import MORPH,discover,capture,AttributeCapture
+from native_attributes import MORPH,UV_CONTROLLER,discover,capture,AttributeCapture
 from geometry_stream import Geometry
 from game_assets import Assets
 from live_probe import SceneReadChanged
@@ -36,6 +36,24 @@ class AttributeMemory(Memory):
 
 
 class AttributeTests(unittest.TestCase):
+    def test_native_uv_controller_copies_resolved_uvs_and_fences_its_selector(self):
+        class UVMemory(AttributeMemory):
+            selected=0;controller_type=UV_CONTROLLER
+            def read(self,p,n):
+                if p==0xc0000:
+                    raw=bytearray(0x46);struct.pack_into('<I',raw,0,self.controller_type);struct.pack_into('<I',raw,0x28,self.target);struct.pack_into('<H',raw,0x44,self.selected);return bytes(raw[:n])
+                raw=super().read(p,n)
+                if p==0x50000:
+                    raw=bytearray(raw);struct.pack_into('<H',raw,0xa,1);return bytes(raw)
+                return raw
+        r=UVMemory();shape={**r.shape(),'cell_key':'interior:1'};item=discover(r,shape)
+        self.assertTrue(item['uvs']);self.assertFalse(item['morph']);self.assertFalse(item['colors'])
+        prepared=AttributeCapture([item]);r.uv=.125;first=capture(r,prepared)[0x40000];r.uv=.875;second=capture(r,prepared)[0x40000]
+        self.assertEqual(first[2][0,0],.125);self.assertEqual(second[2][0,0],.875)
+        r.selected=1
+        with self.assertRaisesRegex(SceneReadChanged,'UV controller'):capture(r,prepared)
+        self.assertIsNone(discover(r,shape));self.assertEqual(shape['unsupported_uv_animation'],1)
+
     def test_native_near_pass_sun_flare_streams_current_vertices_alpha_and_uv_without_world_false_positives(self):
         r=AttributeMemory();shape={**r.shape(),'controller':'0x0','cell_key':'view:first-person','texture':'Textures\\tx_sun_flash_grey_05.dds'}
         item=discover(r,shape);self.assertIsNotNone(item);self.assertTrue(item['colors']);self.assertTrue(item['uvs'])

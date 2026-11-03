@@ -21,6 +21,15 @@ def packet():
 
 
 class PackedStateTests(unittest.TestCase):
+    def test_native_identifier_alphabet_remains_printable_ascii_only(self):
+        for code in range(128):
+            value='native:'+chr(code)
+            if 32<=code<=126:self.assertEqual(metadata.key(value),bytes([len(value)])+value.encode('ascii'))
+            else:
+                with self.subTest(code=code),self.assertRaises(ValueError):metadata.key(value)
+        for value in ('native:\u00a0','native:\u00e9','native:\u200b','x'*97):
+            with self.subTest(value=value),self.assertRaises(ValueError):metadata.key(value)
+
     def manifest(self,p,body):
         return {**{k:v for k,v in p.items()if k not in(*metadata.FIELDS,'instance_states')},'version':4,'state_metadata_version':1}
     def test_complete_metadata_and_geometry_round_trip_in_one_identity_bound_body(self):

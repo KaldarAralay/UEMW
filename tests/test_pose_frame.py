@@ -14,6 +14,18 @@ def header(identity=(0,0),flags=0,bound=(0,10,0,1),transform=None):
     return bytes(raw)
 
 class PoseFrameTests(unittest.TestCase):
+    def test_reflected_only_geometry_is_fresh_without_bypassing_native_retirement(self):
+        cam={**CAMERA,'position':[0,0,100],'forward':[0,1,-.75],'up':[0,.75,1],'frustum':[-.3,.3,.3,-.3,1,2000]}
+        records=[(p,(3,0),(),None,None)for p in(0x20000,0x30000,0x40000,0x50000,0x60000)]
+        raw={p:header((99 if p==0x40000 else 3,0),flags=1 if p==0x30000 else 0,bound=(0,500,300,1))for p in(0x20000,0x30000,0x40000,0x50000,0x60000)}
+        layout=PoseLayout(records,view_pointers={0x50000},node_identities={p:(0,0)for p in raw},reflection_excluded={0x60000})
+        self.assertFalse(PoseFrame(raw,layout,cam).visible.any())
+        frame=PoseFrame(raw,layout,cam,reflection_plane=0)
+        np.testing.assert_array_equal(frame.visible,[True,False,False,False,False])
+        np.testing.assert_array_equal(frame.offscreen_reflections,[True,False,False,False,False])
+        # Underwater and source-hidden water never enable the mirror view.
+        self.assertFalse(PoseFrame(raw,layout,{**cam,'position':[0,0,-100]},reflection_plane=0).offscreen_reflections.any())
+        self.assertFalse(PoseFrame(raw,layout,cam,water_visible=False,reflection_plane=0).offscreen_reflections.any())
     def test_cell_slots_own_borrowed_render_roots_and_retirement_still_wins(self):
         root=bytearray(header());struct.pack_into('<I',root,0x18,0x90000)
         records=[(0x20000,(3,0),(0x10000,),None,None),(0x30000,(4,0),(0x10000,),None,None)]

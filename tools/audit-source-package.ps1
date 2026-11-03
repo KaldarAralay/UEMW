@@ -18,7 +18,7 @@ try {
         $DiskHash=(Get-FileHash -LiteralPath (Join-Path $ProjectRoot $Item.Path) -Algorithm SHA256).Hash
         if($Hash -ne $Item.SHA256 -or $Hash -ne $DiskHash){$Failures+="Hash mismatch: $($Item.Path)"}
     }
-    $Forbidden=@($Archive.Entries | Where-Object {$_.FullName -match '(?i)\.(bsa|esm|esp|ess|nif|dds|png|mp4|mkv|exe|dll|obj|lib|exp|ilk|pdb|dmp|ttf|uasset|umap|umesh|uskin|pak|utrace|pth|pt|onnx|safetensors)$'})
+    $Forbidden=@($Archive.Entries | Where-Object {$_.FullName -match '(?i)\.(bsa|esm|esp|ess|nif|dds|png|mp4|mkv|exe|dll|obj|lib|exp|ilk|pdb|dmp|ttf|uasset|umap|umesh|uskin|uuv|pak|utrace|pth|pt|onnx|safetensors)$'})
     $Result=[pscustomobject]@{passed=($Failures.Count -eq 0 -and $Forbidden.Count -eq 0 -and $Archive.Entries.Count -eq ($Manifest.Count+1));source_files=$Manifest.Count;zip_sha256=(Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash;failures=$Failures;forbidden_entries=@($Forbidden|ForEach-Object {$_.FullName})}
     $Result|ConvertTo-Json -Depth 4|Set-Content -LiteralPath (Join-Path $ProjectRoot "logs\$LogPrefix-source-package-audit.json")
     $Result|ConvertTo-Json -Depth 4

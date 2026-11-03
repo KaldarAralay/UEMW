@@ -1,4 +1,6 @@
 #include "MWLive.h"
+#include "MWDistant.h"
+#include "MWUI.h"
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "MWPresentation.h"
 #include "MWCelestial.h"
@@ -7,10 +9,12 @@
 #include "MWBackground.h"
 #include "MWChannel.h"
 #include "MWMesh.h"
+#include "MWLines.h"
 #include "MWFrame.h"
 #include "MWCamera.h"
 #include "MWSkin.h"
 #include "MWCatalog.h"
+#include "MWTextureStages.h"
 #include "MWTexture.h"
 #include "MWTerrain.h"
 #include "MWEnvironment.h"
@@ -220,6 +224,8 @@ struct FMWDecodedFrame {
     TMap<FString,int32> MaterialFrames;
     bool HaveMaterialFrames=false;
     TMap<FString,FMWMaterialValue> MaterialValues;
+    TMap<FString,FMWTextureEffectState> TextureEffects;
+    bool HaveTextureEffects=false;
     bool HaveMaterialValues=false;
     bool HaveEnvironment=false;
     FString Text,Error;
@@ -235,8 +241,9 @@ struct FMWDecodedFrame {
 // all actors, components, catalogs/materials and camera commits stay on Tick.
 // Packet ownership moves under the lock: a DOM is never read on both threads.
 struct FMWFrameReader {
+    FMWContinuityCache ContinuityCache;
     FMWChannelReader Channel;
-    FString BindingName,BindingDigest;
+    FString BindingName,BindingDigest,BindingTableDigest;
     TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> BindingCache;
     TSharedPtr<const TMap<FString,int32>,ESPMode::ThreadSafe> BindingIndexCache;
     FString Path;
@@ -270,7 +277,11 @@ struct FMWFrameReader {
             TArray<uint8> SharedBytes;bool Shared=false;
             const auto ChannelResult=Channel.Read(Path,Result.Text,SharedBytes,Shared);
             if(ChannelResult==EMWChannelRead::Busy){FPlatformProcess::Sleep(.001f);continue;}
-            if(ChannelResult==EMWChannelRead::Unchanged){FPlatformProcess::Sleep(.004f);continue;}
+            // A 4 ms shared-channel poll plus decode frequently missed the
+            // next game-thread tick after a genuinely fresh native capture.
+            // Unchanged shared reads inspect only the bounded commit header;
+            // sleep rather than spin, with no UObject work on this thread.
+            if(ChannelResult==EMWChannelRead::Unchanged){FPlatformProcess::Sleep(.001f);continue;}
             const bool Read=ChannelResult==EMWChannelRead::Ready;
             (Shared?Result.ChannelReadMs:Result.ManifestReadMs)=(FPlatformTime::Seconds()-Started)*1000;
             if(!Read) {
@@ -300,15 +311,22 @@ struct FMWFrameReader {
                             Result.Packet->SetArrayField(TEXT("objects"),{});
                             if(!ValidatePacket(Result.Packet,true))Result.Error=TEXT("INVALID BINARY METADATA");
                             else if(Result.Packet->HasField(TEXT("scene_bindings_version"))) {
-                                double BindingVersion=0;FString Name,Digest;
-                                if(!Result.Packet->TryGetNumberField(TEXT("scene_bindings_version"),BindingVersion) || BindingVersion!=1 || !Result.Packet->TryGetStringField(TEXT("scene_catalog"),Name) || !Result.Packet->TryGetStringField(TEXT("scene_catalog_md5"),Digest))Result.Error=TEXT("INVALID NATIVE BINDING REFERENCE");
+                                double BindingVersion=0;FString Name,Digest,TableDigest;const TSharedPtr<FJsonObject>* Reference=nullptr;
+                                if(!Result.Packet->TryGetNumberField(TEXT("scene_bindings_version"),BindingVersion) || (BindingVersion!=1 && BindingVersion!=2) || !Result.Packet->TryGetStringField(TEXT("scene_catalog"),Name) || !Result.Packet->TryGetStringField(TEXT("scene_catalog_md5"),Digest) ||
+                                    (BindingVersion==2 && (!Result.Packet->TryGetObjectField(TEXT("scene_binding_index"),Reference) || !Reference->IsValid() || !(*Reference)->TryGetStringField(TEXT("md5"),TableDigest))))Result.Error=TEXT("INVALID NATIVE BINDING REFERENCE");
                                 else {
-                                    if(!BindingCache.IsValid() || BindingName!=Name || BindingDigest!=Digest) {
+                                    if(BindingVersion==2) {
+                                        FString TableFile;double TableBytes=0;
+                                        if(!(*Reference)->TryGetStringField(TEXT("file"),TableFile) || !(*Reference)->TryGetNumberField(TEXT("bytes"),TableBytes) || !FMath::IsFinite(TableBytes) || TableBytes<32 || TableBytes>16*1024*1024 || TableBytes!=double(int64(TableBytes)))Result.Error=TEXT("INVALID NATIVE BINDING DESCRIPTOR");
+                                        else TableDigest+=TEXT("|")+TableFile+FString::Printf(TEXT("|%d"),int32(TableBytes));
+                                    }
+                                    if(Result.Error.IsEmpty() && (!BindingCache.IsValid() || BindingName!=Name || BindingDigest!=Digest || BindingTableDigest!=TableDigest)) {
                                         auto Rows=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>();
-                                        if(MWReadCatalogBindings(Name,Digest,FPaths::GetPath(FPaths::GetPath(Path))/TEXT("assets"),*Rows)){
+                                        const FString Folder=FPaths::GetPath(FPaths::GetPath(Path))/TEXT("assets");
+                                        if(BindingVersion==2?MWReadBindingIndex(*Reference,Name,Digest,Folder,*Rows):MWReadCatalogBindings(Name,Digest,Folder,*Rows,&ContinuityCache)){
                                             auto Index=MakeShared<TMap<FString,int32>,ESPMode::ThreadSafe>();Index->Reserve(Rows->Num());
                                             for(int32 I=0;I<Rows->Num();++I)Index->Add((*Rows)[I].Id,I);
-                                            BindingCache=Rows;BindingIndexCache=Index;BindingName=Name;BindingDigest=Digest;
+                                            BindingCache=Rows;BindingIndexCache=Index;BindingName=Name;BindingDigest=Digest;BindingTableDigest=TableDigest;
                                         }
                                         else Result.Error=TEXT("INVALID NATIVE BINDING TABLE");
                                     }
@@ -336,6 +354,11 @@ struct FMWFrameReader {
                 const TSharedPtr<FJsonObject>* Material=nullptr;
                 Result.HaveMaterialValues=Result.Packet->TryGetObjectField(TEXT("material_values"),Material) && Material->IsValid() && MWDecodeMaterialValues(*Material,Result.MaterialValues);
                 if(!Result.HaveMaterialValues)Result.Error=TEXT("INVALID NATIVE MATERIAL VALUES");
+            }
+            if(Result.Error.IsEmpty() && Result.Packet.IsValid() && Result.Packet->HasField(TEXT("texture_effects"))) {
+                const TSharedPtr<FJsonObject>* Effects=nullptr;
+                Result.HaveTextureEffects=Result.Packet->TryGetObjectField(TEXT("texture_effects"),Effects) && Effects->IsValid() && MWDecodeTextureEffects(*Effects,Result.TextureEffects);
+                if(!Result.HaveTextureEffects)Result.Error=TEXT("INVALID NATIVE TEXTURE EFFECTS");
             }
             Result.DecodeMs=(FPlatformTime::Seconds()-Started)*1000;
             Result.DecodeOtherMs=FMath::Max(0.0,Result.DecodeMs-Result.ChannelReadMs-Result.ManifestReadMs-Result.ManifestJsonMs-Result.BinaryTimings.ReadMs-Result.BinaryTimings.HashMs-Result.BinaryTimings.DecodeMs);
@@ -420,9 +443,12 @@ struct FMWPresentationWriter {
     }
 };
 
-AMWLive::~AMWLive() {delete PresentationWriter;PresentationWriter=nullptr;delete CameraReader;CameraReader=nullptr;delete FrameReader;FrameReader=nullptr;delete CatalogLoader;CatalogLoader=nullptr;}
+AMWLive::~AMWLive() {delete UIView;UIView=nullptr;delete DistantView;DistantView=nullptr;delete PresentationWriter;PresentationWriter=nullptr;delete CameraReader;CameraReader=nullptr;delete FrameReader;FrameReader=nullptr;delete CatalogLoader;CatalogLoader=nullptr;}
 
 void AMWLive::EndPlay(const EEndPlayReason::Type Reason) {
+    delete UIView;UIView=nullptr;
+    delete DistantView;DistantView=nullptr;
+    if(DistantGeometry){DistantGeometry->Destroy();DistantGeometry=nullptr;}
     BackgroundView.Reset();
     ClearPrimitiveFilters();
     delete PresentationWriter;PresentationWriter=nullptr;
@@ -431,6 +457,7 @@ void AMWLive::EndPlay(const EEndPlayReason::Type Reason) {
 }
 
 void AMWLive::BeginPlay() {
+    if(AuxiliaryGeometry){Super::BeginPlay();SetActorTickEnabled(false);CreateGeometryMaterial();HideScene();return;}
     BackgroundView=FSceneViewExtensions::NewExtension<FMWBackgroundView>(GetWorld());
     Super::BeginPlay();
     for(const auto* Name:{TEXT("t.IdleWhenNotForeground"),TEXT("Slate.bAllowThrottling")}) {
@@ -449,6 +476,8 @@ void AMWLive::BeginPlay() {
     DataRoot=FPaths::ConvertRelativePathToFull(DataRoot);
     SnapshotPath=DataRoot/TEXT("local/bridge/latest.json");
     AssetsPath=DataRoot/TEXT("local/assets");
+    DistantView=new FMWDistantView;
+    UIView=new FMWUIView;
     FModuleManager::LoadModuleChecked<IModuleInterface>(TEXT("ImageWrapper"));
     EnvironmentTexture=MWFloatTexture(8,33,{});
     NativeAmbientSky->SetCubemap(LoadObject<UTextureCube>(nullptr,TEXT("/Game/UEMW/Materials/MW_AmbientProbe.MW_AmbientProbe")));
@@ -482,6 +511,8 @@ void AMWLive::BeginPlay() {
 }
 
 void AMWLive::HideScene() {
+    if(DistantGeometry)DistantGeometry->HideScene();
+    DistantVisible=0;
     if(SceneShown)UE_LOG(LogTemp,Warning,TEXT("UEMW scene hidden seq=%lld catalog=%s reason=%s"),Sequence,*Catalog,*Status);
     SceneShown=false;
     InvalidateWaterReflection();
@@ -515,6 +546,7 @@ void AMWLive::RejectGeometry() {
 }
 
 void AMWLive::ResetScene() {
+    if(DistantGeometry)DistantGeometry->HideScene();
     NativeMenuOpen=true;HavePlayerStats=false;
     NativePoseValid=false;AppliedNativeStates.Empty();AppliedNativeBindings.Empty();AppliedNativeCatalog.Empty();NativeResourceInvalidations.Empty();
     SourceBindingSnapshot.Reset();CatalogBindingSnapshot.Reset();AppliedBindingSnapshot.Reset();SourceBindingCatalog.Empty();
@@ -540,11 +572,12 @@ void AMWLive::ResetScene() {
     RigidVisible.Empty();ReconciledCatalog.Empty();
     SkinnedComponents.Empty();SkinMaterials.Empty();WeightTextures.Empty();PaletteTextures.Empty();ViewCachedAssets.Empty();
     CurrentMaterialFrames.Empty();AppliedMaterialFrames.Empty();
+    CurrentTextureEffects.Empty();AppliedTextureEffects.Empty();
     CurrentMaterialValues.Empty();AppliedMaterialValues.Empty();
     UploadedBonePalettes.Empty();
     UploadedVertexPoses.Empty();
     ObjectCount=0;FocusName.Empty();
-    AcceptedSnapshotStamp=0;AcceptedSnapshotText.Empty();
+    AcceptedSnapshotStamp=0;AcceptedGeometrySequence=-1;AcceptedSnapshotText.Empty();
     CameraSession.Empty();CameraEpoch.Empty();CameraSequence=-1;LastCameraStamp=0;
     ViewPoseCameraValid=false;ViewPoseStamp=0;ViewPoseBounds.Empty();ViewCorrection=FTransform::Identity;ViewCorrectedMaterials=BackgroundAnchoredMaterials=0;
     ViewLaneCatalog.Empty();ViewLaneStamp=0;ViewLaneIds.Empty();ViewLaneAssets.Empty();BackgroundPoseValid=false;
@@ -559,13 +592,18 @@ void AMWLive::CreateGeometryMaterial() {
     GeometryTextureParameter=TEXT("SpriteTexture");
     GeometryBaseMaterials.Empty();SkinBaseMaterials.Empty();
     for(const auto* Mode:{TEXT("Opaque"),TEXT("Masked"),TEXT("Foliage"),TEXT("Translucent"),TEXT("Additive"),TEXT("Premultiplied"),TEXT("Modulate"),TEXT("Water"),TEXT("Terrain"),TEXT("Hair"),TEXT("Glass")}) {
-        const FString BaseName=FString(TEXT("MW_"))+Mode;
+      for(bool EnvironmentMap:{false,true}) {
+        if(EnvironmentMap && (FString(Mode)==TEXT("Water") || FString(Mode)==TEXT("Terrain")))continue;
+        const FString Suffix=EnvironmentMap?TEXT("_Env"):TEXT("");
+        const FString Key=FString(Mode).ToLower()+(EnvironmentMap?TEXT("-environment"):TEXT(""));
+        const FString BaseName=FString(TEXT("MW_"))+Mode+Suffix;
         auto* Base=LoadObject<UMaterialInterface>(nullptr,*(TEXT("/Game/UEMW/Materials/")+BaseName+TEXT(".")+BaseName));
-        const FString Name=FString(TEXT("MW_"))+Mode+TEXT("_Skin");
+        const FString Name=BaseName+TEXT("_Skin");
         auto* Material=LoadObject<UMaterialInterface>(nullptr,*(TEXT("/Game/UEMW/Materials/")+Name+TEXT(".")+Name));
         if(!Base || !Material){UE_LOG(LogTemp,Error,TEXT("UEMW cooked native blend materials missing: %s"),Mode);GeometryBaseMaterial=nullptr;return;}
-        GeometryBaseMaterials.Add(FString(Mode).ToLower(),Base);
-        SkinBaseMaterials.Add(FString(Mode).ToLower(),Material);
+        GeometryBaseMaterials.Add(Key,Base);
+        SkinBaseMaterials.Add(Key,Material);
+      }
     }
     GeometryBaseMaterial=GeometryBaseMaterials.FindRef(TEXT("opaque"));
     GeometryMaskedMaterial=GeometryBaseMaterials.FindRef(TEXT("masked"));
@@ -634,7 +672,7 @@ bool AMWLive::LoadCatalog(const FString& Name) {
     if(Loader.Name!=Name) {
         if(Loader.Future.IsValid() && !Loader.Future.IsReady()){Loader.Cancelled=true;return false;}
         if(Loader.Future.IsValid())Loader.Future.Get();
-        Loader.Data.Reset();Loader.MeshIndex=Loader.TextureIndex=Loader.TerrainStage=0;Loader.Name=Name;Loader.BindingsCommitted=false;Loader.Cancelled=false;Loader.Error.Empty();ResourceError.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;
+        Loader.Data.Reset();Loader.MeshIndex=Loader.TextureIndex=Loader.AliasIndex=Loader.TerrainStage=0;Loader.Name=Name;Loader.DefinitionsCommitted=Loader.BindingsCommitted=false;Loader.Cancelled=false;Loader.Error.Empty();ResourceError.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;
         TSet<FString> KnownMeshes,KnownTextures;
         // A catalog may replace another before its material jobs finish. CPU
         // metadata alone is not a completed cache entry: the new catalog must
@@ -653,9 +691,19 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         auto PoseSourceBindings=CatalogBindingSnapshot;
         if(!PoseSourceBindings.IsValid() || PoseSourceBindings->Num()!=GeometryBindings.Num())PoseSourceBindings=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>(GeometryBindings);
         const FThreadSafeBool* Cancel=&Loader.Cancelled;
-        Loader.Future=Async(EAsyncExecution::ThreadPool,[Name,Folder,KnownMeshes=MoveTemp(KnownMeshes),KnownTextures=MoveTemp(KnownTextures),Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool,PoseSourceCatalog,PoseSourceBindings=MoveTemp(PoseSourceBindings)]() {
+        const auto IncomingBindings=SourceBindingCatalog==Name?SourceBindingSnapshot:nullptr;
+        Loader.Future=Async(EAsyncExecution::ThreadPool,[Name,Folder,KnownMeshes=MoveTemp(KnownMeshes),KnownTextures=MoveTemp(KnownTextures),Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool,PoseSourceCatalog,PoseSourceBindings=MoveTemp(PoseSourceBindings),IncomingBindings]() {
             auto Data=MWReadCatalog(Name,Folder,KnownMeshes,KnownTextures,*Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool);
+            if(Data.IsValid() && IncomingBindings.IsValid() && !MWEqualBindingTables(*IncomingBindings,Data->Bindings))return FMWCatalogPtr();
             if(Data.IsValid() && !*Cancel && MWBuildPoseRemap(*PoseSourceBindings,Data->Bindings,Data->PoseRemap)){Data->PoseSourceCatalog=PoseSourceCatalog;Data->PoseSourceCount=PoseSourceBindings->Num();}
+            if(Data.IsValid() && !*Cancel) {
+                TMap<FString,int32> Previous;Previous.Reserve(PoseSourceBindings->Num());
+                for(int32 I=0;I<PoseSourceBindings->Num();++I)Previous.Add((*PoseSourceBindings)[I].Id,I);
+                for(const auto& B:Data->Bindings)if(const auto* I=Previous.Find(B.Id)) {
+                    const auto& Old=(*PoseSourceBindings)[*I];
+                    if(Old.Asset!=B.Asset && MWCompatibleBinding(Old,B))Data->ResourceAliases.FindOrAdd(B.Asset)=Old.Asset;
+                }
+            }
             return Data;
         });
         return false;
@@ -669,6 +717,7 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         Loader.UpgradeIndex=Loader.Data->UpgradeIndex;
         TextureUpgradeStatus=Loader.UpgradeIndex->Status;PeakTextureWorkMs=FMath::Max(PeakTextureWorkMs,Loader.Data->TextureWorkMs);TextureUpgradeFallbacks+=Loader.Data->UpgradeFallbacks;
         Loader.Data->Meshes.GetKeys(Loader.MeshKeys);Loader.Data->Images.GetKeys(Loader.TextureKeys);
+        Loader.Data->ResourceAliases.GetKeys(Loader.AliasKeys);Loader.AliasKeys.Sort();
         Loader.MeshKeys.Sort([&](const FString& A,const FString& B){
             const bool NearA=Loader.Data->Meshes[A].FirstPerson,NearB=Loader.Data->Meshes[B].FirstPerson;
             return NearA!=NearB?NearA:A<B;
@@ -676,30 +725,13 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         Loader.TextureKeys.Sort();
     }
     auto& Data=*Loader.Data;
-    if(!Loader.BindingsCommitted) {
+    if(!Loader.DefinitionsCommitted) {
         // The background decoder validated every definition and image. Adopt
-        // binding order and CPU metadata together before constructing UObjects.
+        // CPU metadata first; active bindings remain intact during GPU staging.
         EnsureRenderSelection();
-        for(auto& Pair:Data.Meshes){const auto& D=Pair.Value;SetRenderAssetTraits(Pair.Key,(!TargetedRenderUpdates || D.Background || D.FirstPerson?1:0)|(!TargetedRenderUpdates || !D.TextureFrameGroup.IsEmpty()?2:0)|(!TargetedRenderUpdates || !D.MaterialValueGroup.IsEmpty()?4:0));if(D.FirstPerson && ViewCachedAssets.Num()<128)ViewCachedAssets.Add(Pair.Key);MeshData.Add(Pair.Key,MoveTemp(Pair.Value));}
+        for(auto& Pair:Data.Meshes){const auto& D=Pair.Value;SetRenderAssetTraits(Pair.Key,(!TargetedRenderUpdates || D.Background || D.FirstPerson?1:0)|(!TargetedRenderUpdates || !D.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(D)?2:0)|(!TargetedRenderUpdates || !D.MaterialValueGroup.IsEmpty()?4:0));if(D.FirstPerson && ViewCachedAssets.Num()<128)ViewCachedAssets.Add(Pair.Key);MeshData.Add(Pair.Key,MoveTemp(Pair.Value));}
         Data.Meshes.Empty();
-        for(auto It=MeshData.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key())){SetRenderAssetTraits(It.Key(),0);It.RemoveCurrent();}
-        for(auto It=GeometryMaterials.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key()))It.RemoveCurrent();
-        for(auto It=GeometryTextures.CreateIterator();It;++It)if(!Data.WantedTextures.Contains(It.Key()))It.RemoveCurrent();
-        for(auto It=MaskedTextures.CreateIterator();It;++It)if(!Data.WantedMaskedTextures.Contains(It.Key()))It.RemoveCurrent();
-        for(auto It=BlendTextures.CreateIterator();It;++It)if(!Data.WantedBlendTextures.Contains(It.Key()))It.RemoveCurrent();
-        for(auto It=DetailTextures.CreateIterator();It;++It)if(!Data.WantedDetailTextures.Contains(It.Key()))It.RemoveCurrent();
-        for(auto It=AppliedMaterialFrames.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
-        for(auto It=AppliedMaterialValues.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
-        GeometryBindings=MoveTemp(Data.Bindings);Catalog=Name;Loader.BindingsCommitted=true;
-        CatalogBindingSnapshot=SourceBindingCatalog==Catalog && SourceBindingSnapshot.IsValid() && SourceBindingSnapshot->Num()==GeometryBindings.Num()?SourceBindingSnapshot:nullptr;
-        RenderSelectionCatalog=Catalog;RenderSelectionMeshes=MeshData.Num();RenderSelectionInstances=InstanceAssets.Num();RenderSelectionDirty=false;
-        PreparedPoseSourceCatalog=MoveTemp(Data.PoseSourceCatalog);PreparedPoseSourceCount=Data.PoseSourceCount;PreparedPoseRemap=MoveTemp(Data.PoseRemap);
-        PreparedResourceCatalog=Catalog;PreparedResourceBindings=MoveTemp(Data.BindingAssets);
-        BindingTraits.SetNum(GeometryBindings.Num());BindingTraitsCatalog=Catalog;
-        for(int32 I=0;I<GeometryBindings.Num();++I){const auto& D=MeshData[GeometryBindings[I].Asset];BindingTraits[I]=(D.FirstPerson?1:0)|(D.Rain?2:0)|(!D.MaterialValueGroup.IsEmpty() || !D.TextureFrameGroup.IsEmpty()?4:0);}
-        UpgradedTextureKeys=Data.UpgradedTextures;TextureUpgradeReservedBytes=Data.UpgradeReservedBytes;TextureUpgradeBudgetSkipped=Data.UpgradeBudgetSkipped;
-        CelestialSunIds.Empty();for(const auto& B:GeometryBindings)if(const auto* M=MeshData.Find(B.Asset))if(M->CelestialKind==4)CelestialSunIds.Add(B.Id);
-        return true; // No placeholder becomes visible merely by adopting bindings.
+        Loader.DefinitionsCommitted=true;return false;
     }
     const double Began=FPlatformTime::Seconds();
     if(Data.TerrainChanged && Loader.TerrainStage<3) {
@@ -722,7 +754,7 @@ bool AMWLive::LoadCatalog(const FString& Name) {
             TerrainColorPool=TerrainDetailPool=nullptr;TerrainTileMap=TerrainFinishes=nullptr;TerrainLayers=TerrainTiles=0;TerrainPoolBytes=0;TerrainPoolSignature.Empty();TerrainSignature=Data.TerrainSignature;TerrainStatus=TEXT("original tile fallback / no supported terrain grid");Loader.TerrainStage=3;
             for(const auto& Pair:GeometryMaterials)if(const auto* M=MeshData.Find(Pair.Key))if(M->Terrain)BindTerrainMaterial(Pair.Value);
         }
-        PeakTerrainUploadMs=FMath::Max(PeakTerrainUploadMs,(FPlatformTime::Seconds()-Start)*1000);return true;
+        PeakTerrainUploadMs=FMath::Max(PeakTerrainUploadMs,(FPlatformTime::Seconds()-Start)*1000);return false;
     }
     while(Loader.TextureIndex<Loader.TextureKeys.Num()) {
         const FString& Key=Loader.TextureKeys[Loader.TextureIndex++];
@@ -734,11 +766,12 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         if(Images.Detail.Num()){auto* Texture=MWCreateNativeTexture(Images.Detail);if(!Texture)return Fail(TEXT("Native surface detail allocation failed"));DetailTextures.Add(Key,Texture);}
         Data.Images.Remove(Key);
         PeakTextureUploadMs=FMath::Max(PeakTextureUploadMs,(FPlatformTime::Seconds()-UploadBegan)*1000);
-        if(FPlatformTime::Seconds()-Began>.002)return true;
+        if(FPlatformTime::Seconds()-Began>.002)return false;
     }
     while(Loader.MeshIndex<Loader.MeshKeys.Num()) {
         const FString& Key=Loader.MeshKeys[Loader.MeshIndex++];auto* Mesh=MeshData.Find(Key);
-        const FString Mode=Mesh->Terrain?TEXT("terrain"):Mesh->Water?TEXT("water"):Mesh->Glass?TEXT("glass"):Mesh->Foliage?TEXT("foliage"):Mesh->Character==2 && Mesh->Masked?TEXT("hair"):Data.AlphaModes.FindRef(Key);
+        FString Mode=Mesh->Terrain?TEXT("terrain"):Mesh->Water?TEXT("water"):Mesh->Glass?TEXT("glass"):Mesh->Foliage?TEXT("foliage"):Mesh->Character==2 && Mesh->Masked?TEXT("hair"):Data.AlphaModes.FindRef(Key);
+        if(!Mesh->TextureEffectGroup.IsEmpty() && Mesh->TextureEffectSupported)Mode+=TEXT("-environment");
         auto* Base=Mesh->SkinBones?SkinBaseMaterials.FindRef(Mode):GeometryBaseMaterials.FindRef(Mode);
         if(!Base)return Fail(TEXT("Native material blend policy is unavailable"));
         auto* Material=UMaterialInstanceDynamic::Create(Base,this);
@@ -761,7 +794,30 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         Material->SetScalarParameterValue(TEXT("NativeBackground"),Mesh->Background?1:0);
         Material->SetScalarParameterValue(TEXT("NativeRain"),Mesh->Rain?1:0);
         Material->SetScalarParameterValue(TEXT("NativeBlendOpacity"),Mesh->BlendNativeOpacity?1:0);
+        Material->SetVectorParameterValue(TEXT("NativeAlphaTest"),FLinearColor(Mesh->NativeAlphaTest?1:0,Mesh->AlphaTestFunction,Mesh->AlphaTestReference,0));
         Material->SetVectorParameterValue(TEXT("NativeEmission"),Mesh->Emissive);
+        Material->SetScalarParameterValue(TEXT("NativeTextureApply"),Mesh->TextureApply);
+        bool SecondaryStage=Mesh->TextureApply<2;for(const auto& S:Mesh->TextureStages)SecondaryStage|=S.Slot>0 && S.Slot<=6 && !S.Texture.IsEmpty();
+        Material->SetScalarParameterValue(TEXT("NativeStagesActive"),SecondaryStage?1:0);
+        for(const auto& Stage:Mesh->TextureStages)if(Stage.Slot<=6) {
+            const FName Settings=*FString::Printf(TEXT("NativeStage%dSettings"),Stage.Slot);
+            Material->SetVectorParameterValue(Settings,FLinearColor(Stage.Texture.IsEmpty() || !Stage.Supported?0:1,Stage.Clamp,Stage.Filter,Stage.UVSet));
+            if(Stage.Slot==5 && Stage.Supported && Stage.Bump.Num()==6) {
+                Material->SetScalarParameterValue(TEXT("NativeBumpActive"),1);
+                Material->SetVectorParameterValue(TEXT("NativeBumpMatrix"),FLinearColor(Stage.Bump[2],Stage.Bump[3],Stage.Bump[4],Stage.Bump[5]));
+            }
+            if(Stage.Slot && !Stage.Texture.IsEmpty()) {
+                auto* Texture=GeometryTextures.FindRef(Stage.Texture);if(!Texture)return Fail(TEXT("Native secondary stage texture missing"));
+                Material->SetTextureParameterValue(*FString::Printf(TEXT("NativeStage%d"),Stage.Slot),Texture);
+            }
+        }
+        for(const auto& Stage:Mesh->TextureStages)if(Stage.Slot==14) {
+            auto* Texture=GeometryTextures.FindRef(Stage.Texture);if(!Texture)return Fail(TEXT("Original environment-map texture missing"));
+            Material->SetTextureParameterValue(TEXT("NativeEnvironmentMap"),Texture);
+        }
+        if(const auto* Effect=CurrentTextureEffects.Find(Mesh->TextureEffectGroup)){MWSetTextureEffect(Material,*Effect,Mesh->TextureEffectSupported);AppliedTextureEffects.Add(Key,*Effect);}
+        bool StageChanged=false;
+        if(!MWStageFramesValid(*Mesh,&CurrentMaterialFrames) || !MWApplyStageFrames(Material,*Mesh,CurrentMaterialFrames,GeometryTextures,StageChanged))return Fail(TEXT("Native secondary stage frame invalid"));
         if(!Mesh->MaterialValueGroup.IsEmpty()) {
             const auto* Value=CurrentMaterialValues.Find(Mesh->MaterialValueGroup);
             // Hidden retired branches can lack a current value. Visible-state
@@ -769,13 +825,13 @@ bool AMWLive::LoadCatalog(const FString& Name) {
             if(Value){MWSetMaterialValue(Material,*Value,Mesh->Lit);AppliedMaterialValues.Add(Key,*Value);}
         }
         if(!Mesh->Texture.IsEmpty()) {
-            auto* Texture=Mesh->Masked?MaskedTextures.FindRef(Mesh->Texture):Mesh->BlendFiltered?BlendTextures.FindRef(Mesh->Texture):GeometryTextures.FindRef(Mesh->Texture);if(!Texture)return Fail(TEXT("Native catalog texture dependency is missing"));
+            auto* Texture=Mesh->Masked && !Mesh->NativeAlphaTest?MaskedTextures.FindRef(Mesh->Texture):Mesh->BlendFiltered && !Mesh->NativeAlphaTest?BlendTextures.FindRef(Mesh->Texture):GeometryTextures.FindRef(Mesh->Texture);if(!Texture)return Fail(TEXT("Native catalog texture dependency is missing"));
             Material->SetTextureParameterValue(GeometryTextureParameter,Texture);
             if(Mesh->DetailStrength>0){auto* Detail=DetailTextures.FindRef(Mesh->Texture);if(!Detail)return Fail(TEXT("Native detail texture dependency is missing"));Material->SetTextureParameterValue(TEXT("NativeSurfaceDetail"),Detail);Material->SetVectorParameterValue(TEXT("NativeDetailResolution"),FLinearColor(Mesh->Terrain?512:Detail->GetSizeX(),Mesh->Terrain?512:Detail->GetSizeY(),0,0));}
         }
         if(const auto* Index=CurrentMaterialFrames.Find(Mesh->TextureFrameGroup)) {
             if(!Mesh->TextureFrames.IsValidIndex(*Index))return Fail(TEXT("Native texture frame is outside its palette"));
-            auto* Texture=Mesh->Masked?MaskedTextures.FindRef(Mesh->TextureFrames[*Index]):Mesh->BlendFiltered?BlendTextures.FindRef(Mesh->TextureFrames[*Index]):GeometryTextures.FindRef(Mesh->TextureFrames[*Index]);if(!Texture)return Fail(TEXT("Native catalog texture dependency is missing"));
+            auto* Texture=Mesh->Masked && !Mesh->NativeAlphaTest?MaskedTextures.FindRef(Mesh->TextureFrames[*Index]):Mesh->BlendFiltered && !Mesh->NativeAlphaTest?BlendTextures.FindRef(Mesh->TextureFrames[*Index]):GeometryTextures.FindRef(Mesh->TextureFrames[*Index]);if(!Texture)return Fail(TEXT("Native catalog texture dependency is missing"));
             Material->SetTextureParameterValue(GeometryTextureParameter,Texture);AppliedMaterialFrames.Add(Key,*Index);
         }
         if(Mesh->SkinBones) {
@@ -784,8 +840,37 @@ bool AMWLive::LoadCatalog(const FString& Name) {
             WeightTextures.Add(Key,Weights);Material->SetTextureParameterValue(TEXT("SkinWeights"),Weights);
         }
         GeometryMaterials.Add(Key,Material);
-        if(FPlatformTime::Seconds()-Began>.002)return true;
+        if(FPlatformTime::Seconds()-Began>.002)return false;
     }
+    while(Loader.AliasIndex<Loader.AliasKeys.Num()) {
+        const FString& Key=Loader.AliasKeys[Loader.AliasIndex++];const FString& Previous=Data.ResourceAliases[Key];
+        const auto* Next=MeshData.Find(Key);const auto* Old=MeshData.Find(Previous);
+        if(Next && Old && !Next->FirstPerson && Next->Continuity.IsValid() && Old->Continuity.IsValid() && *Next->Continuity==*Old->Continuity)if(auto* Shared=SharedMeshes.FindRef(Previous)) {
+            if(!SharedMeshes.Contains(Key))++PerfSharedMeshAliases;
+            SharedMeshes.Add(Key,Shared);
+            if(RigidBatches.Contains(Previous) && !PrepareRigidBatch(Key))return Fail(TEXT("Compatible rigid resource allocation failed"));
+        }
+        if(FPlatformTime::Seconds()-Began>.002)return false;
+    }
+    RetargetCompatibleResources(Data.Bindings);
+        for(auto It=MeshData.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key())){SetRenderAssetTraits(It.Key(),0);It.RemoveCurrent();}
+        for(auto It=GeometryMaterials.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=GeometryTextures.CreateIterator();It;++It)if(!Data.WantedTextures.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=MaskedTextures.CreateIterator();It;++It)if(!Data.WantedMaskedTextures.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=BlendTextures.CreateIterator();It;++It)if(!Data.WantedBlendTextures.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=DetailTextures.CreateIterator();It;++It)if(!Data.WantedDetailTextures.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=AppliedMaterialFrames.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=AppliedTextureEffects.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=AppliedMaterialValues.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
+        GeometryBindings=MoveTemp(Data.Bindings);Catalog=Name;Loader.BindingsCommitted=true;
+        CatalogBindingSnapshot=SourceBindingCatalog==Catalog && SourceBindingSnapshot.IsValid() && SourceBindingSnapshot->Num()==GeometryBindings.Num()?SourceBindingSnapshot:nullptr;
+        RenderSelectionCatalog=Catalog;RenderSelectionMeshes=MeshData.Num();RenderSelectionInstances=InstanceAssets.Num();RenderSelectionDirty=false;
+        PreparedPoseSourceCatalog=MoveTemp(Data.PoseSourceCatalog);PreparedPoseSourceCount=Data.PoseSourceCount;PreparedPoseRemap=MoveTemp(Data.PoseRemap);
+        PreparedResourceCatalog=Catalog;PreparedResourceBindings=MoveTemp(Data.BindingAssets);
+        BindingTraits.SetNum(GeometryBindings.Num());BindingTraitsCatalog=Catalog;
+        for(int32 I=0;I<GeometryBindings.Num();++I){const auto& D=MeshData[GeometryBindings[I].Asset];BindingTraits[I]=(D.FirstPerson?1:0)|(D.Rain?2:0)|(!D.MaterialValueGroup.IsEmpty() || !D.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(D)?4:0);}
+        UpgradedTextureKeys=Data.UpgradedTextures;TextureUpgradeReservedBytes=Data.UpgradeReservedBytes;TextureUpgradeBudgetSkipped=Data.UpgradeBudgetSkipped;
+        CelestialSunIds.Empty();for(const auto& B:GeometryBindings)if(const auto* M=MeshData.Find(B.Asset))if(M->CelestialKind==4)CelestialSunIds.Add(B.Id);
     Loader.Data.Reset();GeometryLoading=false;
     UE_LOG(LogTemp,Display,TEXT("UEMW asynchronously loaded catalog: %s meshes=%d textures=%d"),*Name,MeshData.Num(),GeometryTextures.Num());
     return true;
@@ -814,21 +899,24 @@ bool AMWLive::ApplyMaterialFrames(const TMap<FString,int32>& Frames) {
     for(const auto& Asset:FrameAssets) {
         const auto& Data=MeshData[Asset];
         if(const auto* Index=Frames.Find(Data.TextureFrameGroup))if(!Data.TextureFrames.IsValidIndex(*Index))return false;
+        if(!MWStageFramesValid(Data,&Frames))return false;
     }
     CurrentMaterialFrames=Frames;
     bool Changed=false;
     for(const auto& Asset:FrameAssets) {
         auto* Material=GeometryMaterials.FindRef(Asset);const auto* Data=MeshData.Find(Asset);if(!Material || !Data)continue;
+        if(!MWApplyStageFrames(Material,*Data,Frames,GeometryTextures,Changed))return false;
         const auto* Index=Frames.Find(Data->TextureFrameGroup);if(!Index)continue;
         const auto* Previous=AppliedMaterialFrames.Find(Asset);if(Previous && *Previous==*Index)continue;
-        auto* Texture=Data->Masked?MaskedTextures.FindRef(Data->TextureFrames[*Index]):Data->BlendFiltered?BlendTextures.FindRef(Data->TextureFrames[*Index]):GeometryTextures.FindRef(Data->TextureFrames[*Index]);if(!Texture)return false;
+        auto* Texture=Data->Masked && !Data->NativeAlphaTest?MaskedTextures.FindRef(Data->TextureFrames[*Index]):Data->BlendFiltered && !Data->NativeAlphaTest?BlendTextures.FindRef(Data->TextureFrames[*Index]):GeometryTextures.FindRef(Data->TextureFrames[*Index]);if(!Texture)return false;
         Material->SetTextureParameterValue(GeometryTextureParameter,Texture);AppliedMaterialFrames.Add(Asset,*Index);
         Changed=true;
     }
     for(const auto& Pair:FrameInstances) {
         auto* Material=SkinMaterials.FindRef(Pair.Key);const auto* Data=MeshData.Find(Pair.Value);if(!Material || !Data)continue;
+        if(!MWApplyStageFrames(Material,*Data,Frames,GeometryTextures,Changed))return false;
         const auto* Index=Frames.Find(Data->TextureFrameGroup);if(!Index)continue;
-        auto* Texture=Data->Masked?MaskedTextures.FindRef(Data->TextureFrames[*Index]):Data->BlendFiltered?BlendTextures.FindRef(Data->TextureFrames[*Index]):GeometryTextures.FindRef(Data->TextureFrames[*Index]);if(!Texture)return false;
+        auto* Texture=Data->Masked && !Data->NativeAlphaTest?MaskedTextures.FindRef(Data->TextureFrames[*Index]):Data->BlendFiltered && !Data->NativeAlphaTest?BlendTextures.FindRef(Data->TextureFrames[*Index]):GeometryTextures.FindRef(Data->TextureFrames[*Index]);if(!Texture)return false;
         if(Material->K2_GetTextureParameterValue(GeometryTextureParameter)!=Texture){Material->SetTextureParameterValue(GeometryTextureParameter,Texture);Changed=true;}
     }
     if(Changed)++PerfTextureFrameUpdates;
@@ -857,7 +945,24 @@ bool AMWLive::ApplyMaterialValues(const TMap<FString,FMWMaterialValue>& Values) 
     return true;
 }
 
-bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native,const TMap<FString,int32>* MaterialFrames,const TMap<FString,FMWMaterialValue>* MaterialValues,const TArray<FMWBinding>* IncomingBindings,const TMap<FString,int32>* IncomingIndex) {
+bool AMWLive::ApplyTextureEffects() {
+    if(CurrentTextureEffects.IsEmpty())return true;
+    EnsureRenderSelection();TSet<FString> Changed;
+    for(const auto& Asset:FrameAssets) {
+        auto* Material=GeometryMaterials.FindRef(Asset);const auto* Data=MeshData.Find(Asset);if(!Material || !Data || Data->TextureEffectGroup.IsEmpty())continue;
+        if(const auto* Value=CurrentTextureEffects.Find(Data->TextureEffectGroup)) {
+            const auto* Previous=AppliedTextureEffects.Find(Asset);if(Previous && *Previous==*Value)continue;
+            MWSetTextureEffect(Material,*Value,Data->TextureEffectSupported);AppliedTextureEffects.Add(Asset,*Value);Changed.Add(Asset);
+        }
+    }
+    for(const auto& Pair:FrameInstances)if(Changed.Contains(Pair.Value)) {
+        const auto* Data=MeshData.Find(Pair.Value);auto* Material=SkinMaterials.FindRef(Pair.Key);if(!Data || !Material)continue;
+        if(const auto* Value=CurrentTextureEffects.Find(Data->TextureEffectGroup))MWSetTextureEffect(Material,*Value,Data->TextureEffectSupported);
+    }
+    return true;
+}
+
+bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native,const TMap<FString,int32>* MaterialFrames,const TMap<FString,FMWMaterialValue>* MaterialValues,const TArray<FMWBinding>* IncomingBindings,const TMap<FString,int32>* IncomingIndex,const TMap<FString,FMWTextureEffectState>* TextureEffects) {
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UpdateGeometry);
     double PartBegan=FPlatformTime::Seconds();GeometryCpuMs.Empty();
     auto Part=[&](const TCHAR* Name){const double T=FPlatformTime::Seconds();GeometryCpuMs.Add(Name,(T-PartBegan)*1000);PartBegan=T;};
@@ -868,6 +973,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     if(SceneEpoch!=NewEpoch) {ResetScene();SceneEpoch=NewEpoch;}
     if(MaterialFrames)CurrentMaterialFrames=*MaterialFrames;
     if(MaterialValues)CurrentMaterialValues=*MaterialValues;
+    if(TextureEffects)CurrentTextureEffects=*TextureEffects;else CurrentTextureEffects.Empty();
     const FString Name=Packet->GetStringField(TEXT("scene_catalog"));
     RequestedCatalog=Name;
     bool Retained=false;int32 RetainedMissing=0;
@@ -880,7 +986,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         // Only immutable binding indices are cached. Pose bytes below are
         // replaced from every fresh frame, including creation/removal/hides.
         if(Digest.IsEmpty() || RetainedIncomingCatalog!=Name || RetainedIncomingDigest!=Digest || RetainedTargetCatalog!=Catalog || RetainedIncomingCount!=IncomingBindings->Num()) {
-            if(!MWBuildRetainedRemap(*IncomingBindings,GeometryBindings,RetainedGeometryIndices,IncomingIndex))return false;
+            if(!MWBuildRetainedRemap(*IncomingBindings,GeometryBindings,RetainedGeometryIndices,IncomingIndex,true))return false;
             RetainedIncomingCatalog=Name;RetainedIncomingDigest=Digest;RetainedTargetCatalog=Catalog;RetainedIncomingCount=IncomingBindings->Num();
         }
         TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RemapRetainedFrame);
@@ -890,7 +996,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         for(int32 I=0;I<RetainedStates.Num();++I)if(RetainedStates[I].Visible) {
             const auto* Data=MeshData.Find(GeometryBindings[I].Asset);
             if(!Data || (!Data->MaterialValueGroup.IsEmpty() && (!MaterialValues || !MaterialValues->Contains(Data->MaterialValueGroup))) ||
-                (!Data->TextureFrameGroup.IsEmpty() && (!MaterialFrames || !MaterialFrames->Contains(Data->TextureFrameGroup)))){RetainedStates[I].Visible=false;++RetainedMissing;}
+                (!Data->TextureFrameGroup.IsEmpty() && (!MaterialFrames || !MaterialFrames->Contains(Data->TextureFrameGroup))) || !MWStageFramesValid(*Data,MaterialFrames,true) || (!Data->TextureEffectGroup.IsEmpty() && !CurrentTextureEffects.Contains(Data->TextureEffectGroup))){RetainedStates[I].Visible=false;++RetainedMissing;}
             else ++Ready;
         }
         if(!Ready)return false;
@@ -909,9 +1015,12 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         if(Native && !RequiredAssets.Contains(Pair.Key))continue;
         if(!Pair.Value.MaterialValueGroup.IsEmpty() && (!MaterialValues || !MaterialValues->Contains(Pair.Value.MaterialValueGroup)))return false;
         if(!Pair.Value.TextureFrameGroup.IsEmpty() && (!MaterialFrames || !MaterialFrames->Contains(Pair.Value.TextureFrameGroup)))return false;
+        if(!MWStageFramesValid(Pair.Value,MaterialFrames,true))return false;
+        if(!Pair.Value.TextureEffectGroup.IsEmpty() && !CurrentTextureEffects.Contains(Pair.Value.TextureEffectGroup))return false;
     }
     if(MaterialFrames && !ApplyMaterialFrames(*MaterialFrames))return false;
     if(MaterialValues && !ApplyMaterialValues(*MaterialValues))return false;
+    if(!ApplyTextureEffects())return false;
     Part(TEXT("catalog_materials"));
     GeometryLoading=false;
     const double ApplyBegan=FPlatformTime::Seconds();int32 NewResources=0;
@@ -1020,7 +1129,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
                 MWNativeDrawLayer(Component,*Data);
                 Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);
                 Component->SetStaticMesh(Mesh);Component->SetMaterial(0,Material);
-                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(Data->Lit && !Data->Sky && !Data->Background && !Data->Water);Component->SetRenderCustomDepth(Data->Water);Component->SetCustomDepthStencilValue(1);
+                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && Data->Lit && !Data->Sky && !Data->Background && !Data->Water);Component->SetRenderCustomDepth(Data->Water);Component->SetCustomDepthStencilValue(1);
                 Component->SetNativeBounds(Typed->Bound);Component->RegisterComponent();SkinnedComponents.Add(Id,Component);
             }
             SetPrimitiveShown(Component,true);Component->SetNativeBounds(Typed->Bound);
@@ -1031,14 +1140,14 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             }
             continue;
         }
-        if(!IsDeformed && Data->FirstPerson && !Data->Transparent && MWCanInstance(RigidMatrix)) {
+        if(!Data->Lines && !IsDeformed && Data->FirstPerson && !Data->Transparent && MWCanInstance(RigidMatrix)) {
             // A separate component keeps CPU culling bounds at the corrected
             // camera pose. ISM per-instance culling cannot see material WPO.
             RemoveRigid(Id);auto* C=SkinnedComponents.FindRef(Id);if(!C)return false;
             SetPrimitiveShown(C,true);TArray<double> Saved;Saved.Append(RigidMatrix,13);LastRigidTransforms.Add(Id,MoveTemp(Saved));
             continue;
         }
-        if(!IsDeformed && !Data->Transparent && MWCanInstance(RigidMatrix)) {
+        if(!Data->Lines && !IsDeformed && !Data->Transparent && MWCanInstance(RigidMatrix)) {
             SetPrimitiveShown(GeometryComponents.FindRef(Id),false);
             const auto& Transform=Typed?Empty:Compact?(*Row)[1]->AsArray():Instance->GetArrayField(TEXT("transform"));
             double M[13];for(int32 i=0;i<13;++i)M[i]=Typed?Typed->Transform[i]:Transform[i]->AsNumber();
@@ -1052,7 +1161,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
                 Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(Batch,*Data);
                 Batch->SetStaticMesh(Mesh);Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);
-                Batch->SetCastShadow(Data->Lit && !Data->Sky && !Data->Background && !Data->Water);Batch->SetRenderCustomDepth(Data->Water);Batch->SetCustomDepthStencilValue(1);Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);
+                Batch->SetCastShadow(!AuxiliaryGeometry && Data->Lit && !Data->Sky && !Data->Background && !Data->Water);Batch->SetRenderCustomDepth(Data->Water);Batch->SetCustomDepthStencilValue(1);Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);
             }
             const FTransform Placement=MWNativeTransform(M);
             auto* Slot=RigidSlots.Find(Id);
@@ -1073,7 +1182,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         const bool BindingChanged=AssetChanged;
         bool Rebuild=!Component || BindingChanged || Component->GetNumSections()==0;
         if(!Component) {
-            Component=NewObject<UProceduralMeshComponent>(this);
+            Component=Data->Lines?NewObject<UMWNativeLineComponent>(this):NewObject<UProceduralMeshComponent>(this);
             MWNativeDrawLayer(Component,*Data);
             Component->SetMobility(EComponentMobility::Movable);
             Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -1150,10 +1259,11 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         if(Typed && Typed->UVs.Num())for(int32 i=0;i<World.Num();++i)DynamicUVs.Emplace(Typed->UVs[i*2],Typed->UVs[i*2+1]);
         const auto& UVs=DynamicUVs.Num()?DynamicUVs:Data->UVs;
         TArray<FProcMeshTangent> Tangents;
-        if(Rebuild) {
+        if(Rebuild || Data->Lines) {
             Component->ClearAllMeshSections();
             if(auto** Material=GeometryMaterials.Find(Asset)) Component->SetMaterial(0,*Material);
-            Component->CreateMeshSection_LinearColor(0,World,Data->Triangles,Normals,UVs,Colors,Tangents,false);
+            if(Data->Lines){if(!CastChecked<UMWNativeLineComponent>(Component)->SetNativeSection(World,Data->Triangles,UVs,Data->StageUV1,Data->StageUV2,Colors))return false;}
+            else Component->CreateMeshSection_LinearColor(0,World,Data->Triangles,Normals,UVs,{},Data->StageUV1,Data->StageUV2,Colors,Tangents,false,false);
             ++NewResources;
             if(!Component->IsRegistered())Component->RegisterComponent();
             if(GeometryComponents.Num()<=3) UE_LOG(LogTemp,Display,TEXT("UEMW mesh %s verts=%d triangles=%d origin=%s bounds=%s"),*Id,World.Num(),Data->Triangles.Num()/3,*Component->GetComponentLocation().ToString(),*Component->Bounds.ToString());
@@ -1161,7 +1271,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         } else {
             // Creation already preserves raw native vertex channels. UE's
             // update overload defaults to sRGB conversion, unlike creation.
-            Component->UpdateMeshSection_LinearColor(0,World,Normals,UVs,Colors,Tangents,false);
+            Component->UpdateMeshSection_LinearColor(0,World,Normals,UVs,{},Data->StageUV1,Data->StageUV2,Colors,Tangents,false);
         }
         if(Typed && IsDeformed){UploadedVertexPoses.Add(Id,{Typed->Points,Typed->Colors,Typed->UVs});VertexPoseChanged=true;}
         if(!IsDeformed) {TArray<double> Saved;Saved.Append(M,13);LastRigidTransforms.Add(Id,MoveTemp(Saved));}
@@ -1322,6 +1432,10 @@ void AMWLive::PublishPresentationState() {
     Json->SetNumberField(TEXT("unix_ns"),Now*1e9);
     Json->SetBoolField(TEXT("live"),GeometryActive && Status.StartsWith(TEXT("LIVE /")));
     Json->SetBoolField(TEXT("partial_geometry"),GeometryPartial);Json->SetNumberField(TEXT("pending_native_instances"),PendingGeometryInstances);
+    Json->SetBoolField(TEXT("ui_ready"),UIReady && Now>=UIStamp && Now-UIStamp<=.5);Json->SetNumberField(TEXT("ui_sample_unix_ns"),UIStamp*1e9);Json->SetNumberField(TEXT("ui_sequence"),UISequence);Json->SetBoolField(TEXT("ui_native_menu"),UINativeMenu);
+    TArray<TSharedPtr<FJsonValue>> MenuValues;for(const auto& Name:UIMenus)MenuValues.Add(MakeShared<FJsonValueString>(Name));Json->SetArrayField(TEXT("ui_menus"),MenuValues);
+    Json->SetNumberField(TEXT("ui_width"),UIWidth);Json->SetNumberField(TEXT("ui_height"),UIHeight);
+    TArray<TSharedPtr<FJsonValue>> Regions;for(const auto& R:UIRegions){TArray<TSharedPtr<FJsonValue>> V;for(double N:{R.X,R.Y,R.Z,R.W})V.Add(MakeShared<FJsonValueNumber>(N));Regions.Add(MakeShared<FJsonValueArray>(V));}Json->SetArrayField(TEXT("ui_native_regions"),Regions);
     Json->SetStringField(TEXT("session"),Session);
     Json->SetStringField(TEXT("scene_epoch"),SceneEpoch);
     Json->SetNumberField(TEXT("sequence"),Sequence);
@@ -1375,7 +1489,7 @@ void AMWLive::Tick(float Delta) {
     if(PerfFrameIntervalMs.Num()<120)PerfFrameIntervalMs.Add(Delta*1000.);
     if(GGPUFrameTime>0 && PerfGPUFrameMs.Num()<120)PerfGPUFrameMs.Add(FPlatformTime::ToMilliseconds(GGPUFrameTime));
     ConfigurePresentation();
-    ON_SCOPE_EXIT {FlushRigidBatches();ApplyCameraLane();UpdateViewCorrection();UpdateRainInterpolation();UpdateOutdoorLighting();UpdateCelestialShafts();UpdateWaterReflection();PublishPresentationState();PublishStateWitness();};
+    ON_SCOPE_EXIT {FlushRigidBatches();ApplyCameraLane();UpdateViewCorrection();UpdateRainInterpolation();UpdateOutdoorLighting();UpdateCelestialShafts();UpdateWaterReflection();if(DistantView)DistantView->Update(*this);if(UIView)UIView->Update(*this);PublishPresentationState();PublishStateWitness();};
     // Only current-source work may allocate; no queued pose is replayed.
     const double SourceAge=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds()-SourcePacketStamp;
     if(SourcePacketStamp<=0 || (SourceAge>=-1 && SourceAge<=.5)) {
@@ -1403,6 +1517,10 @@ void AMWLive::Tick(float Delta) {
             Perf->SetNumberField(TEXT("render_frames"),HealthFrames); // Legacy log readers only.
             Perf->SetNumberField(TEXT("applied"),PerfAgeMs.Num());
             Perf->SetNumberField(TEXT("partial_applied"),PerfPartialAgeMs.Num());
+            Perf->SetNumberField(TEXT("native_motion_frames"),PerfNativeMotionFrames);PerfNativeMotionFrames=0;
+            Perf->SetNumberField(TEXT("resource_retargets"),PerfResourceRetargets);PerfResourceRetargets=0;
+            Perf->SetNumberField(TEXT("resource_rebind_hides"),PerfResourceRebindHides);PerfResourceRebindHides=0;
+            Perf->SetNumberField(TEXT("shared_mesh_aliases"),PerfSharedMeshAliases);PerfSharedMeshAliases=0;
             Perf->SetNumberField(TEXT("native_states_reused"),PerfNativeStateReused);PerfNativeStateReused=0;
             Perf->SetNumberField(TEXT("native_states_changed"),PerfNativeStateChanged);PerfNativeStateChanged=0;
             Perf->SetNumberField(TEXT("pending_native_instances"),PendingGeometryInstances);
@@ -1621,7 +1739,7 @@ void AMWLive::Tick(float Delta) {
         BackgroundView->Color=FLinearColor(Fog.X,Fog.Y,Fog.Z,1);
     }
     const int32 GeometryVersion=GeometryActive?Packet->GetIntegerField(TEXT("geometry_version")):0;
-    if(GeometryActive && ((GeometryVersion!=1 && GeometryVersion!=2 && GeometryVersion!=3 && GeometryVersion!=4 && GeometryVersion!=5 && GeometryVersion!=6) || !UpdateGeometry(Packet,GeometryVersion>=5?&Decoded.States:nullptr,Decoded.HaveMaterialFrames?&Decoded.MaterialFrames:nullptr,Decoded.HaveMaterialValues?&Decoded.MaterialValues:nullptr,Decoded.Bindings.Get(),Decoded.BindingIndex.Get()))) {
+    if(GeometryActive && ((GeometryVersion!=1 && GeometryVersion!=2 && GeometryVersion!=3 && GeometryVersion!=4 && GeometryVersion!=5 && GeometryVersion!=6) || !UpdateGeometry(Packet,GeometryVersion>=5?&Decoded.States:nullptr,Decoded.HaveMaterialFrames?&Decoded.MaterialFrames:nullptr,Decoded.HaveMaterialValues?&Decoded.MaterialValues:nullptr,Decoded.Bindings.Get(),Decoded.BindingIndex.Get(),Decoded.HaveTextureEffects?&Decoded.TextureEffects:nullptr))) {
         RejectGeometry();
         return;
     }
@@ -1683,6 +1801,12 @@ void AMWLive::Tick(float Delta) {
     if(GeometryPartial && !NativeMenuOpen)Status=FString::Printf(TEXT("LIVE / STREAMING %d NATIVE SHAPES"),PendingGeometryInstances);
     AcceptedSnapshotText=MoveTemp(Decoded.Text);
     AcceptedSnapshotStamp=Packet->GetNumberField(TEXT("sample_unix_ns"))/1e9;
+    AcceptedGeometrySequence=(int64)Packet->GetNumberField(TEXT("sequence"));
+    double NativeFrame=0;
+    if(Packet->TryGetNumberField(TEXT("frame_ms"),NativeFrame) && FMath::IsFinite(NativeFrame) && NativeFrame>=0 && NativeFrame<=4294967295.0 && NativeFrame==FMath::FloorToDouble(NativeFrame)) {
+        if(LastMotionSession!=Session || LastMotionEpoch!=SceneEpoch || LastMotionFrame!=NativeFrame)++PerfNativeMotionFrames;
+        LastMotionSession=Session;LastMotionEpoch=SceneEpoch;LastMotionFrame=NativeFrame;
+    }
     RecordPoseApplication(AcceptedSnapshotStamp,ApplyStarted);
     const double Monotonic=FPlatformTime::Seconds();
     if(Monotonic-LastDiagnostic>=1) {
@@ -1706,28 +1830,13 @@ bool AMWLive::GameplayHudVisible() const {
 void AMWHud::DrawHUD() {
     Super::DrawHUD();
     for(TActorIterator<AMWLive> It(GetWorld());It;++It) {
+        if(It->AuxiliaryGeometry)continue;
         DrawText(It->GeometryActive?TEXT("UEMW / LIVE ORIGINAL GEOMETRY"):TEXT("UEMW LIVE BRIDGE / DIAGNOSTIC MARKERS"),FLinearColor::Yellow,20,20,nullptr,1.2f);
         DrawText(It->Status,FLinearColor::White,20,48);
         DrawText(FString::Printf(TEXT("%s | seq %lld | %d refs | read %.2f ms"),*It->Cell,It->Sequence,It->ObjectCount,It->ReadMs),FLinearColor::White,20,72);
         DrawText(It->GeometryActive?FString::Printf(TEXT("%d mesh instances | original game controls input, collision, AI and animation"),It->InstanceCount()):TEXT("Input belongs to the original Morrowind window. Markers are milestone diagnostics only."),FLinearColor::White,20,96);
         DrawText(It->InputHint,FLinearColor::Yellow,20,120);
-        if(It->GameplayHudVisible()) {
-            if(It->HavePlayerStats) {
-                const FVector2D Values[]={It->Health,It->Magicka,It->Fatigue};
-                const FLinearColor Colors[]={FLinearColor(.7f,.06f,.04f),FLinearColor(.08f,.2f,.7f),FLinearColor(.06f,.5f,.13f)};
-                const TCHAR* Names[]={TEXT("Health"),TEXT("Magicka"),TEXT("Fatigue")};
-                for(int32 I=0;I<3;++I) {
-                    const float Y=Canvas->SizeY-72+I*22;
-                    DrawRect(FLinearColor(.02f,.02f,.02f,.85f),16,Y,180,18);
-                    const float Ratio=Values[I].X>0?FMath::Clamp(Values[I].Y/Values[I].X,0.,1.):0;
-                    DrawRect(Colors[I],18,Y+2,176*Ratio,14);
-                    DrawText(FString::Printf(TEXT("%s %.0f / %.0f"),Names[I],Values[I].Y,Values[I].X),FLinearColor::White,22,Y);
-                }
-            }
-            const float X=Canvas->SizeX*.5f,Y=Canvas->SizeY*.5f;
-            DrawLine(X-5,Y,X+5,Y,FLinearColor::White);DrawLine(X,Y-5,X,Y+5,FLinearColor::White);
-            if(!It->FocusName.IsEmpty()) DrawText(It->FocusName,FLinearColor::White,X-40,Y+20);
-        }
+        if(It->UIView)It->UIView->Draw(**It,Canvas);
         break;
     }
 }

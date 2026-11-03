@@ -33,9 +33,9 @@ void AMWLive::UpdateOutdoorLighting() {
     SurfaceReflectionsApplied=Reflections;
     // Repartition the same native-driven sun. No additional sun or sky clock.
     NativeSun->SetDynamicShadowCascades(Active?4:3);
-    NativeSun->SetCascadeDistributionExponent(Active?3.f:2.f);
-    NativeSun->SetCascadeTransitionFraction(Active?.18f:.1f);
-    NativeSun->SetShadowDistanceFadeoutFraction(Active?.18f:.1f);
+    NativeSun->SetCascadeDistributionExponent(2.f);
+    NativeSun->SetCascadeTransitionFraction(Active?.25f:.18f);
+    NativeSun->SetShadowDistanceFadeoutFraction(Active?.25f:.18f);
     NativeSun->ShadowResolutionScale=Active?1.f:.75f;
     NativeSun->SetShadowBias(Active?.25f:.35f);
     NativeSun->ShadowSlopeBias=Active?.45f:.5f;

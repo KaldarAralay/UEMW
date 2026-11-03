@@ -9,6 +9,17 @@ from native_materials import FlipCapture
 from native_switches import SwitchLayout
 
 class ContinuityTests(unittest.TestCase):
+    def test_particle_descriptor_cache_follows_retained_and_replaced_binding_lists(self):
+        import copy
+        g=Geometry.__new__(Geometry);g.shapes=[dict(id='0x10000',particles=True),dict(id='0x20000'),dict(id='0x30000',particles=True)]
+        items,pointers=g.particle_metadata();self.assertEqual(pointers,{0x10000,0x30000})
+        retained=copy.copy(g);retained.shapes=g.shapes[1:]
+        self.assertEqual(retained.particle_metadata()[1],{0x30000})
+        g.shapes=[dict(id='0x40000',particles=True)]
+        self.assertEqual(g.particle_metadata()[1],{0x40000})
+        self.assertEqual(pointers,{0x10000,0x30000})
+        self.assertEqual(len(items),2)
+
     def test_other_effect_creation_does_not_retire_an_unchanged_flying_projectile(self):
         projectile=('projectile','0x10000',b'header',b'owned child')
         before=(projectile,('world_effect','0x20000',b'header',b'casting glow'))

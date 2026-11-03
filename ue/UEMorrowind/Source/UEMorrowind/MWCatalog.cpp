@@ -4,6 +4,7 @@
 #include "MWTransparency.h"
 #include "MWSkin.h"
 #include "MWTexture.h"
+#include "MWTextureStages.h"
 #include "ImageUtils.h"
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
@@ -16,7 +17,100 @@ static bool ReadCatalogText(const FString& Path,FString& Text) {
 static bool TextField(const TSharedPtr<FJsonObject>& Obj,const TCHAR* Key,int32 Max=512) {
     FString Value;return Obj->TryGetStringField(Key,Value) && Value.Len()<=Max;
 }
-bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FString& AssetsPath,TArray<FMWBinding>& Out) {
+static bool CanonicalDefinition(const TSharedPtr<FJsonValue>& Value,FString& Out,int32& Budget,int32 Depth=0,bool Shading=false) {
+    if(!Value.IsValid() || Depth>16 || --Budget<0 || Out.Len()>16384)return false;
+    auto String=[&](const FString& Text){Out.AppendInt(Text.Len());Out.AppendChar(TEXT(':'));Out+=Text;};
+    switch(Value->Type) {
+    case EJson::Object: {
+        const auto Object=Value->AsObject();if(!Object.IsValid())return false;
+        TArray<FString> Keys;Object->Values.GetKeys(Keys);
+        if(Shading)Keys.RemoveAll([](const FString& Key){return Key==TEXT("native_lights") || Key==TEXT("native_sun");});
+        Keys.Sort();Out.AppendChar(TEXT('O'));Out.AppendInt(Keys.Num());Out.AppendChar(TEXT(':'));
+        for(const auto& Key:Keys){String(Key);if(!CanonicalDefinition(Object->Values[Key],Out,Budget,Depth+1,Depth==0 && Key==TEXT("shading")))return false;}
+        break;
+    }
+    case EJson::Array:
+        Out.AppendChar(TEXT('A'));Out.AppendInt(Value->AsArray().Num());Out.AppendChar(TEXT(':'));
+        for(const auto& Item:Value->AsArray())if(!CanonicalDefinition(Item,Out,Budget,Depth+1))return false;
+        break;
+    case EJson::String:Out.AppendChar(TEXT('S'));String(Value->AsString());break;
+    case EJson::Number: {
+        double Number=Value->AsNumber();if(!FMath::IsFinite(Number))return false;
+        uint64 Bits=0;FMemory::Memcpy(&Bits,&Number,8);
+        if((Bits&0x7fffffffffffffffULL)==0)Bits=0; // Match numeric cache equality for both zeroes.
+        Out.AppendChar(TEXT('D'));
+        const TCHAR* Hex=TEXT("0123456789abcdef");
+        for(int32 Shift=60;Shift>=0;Shift-=4)Out.AppendChar(Hex[(Bits>>Shift)&15]);
+        break;
+    }
+    case EJson::Boolean:Out.AppendChar(Value->AsBool()?TEXT('T'):TEXT('F'));break;
+    case EJson::Null:Out.AppendChar(TEXT('N'));break;
+    default:return false;
+    }
+    return Out.Len()<=16384;
+}
+FMWResourceIdentity MWResourceContinuity(const TSharedPtr<FJsonObject>& Definition) {
+    if(!Definition.IsValid())return nullptr;
+    // A typed, length-prefixed identity avoids cloning a JSON tree or running
+    // thousands of JSON writers on the latency-sensitive binding reader.
+    // Full IEEE double bits preserve numeric distinctions without formatting.
+    FString Canonical=TEXT("URD1");Canonical.Reserve(1024);int32 Budget=4096;
+    if(!CanonicalDefinition(MakeShared<FJsonValueObject>(Definition),Canonical,Budget))return nullptr;
+    return MakeShared<FString,ESPMode::ThreadSafe>(MoveTemp(Canonical));
+}
+bool MWCompatibleBinding(const FMWBinding& A,const FMWBinding& B) {
+    return A.Id==B.Id && A.Cell==B.Cell && (A.Asset==B.Asset || (A.Continuity.IsValid() && B.Continuity.IsValid() && *A.Continuity==*B.Continuity));
+}
+bool MWEqualBindingTables(const TArray<FMWBinding>& A,const TArray<FMWBinding>& B) {
+    if(A.Num()!=B.Num())return false;
+    for(int32 I=0;I<A.Num();++I) {
+        const auto& X=A[I];const auto& Y=B[I];
+        if(X.Id!=Y.Id || X.Asset!=Y.Asset || X.Cell!=Y.Cell || X.Continuity.IsValid()!=Y.Continuity.IsValid() || (X.Continuity.IsValid() && *X.Continuity!=*Y.Continuity))return false;
+    }
+    return true;
+}
+bool MWReadBindingIndex(const TSharedPtr<FJsonObject>& Reference,const FString& CatalogName,const FString& CatalogDigest,const FString& AssetsPath,TArray<FMWBinding>& Out) {
+    auto Hex=[](const FString& S){if(S.Len()!=32)return false;for(TCHAR C:S)if(!FChar::IsHexDigit(C))return false;return true;};
+    FString Name,Digest;double Size=0;
+    if(!Reference.IsValid() || CatalogName.Len()!=45 || !CatalogName.StartsWith(TEXT("catalog-")) || !CatalogName.EndsWith(TEXT(".json")) || !Hex(CatalogName.Mid(8,32)) || !Hex(CatalogDigest) ||
+        !Reference->TryGetStringField(TEXT("file"),Name) || Name!=TEXT("bindings-")+CatalogName.Mid(8,32)+TEXT(".bin") ||
+        !Reference->TryGetStringField(TEXT("md5"),Digest) || !Hex(Digest) || !Reference->TryGetNumberField(TEXT("bytes"),Size) || !FMath::IsFinite(Size) || Size<32 || Size>16*1024*1024 || Size!=FMath::FloorToDouble(Size))return false;
+    const FString File=AssetsPath/Name;
+    if(IFileManager::Get().FileSize(*File)!=int64(Size))return false;
+    TArray<uint8> Bytes;
+    if(!FFileHelper::LoadFileToArray(Bytes,*File) || Bytes.Num()!=int32(Size) || !FMD5::HashBytes(Bytes.GetData(),Bytes.Num()).Equals(Digest,ESearchCase::IgnoreCase) || FMemory::Memcmp(Bytes.GetData(),"UBI2",4)!=0 || Bytes[4]!=2 || Bytes[5] || Bytes[6] || Bytes[7])return false;
+    FString Embedded;const TCHAR* Digits=TEXT("0123456789abcdef");
+    for(int32 I=8;I<24;++I){Embedded.AppendChar(Digits[Bytes[I]>>4]);Embedded.AppendChar(Digits[Bytes[I]&15]);}
+    if(!Embedded.Equals(CatalogDigest,ESearchCase::IgnoreCase))return false;
+    int32 Offset=24;
+    auto UInt=[&](uint32& V){if(Offset>Bytes.Num()-4)return false;V=uint32(Bytes[Offset])|(uint32(Bytes[Offset+1])<<8)|(uint32(Bytes[Offset+2])<<16)|(uint32(Bytes[Offset+3])<<24);Offset+=4;return true;};
+    auto String=[&](FString& V,int32 Limit,bool Empty=false){
+        uint32 N=0;if(!UInt(N) || N>uint32(Limit*4) || N>uint32(Bytes.Num()-Offset) || (!Empty && !N))return false;
+        const FUTF8ToTCHAR Converted(reinterpret_cast<const ANSICHAR*>(Bytes.GetData()+Offset),int32(N));
+        V=FString(Converted.Length(),Converted.Get());const FTCHARToUTF8 Roundtrip(*V,V.Len());
+        if(V.Len()>Limit || Roundtrip.Length()!=int32(N) || FMemory::Memcmp(Roundtrip.Get(),Bytes.GetData()+Offset,N)!=0)return false;
+        for(TCHAR C:V)if(!C)return false;
+        Offset+=int32(N);return true;
+    };
+    uint32 Surfaces=0,Count=0;
+    if(!UInt(Surfaces) || !UInt(Count) || !Surfaces || Surfaces>8192 || !Count || Count>16384)return false;
+    TArray<FString> Assets;TArray<FMWResourceIdentity> Identities;TSet<FString> SeenAssets;
+    Assets.Reserve(Surfaces);Identities.Reserve(Surfaces);
+    for(uint32 I=0;I<Surfaces;++I) {
+        FString Asset,Identity;
+        if(!String(Asset,160) || !String(Identity,16384,true) || SeenAssets.Contains(Asset) || (!Identity.IsEmpty() && !Identity.StartsWith(TEXT("URD1"))))return false;
+        SeenAssets.Add(Asset);Assets.Add(MoveTemp(Asset));Identities.Add(Identity.IsEmpty()?FMWResourceIdentity():MakeShared<FString,ESPMode::ThreadSafe>(MoveTemp(Identity)));
+    }
+    TArray<FMWBinding> Rows;Rows.Reserve(Count);TSet<FString> SeenIds;
+    for(uint32 I=0;I<Count;++I) {
+        FMWBinding Row;uint32 Index=0;
+        if(!String(Row.Id,64) || !UInt(Index) || Index>=Surfaces || !String(Row.Cell,64,true) || SeenIds.Contains(Row.Id))return false;
+        Row.Asset=Assets[Index];Row.Continuity=Identities[Index];SeenIds.Add(Row.Id);Rows.Add(MoveTemp(Row));
+    }
+    if(Offset!=Bytes.Num())return false;
+    Out=MoveTemp(Rows);return true;
+}
+bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FString& AssetsPath,TArray<FMWBinding>& Out,FMWContinuityCache* Cache) {
     if(!Name.StartsWith(TEXT("catalog-")) || !Name.EndsWith(TEXT(".json")) || Name.Len()>64 || Name.Contains(TEXT("/")) || Name.Contains(TEXT("\\")) || Name.Contains(TEXT(":")) || Name.Contains(TEXT("..")) || Digest.Len()!=32)return false;
     for(TCHAR C:Digest)if(!FChar::IsHexDigit(C))return false;
     FString Text,Actual,Format;double Version=0;TSharedPtr<FJsonObject> Root;
@@ -24,15 +118,27 @@ bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FStri
         !Root->TryGetStringField(TEXT("format"),Format) || Format!=TEXT("uemw.assets") || !Root->TryGetNumberField(TEXT("version"),Version) || Version!=1)return false;
     const TArray<TSharedPtr<FJsonValue>>* Rows=nullptr;const TSharedPtr<FJsonObject>* Definitions=nullptr;
     if(!Root->TryGetArrayField(TEXT("bindings"),Rows) || Rows->Num()>16384 || !Root->TryGetObjectField(TEXT("meshes"),Definitions) || !Definitions->IsValid() || (*Definitions)->Values.Num()>8192)return false;
-    TArray<FMWBinding> Result;TSet<FString> Ids;
+    TArray<FMWBinding> Result;TSet<FString> Ids;TMap<FString,FMWResourceIdentity> Continuities;FMWContinuityCache NextCache;
     for(const auto& Value:*Rows) {
         const TSharedPtr<FJsonObject>* Row=nullptr;FMWBinding B;
         if(!Value->TryGetObject(Row) || !Row->IsValid() || !(*Row)->TryGetStringField(TEXT("id"),B.Id) || B.Id.IsEmpty() || B.Id.Len()>64 ||
             !(*Row)->TryGetStringField(TEXT("asset"),B.Asset) || B.Asset.IsEmpty() || B.Asset.Len()>160 || !(*Definitions)->HasField(B.Asset) || Ids.Contains(B.Id))return false;
         if((*Row)->HasField(TEXT("cell_key")) && (!(*Row)->TryGetStringField(TEXT("cell_key"),B.Cell) || B.Cell.Len()>64))return false;
-        Ids.Add(B.Id);Result.Add(MoveTemp(B));
+        if(!Continuities.Contains(B.Asset)) {
+            const TSharedPtr<FJsonObject>* Definition=nullptr;
+            if(!(*Definitions)->TryGetObjectField(B.Asset,Definition) || !Definition->IsValid())return false;
+            FMWResourceIdentity Identity;
+            if(Cache)if(const auto* Previous=Cache->Entries.Find(B.Asset)) {
+                const FJsonValueObject Before(Previous->Definition),After(*Definition);
+                if(FJsonValue::CompareEqual(Before,After))Identity=Previous->Identity;
+            }
+            if(!Identity.IsValid())Identity=MWResourceContinuity(*Definition);
+            Continuities.Add(B.Asset,Identity);
+            if(Cache)NextCache.Entries.Add(B.Asset,{*Definition,Identity});
+        }
+        B.Continuity=Continuities[B.Asset];Ids.Add(B.Id);Result.Add(MoveTemp(B));
     }
-    Out=MoveTemp(Result);return true;
+    Out=MoveTemp(Result);if(Cache)Cache->Entries=MoveTemp(NextCache.Entries);return true;
 }
 bool MWRebasePoseCache(const TArray<FMWBinding>& PreviousBindings,const TArray<FMWGeometryState>& Previous,const TArray<FMWBinding>& Current,TArray<FMWGeometryState>& Out,TBitArray<>& Matched) {
     if(PreviousBindings.Num()!=Previous.Num() || Previous.Num()>16384 || Current.Num()>16384)return false;
@@ -64,7 +170,7 @@ bool MWMovePoseCache(TArray<FMWGeometryState>& Previous,const TArray<int32>& Ind
     return true;
 }
 
-bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBinding>& Retained,TArray<int32>& Out,const TMap<FString,int32>* ParsedIndex) {
+bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBinding>& Retained,TArray<int32>& Out,const TMap<FString,int32>* ParsedIndex,bool AllowLightingVariant) {
     if(Incoming.Num()>16384 || Retained.Num()>16384)return false;
     TMap<FString,int32> LocalIndex;
     if(!ParsedIndex){LocalIndex.Reserve(Incoming.Num());for(int32 I=0;I<Incoming.Num();++I){if(LocalIndex.Contains(Incoming[I].Id))return false;LocalIndex.Add(Incoming[I].Id,I);}}
@@ -74,7 +180,7 @@ bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBin
         if(!ParsedIndex){if(Seen.Contains(Retained[I].Id))return false;Seen.Add(Retained[I].Id);}
         if(const int32* J=Index.Find(Retained[I].Id)) {
             if(*J<0 || *J>=Incoming.Num() || Incoming[*J].Id!=Retained[I].Id)return false;
-            if(Retained[I].Asset==Incoming[*J].Asset)Result[I]=*J;
+            if(Retained[I].Asset==Incoming[*J].Asset || (AllowLightingVariant && MWCompatibleBinding(Retained[I],Incoming[*J])))Result[I]=*J;
         }
     }
     Out=MoveTemp(Result);return true;
@@ -111,24 +217,35 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
        !Root->TryGetStringField(TEXT("format"),Format) || Format!=TEXT("uemw.assets") ||
        !Root->TryGetNumberField(TEXT("version"),Version) || Version!=1 ||
        !Root->TryGetObjectField(TEXT("meshes"),Definitions) || !Definitions->IsValid() || (*Definitions)->Values.Num()>8192)return nullptr;
-    TArray<FMWBinding> NewBindings;
+    TArray<FMWBinding> NewBindings;TMap<FString,FMWResourceIdentity> Continuities;
+    FString SourceKind;Root->TryGetStringField(TEXT("source_kind"),SourceKind);
+    const bool Distant=SourceKind==TEXT("installed-distant-stat-land");
+    if(Distant && (*Definitions)->Values.Num()>1024)return nullptr;
+    if(Distant) {
+        int64 Total=0;
+        for(const auto& Definition:(*Definitions)->Values) {
+            const TSharedPtr<FJsonObject>* Row=nullptr;double Vertices=0;
+            if(!Definition.Value->TryGetObject(Row) || !Row->IsValid() || !(*Row)->TryGetNumberField(TEXT("vertices"),Vertices) || !FMath::IsFinite(Vertices) || Vertices<1 || Vertices>65535 || Vertices!=FMath::FloorToDouble(Vertices))return nullptr;
+            Total+=int64(Vertices);if(Total>1000000)return nullptr;
+        }
+    }
     TSet<FString> CellKeys;
     const TArray<TSharedPtr<FJsonValue>>* Cells=nullptr;
     if(Root->HasField(TEXT("cells"))) {
-        if(!Root->TryGetArrayField(TEXT("cells"),Cells) || Cells->Num()>9)return nullptr;
+        if(!Root->TryGetArrayField(TEXT("cells"),Cells) || Cells->Num()>(Distant?49:9))return nullptr;
         for(const auto& Value:*Cells) {
             const TSharedPtr<FJsonObject>* Item=nullptr;const TArray<TSharedPtr<FJsonValue>>* Grid=nullptr;FString Key;
             if(!Value->TryGetObject(Item) || !Item->IsValid() || !(*Item)->TryGetStringField(TEXT("key"),Key) ||
                !(*Item)->TryGetArrayField(TEXT("grid"),Grid) || Grid->Num()!=2)return nullptr;
             double X,Y;if(!(*Grid)[0]->TryGetNumber(X) || !(*Grid)[1]->TryGetNumber(Y) || !FMath::IsFinite(X) || !FMath::IsFinite(Y) ||
                 FMath::Abs(X)>32768 || FMath::Abs(Y)>32768 || X!=(int32)X || Y!=(int32)Y ||
-                Key!=FString::Printf(TEXT("exterior:%d,%d"),(int32)X,(int32)Y) || CellKeys.Contains(Key))return nullptr;
+                Key!=FString::Printf(TEXT("%s:%d,%d"),Distant?TEXT("distant"):TEXT("exterior"),(int32)X,(int32)Y) || CellKeys.Contains(Key))return nullptr;
             CellKeys.Add(Key);
         }
     } else {CellKeys.Add(TEXT("exterior:-2,-9"));CellKeys.Add(TEXT("exterior:-2,-8"));}
     const TArray<TSharedPtr<FJsonValue>>* Bindings=nullptr;
     if(Root->TryGetArrayField(TEXT("bindings"),Bindings)) {
-        if(Bindings->Num()>16384)return nullptr;
+        if(Bindings->Num()>(Distant?4096:16384))return nullptr;
         TSet<FString> Ids;
         for(const auto& Value:*Bindings) {
             const TSharedPtr<FJsonObject>* Item=nullptr;FMWBinding Binding;
@@ -138,11 +255,30 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
             if((*Item)->HasField(TEXT("cell_key"))) {
                 if(!(*Item)->TryGetStringField(TEXT("cell_key"),Binding.Cell) || !CellKeys.Contains(Binding.Cell))return nullptr;
             }
-            NewBindings.Add(MoveTemp(Binding));
+            if(!Continuities.Contains(Binding.Asset)) {
+                const TSharedPtr<FJsonObject>* Definition=nullptr;
+                if(!(*Definitions)->TryGetObjectField(Binding.Asset,Definition) || !Definition->IsValid())return nullptr;
+                Continuities.Add(Binding.Asset,MWResourceContinuity(*Definition));
+            }
+            Binding.Continuity=Continuities[Binding.Asset];NewBindings.Add(MoveTemp(Binding));
         }
     }
     TSet<FString> WantedAssets,WantedTextures;
     TArray<FMWTerrainTile> TerrainTiles;
+    if(Root->HasField(TEXT("terrain_tiles"))) {
+        const TArray<TSharedPtr<FJsonValue>>* Paint=nullptr;
+        if(!Distant || !Root->TryGetArrayField(TEXT("terrain_tiles"),Paint) || Paint->Num()>16384)return nullptr;
+        TSet<FIntPoint> Seen;
+        for(const auto& Value:*Paint) {
+            const TSharedPtr<FJsonObject>* Row=nullptr;const TArray<TSharedPtr<FJsonValue>>* Tile=nullptr;double X=0,Y=0;FString Texture,Source;
+            if(!Value->TryGetObject(Row) || !Row->IsValid() || !(*Row)->TryGetArrayField(TEXT("tile"),Tile) || Tile->Num()!=2 ||
+               !(*Tile)[0]->TryGetNumber(X) || !(*Tile)[1]->TryGetNumber(Y) || !FMath::IsFinite(X) || !FMath::IsFinite(Y) || FMath::Abs(X)>1048576 || FMath::Abs(Y)>1048576 || X!=FMath::FloorToDouble(X) || Y!=FMath::FloorToDouble(Y) ||
+               !(*Row)->TryGetStringField(TEXT("texture"),Texture) || !Texture.StartsWith(TEXT("textures/")) || !Texture.EndsWith(TEXT(".png")) || Texture.Len()>512 || Texture.Contains(TEXT("..")) || Texture.Contains(TEXT(":")) || Texture.Contains(TEXT("\\")) ||
+               !(*Row)->TryGetStringField(TEXT("source_texture"),Source) || Source.Len()>512)return nullptr;
+            const FIntPoint Key{int32(X),int32(Y)};if(Seen.Contains(Key))return nullptr;Seen.Add(Key);
+            TerrainTiles.Add({Key,Texture,Source});
+        }
+    }
     TMap<FString,TArray<FString>> AnimationGroups;
     for(const auto& Definition:(*Definitions)->Values) {
         WantedAssets.Add(Definition.Key);
@@ -152,6 +288,14 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         if((*Item)->HasField(TEXT("alpha_mode")) && (!(*Item)->TryGetStringField(TEXT("alpha_mode"),AlphaMode) || (AlphaMode!=TEXT("opaque") && AlphaMode!=TEXT("masked") && AlphaMode!=TEXT("translucent") && AlphaMode!=TEXT("additive") && AlphaMode!=TEXT("premultiplied") && AlphaMode!=TEXT("modulate"))))return nullptr;
         bool BlendNativeOpacity=true;
         if((*Item)->HasField(TEXT("blend_native_opacity")) && (!(*Item)->HasTypedField<EJson::Boolean>(TEXT("blend_native_opacity")) || !(*Item)->TryGetBoolField(TEXT("blend_native_opacity"),BlendNativeOpacity)))return nullptr;
+        bool NativeAlphaTest=false;double AlphaFunction=0,AlphaReference=0;
+        if((*Item)->HasField(TEXT("alpha_test"))) {
+            const TSharedPtr<FJsonObject>* Test=nullptr;double AlphaVersion=0;
+            if(!(*Item)->TryGetObjectField(TEXT("alpha_test"),Test) || !Test->IsValid() || !(*Test)->TryGetNumberField(TEXT("version"),AlphaVersion) || AlphaVersion!=1 ||
+               !(*Test)->TryGetNumberField(TEXT("function"),AlphaFunction) || AlphaFunction<0 || AlphaFunction>7 || AlphaFunction!=FMath::FloorToDouble(AlphaFunction) ||
+               !(*Test)->TryGetNumberField(TEXT("reference"),AlphaReference) || AlphaReference<0 || AlphaReference>255 || AlphaReference!=FMath::FloorToDouble(AlphaReference))return nullptr;
+            NativeAlphaTest=true;
+        }
         if(!File.StartsWith(TEXT("meshes/")) || !File.EndsWith(TEXT(".umesh")) || File.Contains(TEXT("..")) || File.Contains(TEXT(":")) || File.Contains(TEXT("\\"))) return nullptr;
         if(!TextureName.IsEmpty() && (!TextureName.StartsWith(TEXT("textures/")) || !TextureName.EndsWith(TEXT(".png")) || TextureName.Contains(TEXT("..")) || TextureName.Contains(TEXT(":")) || TextureName.Contains(TEXT("\\"))))return nullptr;
         if(!TextureName.IsEmpty())WantedTextures.Add(TextureName);
@@ -179,9 +323,16 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
             if(auto* Previous=AnimationGroups.Find(FrameGroup)){if(*Previous!=FrameTextures)return nullptr;}
             else AnimationGroups.Add(FrameGroup,FrameTextures);
         }
+        FMWMeshData StageRecipe;
+        if(!MWDecodeTextureStages(*Item,StageRecipe,WantedTextures,AnimationGroups) || !MWDecodeEnvironmentMap(*Item,StageRecipe,WantedTextures,AnimationGroups))return nullptr;
         FString SourceTexture;FMWFinish Finish;
         if((*Item)->TryGetStringField(TEXT("source_texture"),SourceTexture))Finish=MWArtworkFinish(SourceTexture);
         bool Terrain=false;
+        if((*Item)->HasField(TEXT("distant_terrain"))) {
+            bool Flag=false;
+            if(!Distant || !(*Item)->TryGetBoolField(TEXT("distant_terrain"),Flag) || !Flag || TerrainTiles.Num()==0 || TextureName.IsEmpty() || AlphaMode!=TEXT("opaque") || !FrameGroup.IsEmpty() || (*Item)->HasField(TEXT("terrain_tile")))return nullptr;
+            Terrain=true;
+        }
         if((*Item)->HasField(TEXT("terrain_tile"))) {
             const TArray<TSharedPtr<FJsonValue>>* Tile=nullptr;double X=0,Y=0;
             if(TextureName.IsEmpty() || AlphaMode!=TEXT("opaque") || !FrameGroup.IsEmpty() || !(*Item)->TryGetArrayField(TEXT("terrain_tile"),Tile) || Tile->Num()!=2 ||
@@ -217,14 +368,20 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         if(MeshBytes<12 || MeshBytes>8*1024*1024)return nullptr;
         if(!FFileHelper::LoadFileToArray(Bytes,*(AssetsPath/File)) || Bytes.Num()<12 || Bytes.Num()>8*1024*1024)return nullptr;
         const bool HasNormals=FMemory::Memcmp(Bytes.GetData(),"UEM3",4)==0;
-        const bool HasColors=HasNormals || FMemory::Memcmp(Bytes.GetData(),"UEM2",4)==0;
+        const bool Lines=FMemory::Memcmp(Bytes.GetData(),"UML2",4)==0;
+        const bool HasColors=HasNormals || Lines || FMemory::Memcmp(Bytes.GetData(),"UEM2",4)==0;
         if(!HasColors && FMemory::Memcmp(Bytes.GetData(),"UEM1",4)!=0)return nullptr;
         uint32 Count,IndexCount;
         FMemory::Memcpy(&Count,Bytes.GetData()+4,4);
         FMemory::Memcpy(&IndexCount,Bytes.GetData()+8,4);
         const int32 Stride=HasNormals?36:HasColors?24:20;
         if(Count==0 || Count>65535 || IndexCount==0 || IndexCount>65535*3 || IndexCount%3 || Bytes.Num()!=12+(int64)Count*Stride+(int64)IndexCount*2) return nullptr;
+        if(Distant && Count!=uint32((*Item)->GetNumberField(TEXT("vertices"))))return nullptr;
         FMWMeshData Data;
+        Data.Lines=Lines;
+        Data.TextureStages=MoveTemp(StageRecipe.TextureStages);Data.TextureApply=StageRecipe.TextureApply;Data.StageUVFile=MoveTemp(StageRecipe.StageUVFile);
+        Data.TextureEffectGroup=MoveTemp(StageRecipe.TextureEffectGroup);Data.TextureEffectSupported=StageRecipe.TextureEffectSupported;
+        Data.Continuity=Continuities.Contains(Definition.Key)?Continuities[Definition.Key]:MWResourceContinuity(*Item);
         Data.Terrain=Terrain;
         Data.Roughness=Finish.Roughness;Data.Specular=Finish.Specular;Data.Metallic=Finish.Metallic;
         Data.DetailStrength=Detail?Finish.DetailStrength:0;Data.RoughnessVariation=Detail?Finish.RoughnessVariation:0;
@@ -234,6 +391,7 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         Data.Glass=Transparent.Glass && SolidLit;Data.BlendFiltered=FilterBlend;
         Data.Transparent=!Excluded && (AlphaMode==TEXT("translucent") || AlphaMode==TEXT("additive") || AlphaMode==TEXT("premultiplied") || AlphaMode==TEXT("modulate"));
         Data.BlendNativeOpacity=BlendNativeOpacity;
+        Data.NativeAlphaTest=NativeAlphaTest;Data.AlphaTestFunction=(uint8)AlphaFunction;Data.AlphaTestReference=(uint8)AlphaReference;
         Data.TextureFrameGroup=FrameGroup;Data.TextureFrames=MoveTemp(FrameTextures);
         Data.MaterialValueGroup=ValueGroup;
         Data.NativeVertices=NativeVertices;Data.NativeColors=NativeColors;Data.NativeUVs=NativeUVs;
@@ -264,6 +422,7 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
             uint16 Indices[3];
             FMemory::Memcpy(Indices,Bytes.GetData()+12+Count*Stride+i*2,6);
             if(Indices[0]>=Count || Indices[1]>=Count || Indices[2]>=Count) return nullptr;
+            if(Lines && Indices[1]!=Indices[2])return nullptr;
             Data.Triangles[i]=Indices[0];Data.Triangles[i+1]=Indices[2];Data.Triangles[i+2]=Indices[1];
         }
         Data.Texture=TextureName;
@@ -288,10 +447,13 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         Data.CelestialKind=MWCelestialKind(SourceTexture,Data.Background,Data.Sky);
         FString SkinFile;
         if((*Item)->TryGetStringField(TEXT("skin_file"),SkinFile)) {
+            if(Data.Lines)return nullptr;
             double Bones=0;
             if(!SkinFile.StartsWith(TEXT("meshes/")) || !SkinFile.EndsWith(TEXT(".uskin")) || SkinFile.Contains(TEXT("..")) || SkinFile.Contains(TEXT(":")) || SkinFile.Contains(TEXT("\\")) ||
                 !MWLoadSkin(AssetsPath/SkinFile,Data) || !(*Item)->TryGetNumberField(TEXT("skin_bones"),Bones) || Bones!=Data.SkinBones)return nullptr;
         }
+        if(Data.Terrain || Data.Water)Data.TextureEffectSupported=false;
+        if(!MWLoadStageUVs(AssetsPath,Data))return nullptr;
         if(!Data.Texture.IsEmpty())WantedTextures.Add(Data.Texture);
         if(!Data.Texture.IsEmpty() && (!Data.Texture.StartsWith(TEXT("textures/")) || !Data.Texture.EndsWith(TEXT(".png")) || Data.Texture.Contains(TEXT("..")) || Data.Texture.Contains(TEXT(":")) || Data.Texture.Contains(TEXT("\\")))) return nullptr;
         Result->Meshes.Add(Definition.Key,MoveTemp(Data));
@@ -299,7 +461,8 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
 
     if(WantedTextures.Num()>4096)return nullptr;
     Result->TerrainSignature=MWTerrainSignature(TerrainTiles);Result->TerrainChanged=Result->TerrainSignature!=KnownTerrain;
-    if(Result->TerrainChanged && TerrainTiles.Num())Result->Terrain=MWBuildTerrain(TerrainTiles,AssetsPath,*Result->UpgradeIndex,Cancelled,KnownTerrainPool);
+    if(Result->TerrainChanged && TerrainTiles.Num())Result->Terrain=MWBuildTerrain(TerrainTiles,AssetsPath,*Result->UpgradeIndex,Cancelled,KnownTerrainPool,Distant?256:512);
+    if(Distant && Result->TerrainChanged && TerrainTiles.Num() && !Result->Terrain.IsValid())return nullptr;
     const double TextureBegan=FPlatformTime::Seconds();
     const auto SelectedUpgrades=MWChooseTextureUpgrades(*Result->UpgradeIndex,WantedTextures,KnownTextures,Result->UpgradeReservedBytes);
     for(const auto& Key:WantedTextures)if(Result->UpgradeIndex->Entries.Contains(Key) && !SelectedUpgrades.Contains(Key))++Result->UpgradeBudgetSkipped;

@@ -11,6 +11,29 @@ import struct
 LIGHT_TYPES={0x74FB90:0,0x74FFE0:1,0x749D40:2,0x7506A8:3}
 MAX_LIGHTS=32
 
+
+def select_lights(candidates,camera,preferred=(),previous=(),budget=MAX_LIGHTS):
+    """Bound visual work by native irradiance, never the object-selection radius.
+
+    Only current, enabled captured identities are eligible. Hysteresis changes
+    visual budget ownership, not the captured colour/attenuation or game state.
+    Canonical row order keeps native object masks stable while walking/turning.
+    """
+    preferred=set(preferred);previous=set(previous)
+    def rank(value):
+        distance=math.dist(value['position'],camera)
+        c,l,q=value['attenuation']
+        # Original dimmer flicker still reaches the shader unchanged. It must
+        # not reshuffle budget ownership every time a candle briefly dims.
+        peak=max(0.,max(value['diffuse'])+max(value['ambient']))*max(1.,value['dimmer'])
+        energy=peak/max(c+l*distance+q*distance*distance,1e-5)
+        # Keep dark lights valid, but rank them behind contributing sources.
+        cost=(1+distance/4096)/max(energy,1e-12)
+        if value['id']in previous:cost/=1.35
+        return (0 if value['kind']==1 else 1 if int(value['id'],16)in preferred else 2,cost,value['id'])
+    current=[v for v in candidates if v['enabled'] and v['kind']!=0]
+    return sorted(sorted(current,key=rank)[:max(0,min(MAX_LIGHTS,budget))],key=lambda v:v['id'])
+
 def numbers(values,limit=1e8,field='values'):
     result=list(values)
     for index,value in enumerate(result):
@@ -49,7 +72,7 @@ def roles(reader,base):
     pointers=struct.unpack('<5I',reader.read(weather+0x7c,20))
     return {p:role for p,role in zip(pointers,('atmosphere','cloud','cloud','sun','glare'))if p}
 
-def capture(reader,base,pointers=(),owners=None,preferred_lights=()):
+def capture(reader,base,pointers=(),owners=None,preferred_lights=(),previous_lights=()):
     world=int(base['world'],16);data=int(base['data'],16);cell=int(base['cell_ptr'],16)
     flags=reader.u32(cell+0x18)
     packed=reader.read(cell+0x1c,16)
@@ -125,12 +148,7 @@ def capture(reader,base,pointers=(),owners=None,preferred_lights=()):
         if not -1<=state['current']<=9 or not -1<=state['next']<=9 or raw[0x199]>1:raise ValueError('Invalid native weather identity')
     camera=base['camera']['position']
     candidates=[v for v in all_lights.values()if v['kind']!=0 and v['enabled']]
-    preferred=set(preferred_lights)
-    candidates.sort(key=lambda v:(0 if v['kind']==1 else 1 if int(v['id'],16)in preferred else 2,max(0,math.dist(v['position'],camera)-v['radius']),v['id']))
-    # Distance determines inclusion, not shader slot identity. Reordering the
-    # same chosen lights on a camera step needlessly rebinds every material's
-    # object-light mask. Keep identical selection with canonical slot order.
-    selected=sorted(candidates[:MAX_LIGHTS],key=lambda v:v['id'])
+    selected=select_lights(candidates,camera,preferred_lights,previous_lights)
     behaves_outside=not bool(flags&1) or bool(flags&0x80)
     water_level=struct.unpack('<f',reader.read(cell+0x90,4))[0]if not behaves_outside and flags&2 else 0.
     numbers((water_level,),field='water_level')

@@ -12,6 +12,7 @@ struct FMWTextureImages {TArray<FImage> Color,Masked,Detail,Blend;};
 struct FMWCatalogData {
     TArray<FMWBinding> Bindings;
     TMap<FString,FString> BindingAssets;
+    TMap<FString,FString> ResourceAliases;
     FString PoseSourceCatalog;
     int32 PoseSourceCount=0;
     TArray<int32> PoseRemap;
@@ -36,22 +37,34 @@ struct FMWCatalogLoader {
     TFuture<FMWCatalogPtr> Future;
     FMWCatalogPtr Data;
     FMWTextureUpgradePtr UpgradeIndex;
-    TArray<FString> MeshKeys,TextureKeys;
-    int32 MeshIndex=0,TextureIndex=0;
+    TArray<FString> MeshKeys,TextureKeys,AliasKeys;
+    int32 MeshIndex=0,TextureIndex=0,AliasIndex=0;
     int32 TerrainStage=0;
     FThreadSafeBool Cancelled=false;
     FString Error;
-    bool BindingsCommitted=false;
+    bool DefinitionsCommitted=false,BindingsCommitted=false;
     ~FMWCatalogLoader(){Cancelled=true;if(Future.IsValid())Future.Wait();}
 };
 FMWCatalogPtr MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder=FString(),FMWTextureUpgradePtr Upgrades=nullptr,const FString& KnownTerrain=FString(),const FString& KnownTerrainPool=FString());
 // Validated binding order only; no mesh/PNG decoding or UObject work.
-bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FString& AssetsPath,TArray<FMWBinding>& Out);
+struct FMWContinuityEntry {TSharedPtr<FJsonObject> Definition;FMWResourceIdentity Identity;};
+// Owned by one parser thread. Exact JSON value comparison fences cached
+// definition identities; neither an asset name nor a previous pose is trusted.
+struct FMWContinuityCache {TMap<FString,FMWContinuityEntry> Entries;};
+bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FString& AssetsPath,TArray<FMWBinding>& Out,FMWContinuityCache* Cache=nullptr);
+// UBI2 table prepared with the catalog; no full catalog DOM on the pose reader.
+bool MWReadBindingIndex(const TSharedPtr<FJsonObject>& Reference,const FString& CatalogName,const FString& CatalogDigest,const FString& AssetsPath,TArray<FMWBinding>& Out);
+bool MWEqualBindingTables(const TArray<FMWBinding>& A,const TArray<FMWBinding>& B);
+// Exact canonical definition equality, excluding only native light membership
+// and sun eligibility. Computed locally from parsed definitions, never trusted
+// from an external compatibility flag. Poses/cache equality stay independent.
+FMWResourceIdentity MWResourceContinuity(const TSharedPtr<FJsonObject>& Definition);
+bool MWCompatibleBinding(const FMWBinding& A,const FMWBinding& B);
 bool MWRemapRetainedGeometry(const TArray<FMWBinding>& IncomingBindings,const TArray<FMWGeometryState>& Incoming,const TArray<FMWBinding>& Retained,TArray<FMWGeometryState>& Out,int32& Missing);
 bool MWRebasePoseCache(const TArray<FMWBinding>& PreviousBindings,const TArray<FMWGeometryState>& Previous,const TArray<FMWBinding>& Current,TArray<FMWGeometryState>& Out,TBitArray<>& Matched);
 bool MWBuildPoseRemap(const TArray<FMWBinding>& Previous,const TArray<FMWBinding>& Current,TArray<int32>& Out);
 bool MWMovePoseCache(TArray<FMWGeometryState>& Previous,const TArray<int32>& Indices,TArray<FMWGeometryState>& Out,TBitArray<>& Matched);
 // Optional index belongs to the same parser-validated immutable incoming table;
 // the retained table is also validated by its catalog parser.
-bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBinding>& Retained,TArray<int32>& Out,const TMap<FString,int32>* ParsedIndex=nullptr);
+bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBinding>& Retained,TArray<int32>& Out,const TMap<FString,int32>* ParsedIndex=nullptr,bool AllowLightingVariant=false);
 bool MWApplyRetainedRemap(const TArray<FMWGeometryState>& Incoming,const TArray<int32>& Indices,TArray<FMWGeometryState>& Out,int32& Missing);

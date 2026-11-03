@@ -51,6 +51,7 @@ class SceneReader:
     def render_properties(self,ptr,inherited,header=None):
         texture,alpha,material,color_mode,*extra=inherited
         lighting_mode=extra[0]if extra else 1
+        alpha_ref=extra[1]if len(extra)>1 else 0
         link=ptr+0x88
         seen=set()
         for _ in range(32):
@@ -62,12 +63,13 @@ class SceneReader:
             if prop:
                 types=self.ancestry(prop)
                 if 'NiTexturingProperty'in types:texture=prop
-                elif 'NiAlphaProperty'in types:alpha=struct.unpack('<H',self.r.read(prop+0x14,2))[0]
+                elif 'NiAlphaProperty'in types:
+                    value=self.r.read(prop+0x14,5);alpha=struct.unpack_from('<H',value)[0];alpha_ref=value[4]
                 elif 'NiMaterialProperty'in types:material=prop
                 elif 'NiVertexColorProperty'in types:
                     color_mode,lighting_mode=struct.unpack('<2I',self.r.read(prop+0x18,8))
                     if color_mode>2 or lighting_mode>1:raise ValueError('Invalid native vertex-colour lighting mode')
-        return texture,alpha,material,color_mode,lighting_mode
+        return texture,alpha,material,color_mode,lighting_mode,alpha_ref
 
     def texture_name(self,prop):
         if not prop:
@@ -84,7 +86,7 @@ class SceneReader:
             return ''
         return self.r.string(self.r.u32(texture+0x2C),512)
 
-    def collect(self,roots=None,cells=None,view_roots=None,aux_roots=None):
+    def collect(self,roots=None,cells=None,view_roots=None,aux_roots=None,prune_hidden=False):
         owned_scene=roots is None or cells is not None
         data=self.r.u32(0x7C67E0)
         cell=self.r.u32(data+0xB540)
@@ -151,8 +153,8 @@ class SceneReader:
         counts=Counter()
         shapes=[]
         errors=[]
-        textures={}
-        lights=set();effect_nodes=set()
+        textures={};environment_effects={}
+        lights=set();effect_nodes=set();ui_read_fences=[]
         def effects(first,owner=None):
             if first in effect_nodes:return
             effect_nodes.add(first)
@@ -174,6 +176,7 @@ class SceneReader:
             visited.add(ptr)
             try:
                 header=self.r.read(ptr,0x90)
+                if prune_hidden:ui_read_fences.append((ptr,header))
                 node_identities[ptr]=(struct.unpack_from('<I',header)[0],struct.unpack_from('<I',header,0x18)[0])
                 types=self.ancestry(ptr,struct.unpack_from('<I',header,0)[0])
                 kind=types[0]
@@ -186,37 +189,57 @@ class SceneReader:
                     continue
                 flags=struct.unpack_from('<H',header,0x14)[0]
                 hidden=hidden or bool(flags&1)
+                if prune_hidden and hidden:continue
                 texture_prop=self.render_properties(ptr,texture_prop,header)
                 if 'NiNode' in types:
                     switch=remember_switch(ptr,types,header)
                     node_data=self.r.read(ptr+0x94,0x1c)
+                    if prune_hidden:ui_read_fences.append((ptr+0x94,node_data))
                     storage,capacity,end=struct.unpack_from('<3I',node_data)
                     if end>capacity or capacity>32768:
                         raise ValueError('Invalid child array bounds')
                     if storage and end:
-                        children=struct.unpack(f'<{end}I',self.r.read(storage,end*4))
+                        child_bytes=self.r.read(storage,end*4)
+                        if prune_hidden:ui_read_fences.append((storage,child_bytes))
+                        children=struct.unpack(f'<{end}I',child_bytes)
                         pending.extend((child,hidden,texture_prop,depth+1,parents+(ptr,),terrain,cell_key,
                             gates+((ptr,child),)if switch else gates)for child in children if child)
                     if any(node_data[0x14:0x1c]):effects(ptr+0xa8,cell_key)
                 elif 'NiLight' in types:
                     if struct.unpack_from('<I',header)[0]in LIGHT_TYPES:
                         lights.add(ptr);light_owners.setdefault(ptr,set()).add(cell_key)
-                elif 'NiTriShape' in types or 'NiParticles'in types:
+                elif 'NiTriShape' in types or 'NiTriStrips'in types or 'NiLines'in types or 'NiParticles'in types:
                     effect_state,model,skin=struct.unpack('<3I',self.r.read(ptr+0x94,12))
+                    if effect_state and effect_state not in environment_effects:environment_effects[effect_state]=self.r.u32(effect_state+0x14)
                     if not model:
                         continue
                     particle='NiParticles'in types
-                    model_header=self.r.read(model,0x44 if particle else 0x36)
+                    strips='NiTriStrips'in types
+                    lines='NiLines'in types
+                    model_header=self.r.read(model,0x44 if particle or strips else 0x38 if lines else 0x36)
+                    if strips:
+                        from native_topology import STRIPS_DATA
+                        if struct.unpack_from('<I',model_header)[0]!=STRIPS_DATA:raise SceneReadChanged('Native triangle-strip data type changed')
                     vertex_count=struct.unpack_from('<H',model_header,8)[0]
                     if particle:
+                        data_types=self.ancestry(model,struct.unpack_from('<I',model_header)[0])
+                        if 'NiParticlesData'not in data_types:raise ValueError('Native particle model is not particle data')
                         capacity,_,_,_=particle_header(model_header)
                         if skin:raise ValueError('Skinned native particle geometry is unsupported')
                         vertex_count=capacity*4;triangle_count=capacity*2
                         skin=0
+                    elif lines:
+                        from native_topology import line_pairs
+                        if not vertex_count:continue
+                        # Vanilla renderLines receives model data and the
+                        # object's world transform, not a skin palette. Its
+                        # DX8 writer reads original model vertices directly.
+                        skin=0
+                        triangle_count=len(line_pairs(self.r,model_header,vertex_count))
                     else:triangle_count=struct.unpack_from('<H',model_header,0x34)[0]
                     if not vertex_count or not triangle_count:
                         continue
-                    texture,alpha,material,color_mode,lighting_mode=texture_prop
+                    texture,alpha,material,color_mode,lighting_mode,alpha_ref=texture_prop
                     blend=classify_blend(alpha)
                     if texture not in textures:textures[texture]=self.texture_name(texture)
                     values=struct.unpack_from('<13f',header,0x40)
@@ -224,18 +247,21 @@ class SceneReader:
                     shapes.append({'id':hex(ptr),'name':name,'type':kind,'model':hex(model),'controller':hex(struct.unpack_from('<I',header,0x10)[0]),
                                    'skin':hex(skin),'visible':not hidden,'cell_key':cell_key,
                                    'vertex_count':vertex_count,'triangle_count':triangle_count,
-                                   'texture':textures[texture],'texture_property':hex(texture),'alpha_flags':alpha,'alpha_mode':blend['mode'],
+                                   'texture':textures[texture],'texture_property':hex(texture),'alpha_flags':alpha,'alpha_ref':alpha_ref,'alpha_mode':blend['mode'],
                                    'blend_native_opacity':blend['native_opacity'],'blend_fallback':blend['fallback'],
                                    'material':hex(material),'color_mode':color_mode,'lighting_mode':lighting_mode,
                                    'transform':{'rotation':values[:9],'position':values[9:12],'scale':values[12]},'parents':parents,'terrain':terrain,
                                    'switch_gates':gates})
+                    if strips:shapes[-1]['topology']='strips'
+                    if lines:shapes[-1]['topology']='lines';counts['rendered_line_shapes']+=1;counts['rendered_line_segments']+=triangle_count
+                    if environment_effects.get(effect_state):shapes[-1]['native_environment_effect']=hex(environment_effects[effect_state])
                     if owned_scene and cell_key!='view:first-person':
                         # The near pass uses the existing global-light path in UE;
                         # unused per-object effect lists must not churn its assets.
                         membership=light_set(self.r,effect_state,light_sets)
                         if membership is not None:shapes[-1].update(native_light_state=effect_state,native_lights=membership,native_sun=hex(native_sun)in membership)
                     if particle:
-                        shapes[-1].update(particles=True,particle_capacity=capacity)
+                        shapes[-1].update(particles=True,particle_capacity=capacity,particle_data_vtable=struct.unpack_from('<I',model_header)[0])
                         counts['rendered_particle_systems']+=1;counts['particle_capacity']+=capacity
                     if terrain:
                         counts['terrain_shapes']+=1;counts['terrain_triangles']+=triangle_count
@@ -251,7 +277,7 @@ class SceneReader:
         return {'cell':cell_name,'cell_ptr':hex(cell),'roots':[hex(p) for p in roots],
                 'stream_cells':cells or [],
                 'nodes':len(visited),'counts':dict(counts),'shapes':shapes,'errors':errors,'lights':sorted(lights),'switches':switches,
-                'node_identities':node_identities,'actor_owners':actor_owners,'cell_root_owners':cell_root_owners,'light_owners':{p:tuple(owners)for p,owners in light_owners.items()}}
+                'node_identities':node_identities,'actor_owners':actor_owners,'cell_root_owners':cell_root_owners,'light_owners':{p:tuple(owners)for p,owners in light_owners.items()},'ui_read_fences':ui_read_fences}
 
 
 def main():

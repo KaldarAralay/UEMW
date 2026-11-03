@@ -9,7 +9,8 @@ SOURCE_TEXTURE=0x75062c
 TEXTURING=0x750778
 
 
-def discover(reader,prop,generation=''):
+def discover(reader,prop,generation='',map_index=0):
+    if not 0<=map_index<14:raise ValueError('Invalid native texture flip slot')
     if not prop:return None
     if reader.u32(prop)!=TEXTURING:return None
     controller=reader.u32(prop+0x10);seen=set();found=None
@@ -20,7 +21,7 @@ def discover(reader,prop,generation=''):
             full=reader.read(controller,0x54)
             target=struct.unpack_from('<I',full,0x28)[0];affected=struct.unpack_from('<I',full,0x50)[0]
             if target!=prop:raise SceneReadChanged('Native texture flip target changed')
-            if affected==0:
+            if affected==map_index:
                 if found:raise ValueError('Multiple native base-map flip controllers')
                 # NI::TArray has a vtable at +0, then storage/capacity/end.
                 storage,capacity,count=struct.unpack_from('<3I',full,0x38)
@@ -32,12 +33,12 @@ def discover(reader,prop,generation=''):
                     if not name:raise ValueError('Native flip texture has no source filename')
                     names.append(name)
                 maps=reader.u32(prop+0x20);end=reader.u32(prop+0x28)
-                if not maps or not 1<=end<=16:raise SceneReadChanged('Native flip base map changed')
-                mapping=reader.u32(maps)
+                if not maps or not map_index<end<=16:raise SceneReadChanged('Native flip map changed')
+                mapping=reader.u32(maps+map_index*4)
                 if not mapping:raise SceneReadChanged('Native flip base map missing')
                 identity=hashlib.sha256(struct.pack('<I',storage)+pointers).hexdigest()[:12]
                 found=dict(id=generation+':'+hex(controller)+':'+identity,controller=controller,property=prop,storage=storage,
-                           capacity=capacity,count=count,pointers=pointers,textures=textures,names=tuple(names),maps=maps,mapping=mapping)
+                           capacity=capacity,count=count,pointers=pointers,textures=textures,names=tuple(names),maps=maps,mapping=mapping,map_index=map_index)
         controller=struct.unpack_from('<I',raw,0x2c)[0]
     return found
 
@@ -57,10 +58,12 @@ class FlipCapture:
             controller,prop,storage,maps,mapping=(item[k]for k in ('controller','property','storage','maps','mapping'))
             count,capacity=item['count'],item['capacity']
             pointers=bytes(item['pointers']);textures=tuple(item['textures'])
+            slot=item.get('map_index',0)
+            if not 0<=slot<14:raise ValueError('Invalid prepared native texture slot')
             if not 1<=count<=capacity<=256 or len(pointers)!=count*4 or len(textures)!=count:
                 raise ValueError('Invalid prepared native flip palette')
-            records.append((key,controller,prop,storage,capacity,count,pointers,textures,maps,mapping))
-            requests.extend(((controller,0x54),(storage,count*4),(prop,0x24),(maps,4),(mapping+4,4)))
+            records.append((key,controller,prop,storage,capacity,count,pointers,textures,maps,mapping,slot))
+            requests.extend(((controller,0x54),(storage,count*4),(prop,0x24),(maps+slot*4,4),(mapping+4,4)))
         self.records=tuple(records);self.plan=ReadPlan(requests)
 
     def subset(self,properties):
@@ -76,14 +79,14 @@ def capture(reader,flips):
         if value is None or len(value)<count:raise SceneReadChanged('Native flip batch was incomplete')
         return value[:count]
     frames={}
-    for key,controller,prop,storage,capacity,count,pointers,textures,maps,mapping in prepared.records:
+    for key,controller,prop,storage,capacity,count,pointers,textures,maps,mapping,slot in prepared.records:
         raw=read(controller,0x54)
-        if struct.unpack_from('<I',raw)[0]!=FLIP or struct.unpack_from('<I',raw,0x28)[0]!=prop or struct.unpack_from('<I',raw,0x50)[0]!=0:
+        if struct.unpack_from('<I',raw)[0]!=FLIP or struct.unpack_from('<I',raw,0x28)[0]!=prop or struct.unpack_from('<I',raw,0x50)[0]!=slot:
             raise SceneReadChanged('Native flip controller was replaced')
         if struct.unpack_from('<3I',raw,0x38)!=(storage,capacity,count)or read(storage,count*4)!=pointers:
             raise SceneReadChanged('Native flip palette was replaced')
         prop_raw=read(prop,0x24)
-        if struct.unpack_from('<I',prop_raw)[0]!=TEXTURING or struct.unpack_from('<I',prop_raw,0x20)[0]!=maps or struct.unpack('<I',read(maps,4))[0]!=mapping:
+        if struct.unpack_from('<I',prop_raw)[0]!=TEXTURING or struct.unpack_from('<I',prop_raw,0x20)[0]!=maps or struct.unpack('<I',read(maps+slot*4,4))[0]!=mapping:
             raise SceneReadChanged('Native texture mapping was replaced')
         current=struct.unpack('<I',read(mapping+4,4))[0]
         # Read the resolved map, avoiding assumptions about whether the

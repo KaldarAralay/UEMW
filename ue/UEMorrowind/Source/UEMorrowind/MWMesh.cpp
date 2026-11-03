@@ -41,7 +41,7 @@ UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterfa
     auto Tangents=Attributes.GetVertexInstanceTangents();
     auto Signs=Attributes.GetVertexInstanceBinormalSigns();
     auto Colors=Attributes.GetVertexInstanceColors();
-    auto UVs=Attributes.GetVertexInstanceUVs();UVs.SetNumChannels(Data.SkinUVs.Num()?2:1);
+    auto UVs=Attributes.GetVertexInstanceUVs();UVs.SetNumChannels(Data.StageUV1.Num()?4:Data.SkinUVs.Num()?2:1);
     const auto Group=Description.CreatePolygonGroup();
     Attributes.GetPolygonGroupMaterialSlotNames()[Group]=TEXT("Native");
     TArray<FVertexID> Vertices;Vertices.Reserve(Data.Vertices.Num());
@@ -64,6 +64,7 @@ UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterfa
             const auto& Color=Data.Colors[V];Colors[Corner]=FVector4f(Color.R,Color.G,Color.B,Color.A);
             UVs.Set(Corner,0,FVector2f(Data.UVs[V]));
             if(Data.SkinUVs.Num())UVs.Set(Corner,1,FVector2f(Data.SkinUVs[V]));
+            if(Data.StageUV1.Num()){UVs.Set(Corner,2,FVector2f(Data.StageUV1[V]));UVs.Set(Corner,3,FVector2f(Data.StageUV2[V]));}
         }
         Description.CreateTriangle(Group,Corners);
     }

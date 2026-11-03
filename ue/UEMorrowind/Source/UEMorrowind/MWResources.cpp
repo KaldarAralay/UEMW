@@ -1,7 +1,9 @@
 #include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "MWLive.h"
 #include "MWFrame.h"
+#include "MWCatalog.h"
 #include "MWMesh.h"
+#include "MWLines.h"
 #include "MWSkin.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "ProceduralMeshComponent.h"
@@ -19,7 +21,7 @@ void AMWLive::SetPrimitiveShown(UPrimitiveComponent* Component,bool Shown) {
     // View filters alone do not retire a primitive from all shadow passes.
     // Remember eligibility and change the proxy only on a visibility transition.
     static const FName ShadowTag(TEXT("UEMWShadowCaster"));
-    if(Component->CastShadow || Component->ComponentTags.Contains(ShadowTag)) {
+    if(!AuxiliaryGeometry && (Component->CastShadow || Component->ComponentTags.Contains(ShadowTag))) {
         Component->ComponentTags.AddUnique(ShadowTag);Component->SetCastShadow(Shown);
     }
     if(auto* PC=GetWorld()->GetFirstPlayerController()) {
@@ -81,14 +83,48 @@ void AMWLive::HideInstance(const FString& Id) {
     VisibleInstances.Remove(Id);
 }
 
+bool AMWLive::PrepareRigidBatch(const FString& Asset) {
+    if(RigidBatches.Contains(Asset))return true;
+    const auto* D=MeshData.Find(Asset);auto* Mesh=SharedMeshes.FindRef(Asset);auto* Material=GeometryMaterials.FindRef(Asset);
+    if(!D || !Mesh || !Material)return false;
+    auto* Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);Batch->SetStaticMesh(Mesh);Batch->SetMaterial(0,Material);
+    MWNativeDrawLayer(Batch,*D);
+    Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);Batch->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Batch->SetRenderCustomDepth(D->Water);Batch->SetCustomDepthStencilValue(1);
+    Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);
+    // Capacity has no pose authority. Only the next fresh native packet can
+    // put an instance into this initially empty batch.
+    for(const auto& Slot:RigidSlots)if(Slot.Value.Asset==Asset){NativeResourceInvalidations.Add(Slot.Key);RigidVisible.Remove(Slot.Key);LastRigidTransforms.Remove(Slot.Key);RigidRows.FindOrAdd(Asset).Add(Slot.Value.Id,FTransform(FQuat::Identity,FVector::ZeroVector,FVector::ZeroVector));}
+    DirtyRigidAssets.Add(Asset);return true;
+}
+
+void AMWLive::RetargetCompatibleResources(const TArray<FMWBinding>& Bindings) {
+    for(const auto& B:Bindings) {
+        const FString Previous=InstanceAssets.FindRef(B.Id);if(Previous.IsEmpty() || Previous==B.Asset || InstanceCells.FindRef(B.Id)!=B.Cell)continue;
+        const auto* Old=MeshData.Find(Previous);const auto* Next=MeshData.Find(B.Asset);auto* Material=GeometryMaterials.FindRef(B.Asset);
+        if(!Old || !Next || !Material || Old->Lines!=Next->Lines || Next->FirstPerson || !Old->Continuity.IsValid() || !Next->Continuity.IsValid() || *Old->Continuity!=*Next->Continuity)continue;
+        if(auto* Component=SkinnedComponents.FindRef(B.Id)) {
+            auto* Skin=SkinMaterials.FindRef(B.Id);auto* Palette=PaletteTextures.FindRef(B.Id);
+            if(!Skin || !Palette || !Next->SkinBones)continue;
+            // Keep the same component, sparse geometry and live palette.
+            // Updating uniforms does not hide/recreate the native actor.
+            Skin->CopyInterpParameters(Material);Skin->SetTextureParameterValue(TEXT("BonePalette"),Palette);
+        }else if(auto* Mutable=GeometryComponents.FindRef(B.Id))Mutable->SetMaterial(0,Material);
+        else if(const auto* Slot=RigidSlots.Find(B.Id)) {
+            if(Slot->Asset!=Previous || !RigidBatches.Contains(B.Asset) || !SharedMeshes.Contains(B.Asset))continue;
+            // The following fresh pose moves this slot between ready batches.
+        }else continue;
+        NativeResourceInvalidations.Add(B.Id);SetInstanceAsset(B.Id,B.Asset);++PerfResourceRetargets;
+    }
+}
+
 bool AMWLive::GeometryResourceReady(const FMWBinding& B,const FMWGeometryState& S) const {
     if(!GeometryMaterials.Contains(B.Asset))return false;
     const auto* Definition=MeshData.Find(B.Asset);if(!Definition)return false;
     const bool Same=InstanceAssets.FindRef(B.Id)==B.Asset;
     if(S.Palette.Num())return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && PaletteTextures.Contains(B.Id);
     double M[13];for(int32 J=0;J<13;++J)M[J]=S.Transform[J];
-    if(Definition->FirstPerson && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && !SkinnedComponents[B.Id]->UseNativeBounds && SkinMaterials.Contains(B.Id);
-    if(S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return SharedMeshes.Contains(B.Asset) && RigidBatches.Contains(B.Asset);
+    if(!Definition->Lines && Definition->FirstPerson && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && !SkinnedComponents[B.Id]->UseNativeBounds && SkinMaterials.Contains(B.Id);
+    if(!Definition->Lines && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return SharedMeshes.Contains(B.Asset) && RigidBatches.Contains(B.Asset);
     auto* C=GeometryComponents.FindRef(B.Id);return Same && C && C->GetNumSections()>0;
 }
 
@@ -138,7 +174,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
             const auto* D=MeshData.Find(Pair.Value);
             if(D && D->FirstPerson && ViewCachedAssets.Contains(Pair.Value))ResourceBindings.Add(Pair.Key,Pair.Value);
         }
-        for(const auto& Pair:InstanceAssets)if(ResourceBindings.FindRef(Pair.Key)!=Pair.Value){HideInstance(Pair.Key);Queue(4,Pair.Key,Pair.Value,FVector4f(0,0,0,1));}
+        for(const auto& Pair:InstanceAssets)if(ResourceBindings.FindRef(Pair.Key)!=Pair.Value){if(ResourceBindings.Contains(Pair.Key) && InstanceSubmitted(Pair.Key))++PerfResourceRebindHides;HideInstance(Pair.Key);Queue(4,Pair.Key,Pair.Value,FVector4f(0,0,0,1));}
     }
     for(int32 i=0;i<States.Num();++i) {
         const auto& S=States[i];if(!S.Visible)continue;
@@ -151,7 +187,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         // material is ready, rather than blocking the resource queue on it.
         if(!GeometryMaterials.Contains(B.Asset))continue;
         double M[13];for(int32 j=0;j<13;++j)M[j]=S.Transform[j];
-        const bool Skin=S.Palette.Num()>0,Rigid=!Skin && !MeshData[B.Asset].Transparent && S.Points.Num()==0 && MWCanInstance(M);
+        const bool Skin=S.Palette.Num()>0,Rigid=!Skin && !MeshData[B.Asset].Lines && !MeshData[B.Asset].Transparent && S.Points.Num()==0 && MWCanInstance(M);
         if((Skin || Rigid) && !SharedMeshes.Contains(B.Asset))Queue(0,TEXT(""),B.Asset,S.Bound);
         if(Rigid && MeshData[B.Asset].FirstPerson) {if(!SameAsset || !SkinnedComponents.Contains(B.Id))Queue(5,B.Id,B.Asset,S.Bound);}
         else if(Rigid) {if(!RigidBatches.Contains(B.Asset))Queue(1,TEXT(""),B.Asset,S.Bound);}
@@ -206,17 +242,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 SharedMeshes.Add(Job.Asset,Mesh);
             }
         }else if(Job.Kind==1) {
-            if(!RigidBatches.Contains(Job.Asset)) {
-                auto* Mesh=SharedMeshes.FindRef(Job.Asset);if(!Mesh){ResourceError=TEXT("Shared mesh dependency missing");return;}
-                auto* Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);Batch->SetStaticMesh(Mesh);
-                MWNativeDrawLayer(Batch,*D);
-                Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);Batch->SetCastShadow(D->Lit && !D->Sky && !D->Background && !D->Water);Batch->SetRenderCustomDepth(D->Water);Batch->SetCustomDepthStencilValue(1);
-                Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Job.Asset,Batch);
-                // A replacement batch cannot expose retained rows from an old
-                // sample. Only a subsequent fresh pose can make them visible.
-                for(const auto& Slot:RigidSlots)if(Slot.Value.Asset==Job.Asset){NativeResourceInvalidations.Add(Slot.Key);RigidVisible.Remove(Slot.Key);LastRigidTransforms.Remove(Slot.Key);RigidRows.FindOrAdd(Job.Asset).Add(Slot.Value.Id,FTransform(FQuat::Identity,FVector::ZeroVector,FVector::ZeroVector));}
-                DirtyRigidAssets.Add(Job.Asset);
-            }
+            if(!PrepareRigidBatch(Job.Asset)){ResourceError=TEXT("Shared mesh dependency missing");return;}
         }else if(Job.Kind==2) {
             PrepareResourceIdentity(Job.Id,Job.Asset);
             if(!SkinnedComponents.Contains(Job.Id)) {
@@ -227,7 +253,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 MWNativeDrawLayer(Component,*D);
                 SetPrimitiveShown(Component,false);UploadedBonePalettes.Remove(Job.Id);
                 Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);Component->SetStaticMesh(Mesh);Component->SetMaterial(0,Skin);
-                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
+                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
                 Component->SetNativeBounds(Job.Bound);Component->RegisterComponent();
                 PaletteTextures.Add(Job.Id,Palette);SkinMaterials.Add(Job.Id,Skin);SkinnedComponents.Add(Job.Id,Component);
             }
@@ -235,9 +261,9 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
             PrepareResourceIdentity(Job.Id,Job.Asset);
             auto* Component=GeometryComponents.FindRef(Job.Id);
             if(!Component) {
-                Component=NewObject<UProceduralMeshComponent>(this);Component->SetMobility(EComponentMobility::Movable);
+                Component=D->Lines?NewObject<UMWNativeLineComponent>(this):NewObject<UProceduralMeshComponent>(this);Component->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(Component,*D);
-                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
+                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
                 Component->bUseAsyncCooking=false;Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);
                 GeometryComponents.Add(Job.Id,Component);
             }
@@ -247,7 +273,9 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 // is committed here; only the next fresh frame may display it.
                 TArray<FVector> EmptyVertices;EmptyVertices.Init(FVector::ZeroVector,D->Vertices.Num());
                 TArray<FVector> Normals;Normals.Init(FVector::UpVector,D->Vertices.Num());TArray<FProcMeshTangent> Tangents;
-                Component->SetMaterial(0,Material);Component->CreateMeshSection_LinearColor(0,EmptyVertices,D->Triangles,Normals,D->UVs,D->Colors,Tangents,false);
+                Component->SetMaterial(0,Material);
+                if(D->Lines){if(!CastChecked<UMWNativeLineComponent>(Component)->SetNativeSection(EmptyVertices,D->Triangles,D->UVs,D->StageUV1,D->StageUV2,D->Colors)){ResourceError=TEXT("Invalid native line capacity");return;}}
+                else Component->CreateMeshSection_LinearColor(0,EmptyVertices,D->Triangles,Normals,D->UVs,D->Colors,Tangents,false);
                 if(!Component->IsRegistered())Component->RegisterComponent();
                 LastRigidTransforms.Remove(Job.Id);UploadedVertexPoses.Remove(Job.Id);
             }

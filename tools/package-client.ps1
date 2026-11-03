@@ -28,6 +28,7 @@ try {
  $MaterialDigest=(@($MaterialInputs|ForEach-Object{(Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash}) -join ':')
  $MaterialStamp=Join-Path $BuildTemp 'materials.sha256'
  $MaterialFiles=@('Opaque','Masked','Foliage','Translucent','Additive','Premultiplied','Modulate','Water','Terrain','Hair','Glass')|ForEach-Object{'MW_'+$_;'MW_'+$_+'_Skin'}
+ $MaterialFiles+=@('Opaque','Masked','Foliage','Translucent','Additive','Premultiplied','Modulate','Hair','Glass')|ForEach-Object{'MW_'+$_+'_Env';'MW_'+$_+'_Env_Skin'}
  $MaterialFiles+=@('MW_WaterFog','MW_NeutralDetail','MW_TerrainColorFallback','MW_TerrainDetailFallback')
  $MaterialFiles+='MW_AmbientProbe'
  $MaterialFiles+='MW_NativeAttenuation'

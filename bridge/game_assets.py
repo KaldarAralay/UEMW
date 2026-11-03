@@ -19,6 +19,7 @@ from live_probe import ROOT, Reader
 from scene_reader import SceneReader
 from asset_files import publish as publish_asset
 from terrain_layout import native_tile
+from native_topology import triangle_indices
 
 
 def normalized(name):
@@ -147,15 +148,17 @@ class Assets:
     def mesh(self,shape):
         if shape.get('particles'):return self.particle_mesh(shape)
         model=int(shape['model'],16)
-        header=self.r.read(model,0x48)
+        header=self.r.read(model,0x38 if shape.get('topology')=='lines' else 0x48)
         unique,revision=struct.unpack_from('<IH',header,0x2C)
+        topology_indices=triangle_indices(self.r,shape,header)if shape.get('topology')in('strips','lines')else None
+        if topology_indices is not None:revision=('native_topology',revision,hashlib.sha256(topology_indices).digest())
         color_ptr=struct.unpack_from('<I',header,0x24)[0]
         dynamic=shape.get('dynamic_attributes')
         immutable_uvs=immutable_indices=None
         if dynamic:
             uv_pointer=struct.unpack_from('<I',header,0x28)[0]
             immutable_uvs=self.r.read(uv_pointer,shape['vertex_count']*8)if uv_pointer and not dynamic.get('uvs') else bytes(shape['vertex_count']*8)
-            immutable_indices=self.r.read(struct.unpack_from('<I',header,0x3c)[0],shape['triangle_count']*6)
+            immutable_indices=topology_indices if topology_indices is not None else triangle_indices(self.r,shape,header)
             # Morph/gradient revisions must not create new immutable resources.
             # Resolved live UVs have their own lane. Topology edits still change
             # the immutable key rather than being frozen.
@@ -177,7 +180,7 @@ class Assets:
             tint=self.material_values[material]
             emissive,unlit=self.material_emissive[material]
         if color_ptr and shape.get('color_mode',2)!=0:tint=(1.,1.,1.,tint[3])
-        key=(model,unique,revision,shape['texture'],shape.get('generation',''),shape.get('alpha_mode','opaque'),shape.get('blend_native_opacity',True),shape.get('color_mode',2),tint,emissive,unlit,tuple(shape['transform']['position'])if shape.get('terrain')else None)
+        key=(model,unique,revision,shape.get('topology','triangles'),shape['texture'],shape.get('generation',''),shape.get('alpha_mode','opaque'),shape.get('blend_native_opacity',True),shape.get('color_mode',2),tint,emissive,unlit,tuple(shape['transform']['position'])if shape.get('terrain')else None)
         if hasattr(self,'used_meshes'):
             self.used_meshes.add(key);self.used_textures.add(shape['texture'])
         if key in self.meshes:
@@ -186,7 +189,8 @@ class Assets:
         triangles=shape['triangle_count']
         vertices=bytes(count*12)if dynamic else self.r.read(struct.unpack_from('<I',header,0x1C)[0],count*12)
         normal_pointer=struct.unpack_from('<I',header,0x20)[0]
-        normals=self.r.read(normal_pointer,count*12)if normal_pointer and not dynamic else b''
+        lines=shape.get('topology')=='lines'
+        normals=self.r.read(normal_pointer,count*12)if normal_pointer and not dynamic and not lines else b''
         normal_source='native_dynamic_triangle_fallback'if dynamic else'native'if normals else'generated_missing_native'
         if normals and (not np.isfinite(np.frombuffer(normals,dtype='<f4')).all()or np.max(np.abs(np.frombuffer(normals,dtype='<f4')))>1e8):
             # Match the consumer's finite/bounded normal contract. Keep real
@@ -197,7 +201,7 @@ class Assets:
             normals=b'';normal_source='generated_invalid_native'
         uv_pointer=struct.unpack_from('<I',header,0x28)[0]
         uvs=immutable_uvs if dynamic else self.r.read(uv_pointer,count*8) if uv_pointer else bytes(count*8)
-        indices=immutable_indices if dynamic else self.r.read(struct.unpack_from('<I',header,0x3C)[0],triangles*6)
+        indices=immutable_indices if dynamic else topology_indices if topology_indices is not None else triangle_indices(self.r,shape,header)
         if color_ptr and shape.get('color_mode',2)!=0 and not(dynamic and dynamic.get('colors')):
             colors=np.frombuffer(self.r.read(color_ptr,count*4),dtype=np.uint8).reshape(-1,4)[:,[2,1,0,3]].astype(np.float32)
         else:colors=np.full((count,4),255.,dtype=np.float32)
@@ -206,13 +210,13 @@ class Assets:
             raise ValueError('Non-finite mesh buffer')
         if np.frombuffer(indices,dtype='<u2').max()>=count:
             raise ValueError('Triangle index exceeds vertex count')
-        payload=struct.pack('<4sII',b'UEM3'if normals else b'UEM2',count,triangles*3)+vertices+normals+uvs+colors+indices
+        payload=struct.pack('<4sII',b'UML2'if lines else b'UEM3'if normals else b'UEM2',count,triangles*3)+vertices+normals+uvs+colors+indices
         digest=hashlib.sha256(payload).hexdigest()
         target=self.out/'meshes'/f'{digest}.umesh'
         publish_asset(target,payload)
         result={'asset':digest,'file':'meshes/'+target.name,'texture':self.texture(shape['texture']),'alpha_mode':shape.get('alpha_mode','opaque'),'blend_native_opacity':shape.get('blend_native_opacity',True),
                 'source_texture':shape['texture'],'vertices':count,'triangles':triangles,'normal_source':normal_source,
-                'shading':dict(lit=not(unlit or shape.get('color_mode',2)==1),emissive=list(emissive),fog=True,sky=False)}
+                'shading':dict(lit=not(lines or unlit or shape.get('color_mode',2)==1),emissive=list(emissive),fog=True,sky=False)}
         if result['texture'] and shape.get('terrain') and count==25 and triangles==32 and not dynamic and shape.get('alpha_mode','opaque')=='opaque':
             tile=native_tile(np.frombuffer(vertices,dtype='<f4').reshape(-1,3),np.frombuffer(uvs,dtype='<f4').reshape(-1,2),shape['transform'])
             if tile is not None:result['terrain_tile']=tile
@@ -228,7 +232,7 @@ class Assets:
             self.used_meshes.add(key);self.used_textures.add(shape['texture'])
         if key in self.meshes:return self.meshes[key]
         points=bytes(vertices*12)
-        uvs=struct.pack('<8f',0,1,1,1,1,0,0,0)*count
+        uvs=struct.pack('<8f',0,0,1,0,1,1,0,1)*count
         colors=bytes([255])*vertices*4
         indices=np.asarray([[4*i+j for j in (0,1,2,0,2,3)]for i in range(count)],dtype='<u2').tobytes()
         payload=struct.pack('<4sII',b'UEM2',vertices,count*6)+points+uvs+colors+indices

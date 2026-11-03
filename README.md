@@ -43,7 +43,9 @@ Paths are otherwise discovered and saved in ignored `local/config.json`. No codi
 
 ## Play
 
-Load a disposable save or start a new character in **original Morrowind**, and keep that window focused. UE is a passive visual window; native menus/dialogue remain accessible in the original. Keyboard and mouse go to Morrowind exactly once. The default is separate windows, with original rendering available throughout.
+Load a disposable save or start a new character in **original Morrowind**, and keep that window focused. Keyboard and mouse go directly to Morrowind exactly once; UE stays passive. `Start-UEMW.cmd` retains the separate-window baseline. **`Start-UEMW-Unified.cmd`** places UE over the original play area and translates the original HUD, menus, maps, journal and dialogue geometry/textures over its scene. Both use the same packaged client.
+
+Unified presentation keeps the small GPU-only inventory portrait on the original UI surface through a bounded opening in the passive overlay. It does not capture the game window or rebuild UI logic. Loading exposes the original progress view until UE resources are ready; unsupported or stale UI falls back to the original. A latched fault needs an explicit relaunch. Native UI sampling is bounded at 20 Hz, with lower rates during resource changes; this is not pixel-perfect UI parity or a locked-60 guarantee. See [rendering evidence and limits](docs/PERFORMANCE.md).
 
 `Stop-UE-View.cmd` closes UE and its bridge while leaving the game open. Save/exit the original normally. `Stop-UEMW.cmd` force-stops the whole private session, discarding unsaved progress. Normal launches do not record video or screenshots.
 

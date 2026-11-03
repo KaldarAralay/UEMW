@@ -106,4 +106,4 @@ else{
 }
 Write-Output 'Private processes started. Use a disposable native save or new game in original Morrowind. The UE view appears when shaders and live geometry are ready.'
 if($TwoWindows){Write-Output 'Keep original Morrowind focused; its native UI stays visible beside UE. No recording is enabled.'}
-else{Write-Output 'Keep original Morrowind focused; UE covers its play area and uncovers native UI automatically. No recording is enabled.'}
+else{Write-Output 'Keep original Morrowind focused; UE presents the native HUD and menus over its scene. Native loading/failure fallback stays available. No recording is enabled.'}

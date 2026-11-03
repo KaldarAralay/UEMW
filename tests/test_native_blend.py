@@ -1,11 +1,28 @@
 import tempfile
 from pathlib import Path
 import unittest
-from native_blend import classify
+from native_blend import classify,alpha_test
 from game_assets import Assets
 
 
 class BlendTests(unittest.TestCase):
+    def test_alpha_comparison_is_independent_of_rgb_blending(self):
+        for function in range(8):
+            flags=self.flags(6,7)|0x200|(function<<10)
+            self.assertEqual(classify(flags)['mode'],'translucent')
+            self.assertEqual(alpha_test(flags,137),dict(version=1,function=function,reference=137))
+        self.assertIsNone(alpha_test(self.flags(0,0),255))
+        for flags,ref in ((0,-1),(0,256),(True,0),(0,False)):
+            with self.assertRaises(ValueError):alpha_test(flags,ref)
+    def test_alpha_reference_inherits_from_the_actual_property(self):
+        from scene_reader import SceneReader
+        class Memory:
+            def read(self,p,n):
+                return {0x10088:__import__('struct').pack('<2I',0x30000,0),0x20088:bytes(8),0x30014:bytes((0xed,0x12,0,0,137))}[p]
+        graph=SceneReader(Memory());graph.ancestry=lambda p:['NiAlphaProperty']
+        props=graph.render_properties(0x10000,(0,0,0,2))
+        self.assertEqual(props[1],0x12ed);self.assertEqual(props[-1],137)
+        self.assertEqual(graph.render_properties(0x20000,props),props)
     def flags(self,source,destination):return 1|(source<<1)|(destination<<5)
     def test_native_rgb_factor_pairs_select_distinct_cooked_policies(self):
         cases=[(6,7,'translucent',True),(6,0,'additive',True),(0,0,'additive',False),

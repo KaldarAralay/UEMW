@@ -11,7 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 PUBLIC_DIRS={'bridge','dev','docs','native','shaders','tests','tools','.github','ue'}
 PRIVATE_DIRS={'local','logs','third_party','.git','.venv','venv','.vs','.vscode','__pycache__','.pytest_cache'}
 GENERATED={'Binaries','Intermediate','Saved','DerivedDataCache'}
-FORBIDDEN={'.bsa','.esm','.esp','.ess','.nif','.dds','.umesh','.uskin','.uasset','.umap','.pak','.exe','.dll','.obj','.lib','.exp','.ilk','.pdb','.dmp','.utrace','.mkv','.mp4','.zip','.pth','.pt','.onnx','.safetensors'}
+FORBIDDEN={'.bsa','.esm','.esp','.ess','.nif','.dds','.umesh','.uskin','.uuv','.uasset','.umap','.pak','.exe','.dll','.obj','.lib','.exp','.ilk','.pdb','.dmp','.utrace','.mkv','.mp4','.zip','.pth','.pt','.onnx','.safetensors'}
 
 
 def source_files(root=ROOT):

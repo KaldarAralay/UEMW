@@ -22,7 +22,8 @@ def separate_desktop_rect(game,areas,preferred):
     return max(choices,key=lambda view:view[2]*view[3])if choices else None
 
 
-def decide(mode, *, game_foreground, minimized, ui_known, native_ui, source_live, renderer_live):
+def decide(mode, *, game_foreground, minimized, ui_known, native_ui, source_live, renderer_live,
+           ui_mirrored=False, ui_transition=False, native_loading=False):
     if mode not in ('overlay', 'side-by-side'):
         return False, 'invalid_mode'
     if mode == 'side-by-side':
@@ -33,12 +34,20 @@ def decide(mode, *, game_foreground, minimized, ui_known, native_ui, source_live
         return False, 'other_foreground'
     if not ui_known:
         return False, 'ui_unknown'
-    if native_ui:
+    if native_loading:
+        return False, 'native_loading'
+    if native_ui and not ui_mirrored and not ui_transition:
         return False, 'native_ui'
     if not source_live:
         return False, 'source_unavailable'
     if not renderer_live:
         return False, 'renderer_unavailable'
+    if not ui_mirrored and not ui_transition:
+        return False, 'ui_unavailable'
+    if ui_transition:
+        return True, 'native_ui_resource_transition'
+    if native_ui:
+        return True, 'ue_native_ui'
     return True, 'ue_play_view'
 
 def window_style(previous,separate):
@@ -58,7 +67,7 @@ class OverlayLatch:
         if generation!=self.generation:
             self.generation=generation;self.shown=False;self.fault=False
         if mode!='overlay':return visible,reason
-        if self.shown and reason in ('source_unavailable','renderer_unavailable'):
+        if self.shown and reason in ('source_unavailable','renderer_unavailable','ui_unavailable','native_ui'):
             self.fault=True
         if self.fault:return False,'fallback_latched_restart_overlay'
         if visible:self.shown=True

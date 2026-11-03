@@ -19,12 +19,12 @@ bool Environment(FMetadataCursor& C,FMWEnvironmentState& Out) {
     Out.Pixels[2]=FVector4f(G[7],G[6],G[8],G[14]);Out.Pixels[3]=FVector4f(G[9],G[10],G[11],(Flags&1)?1:0);
     Out.Pixels[4]=FVector4f(G[12],G[13],Count,(Flags&4)?1:0);Out.Pixels[5]=FVector4f(W[2],W[3],W[4],W[0]);
     Out.Pixels[6]=FVector4f(W[6],W[5],W[7],W[1]);Out.Pixels[7]=FVector4f(G[15],(Flags&2)?1:0,Current,Next);
-    TSet<FString> Ids;Out.LightIds.Empty();
+    TSet<FString> Ids;Out.LightIds.Empty();Out.LightNominalPeaks.Empty();
     for(uint32 I=0;I<Count;++I) {
         FString Id;uint8 Kind=0,Enabled=0;float N[19];
         if(!C.Key(Id,64) || Ids.Contains(Id) || !C.Read(Kind) || Kind<1 || Kind>3 || !C.Read(Enabled) || Enabled>1 || !C.Numbers(N,1) || !C.Numbers(N+1,1,4294967296.f) || !C.Numbers(N+2,17) ||
             FMath::Abs(N[0])>32 || N[1]<0 || N[2]<0 || N[2]>180 || N[3]<0 || !Bounded(N+7,6,32) || N[16]<0 || N[17]<0 || N[18]<0)return false;
-        Ids.Add(Id);Out.LightIds.Add(Id);const int32 Row=(I+1)*8;const float Scale=Enabled?N[0]:0;
+        Ids.Add(Id);Out.LightIds.Add(Id);Out.LightNominalPeaks.Add(FMath::Max(0.f,FMath::Max3(N[10],N[11],N[12]))*FMath::Max(1.f,N[0]));const int32 Row=(I+1)*8;const float Scale=Enabled?N[0]:0;
         Out.Pixels[Row]=FVector4f(N[5],N[4],N[6],Kind);
         Out.Pixels[Row+1]=FVector4f(N[7]*Scale,N[8]*Scale,N[9]*Scale,Enabled);
         Out.Pixels[Row+2]=FVector4f(N[10]*Scale,N[11]*Scale,N[12]*Scale,N[1]);

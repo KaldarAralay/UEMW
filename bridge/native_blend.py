@@ -3,6 +3,12 @@
 Ni factors: ONE=0, ZERO=1, SRC_COLOR=2, DEST_COLOR=4, SRC_ALPHA=6,
 INV_SRC_ALPHA=7. Other pairs remain explicit reported approximations.
 """
+
+def alpha_test(flags,reference=0):
+    if type(flags)is not int or not 0<=flags<=65535 or type(reference)is not int or not 0<=reference<=255:raise ValueError('Invalid native alpha test')
+    if not flags&0x200:return None
+    return dict(version=1,function=(flags>>10)&7,reference=reference)
+
 def classify(flags):
     if type(flags)is not int or not 0<=flags<=65535:raise ValueError('Invalid native alpha flags')
     if not flags&1:return dict(mode='masked'if flags&0x200 else'opaque',native_opacity=True,fallback=None)

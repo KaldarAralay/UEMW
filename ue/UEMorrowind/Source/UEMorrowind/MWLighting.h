@@ -20,5 +20,5 @@ float MWNativeAttenuation(const FVector4f& Curve,float Distance);
 float MWNativeLightRadius(float NativeRadius,const FVector4f& Curve,float Peak);
 FMWLightSettings MWNativeLightSettings(const FVector4f* Row,bool Fidelity=false,float RadiusLimit=4096);
 float MWNativeSunAngle(int32 Current,int32 Next,float Transition);
-struct FMWShadowCandidate {FString Id;double Distance=0;};
+struct FMWShadowCandidate {FString Id;double Distance=0,Importance=1;};
 TArray<FString> MWChooseNativeShadows(const TArray<FMWShadowCandidate>& Candidates,const TArray<FString>& Previous,bool Stable,int32 Budget=2);

@@ -17,6 +17,7 @@ from live_probe import ROOT, Reader, K
 from native_ui import inspect_ui
 from presentation_policy import decide,OverlayLatch,separate_desktop_rect,preferred_size,window_style
 from local_files import read_json
+from ui_presentation import ready as ui_ready, regions as ui_regions, Transition, LoadingTransition
 
 U = C.WinDLL('user32', use_last_error=True)
 U.GetForegroundWindow.restype = W.HWND
@@ -45,6 +46,37 @@ class MonitorInfo(C.Structure):
 U.GetMonitorInfoW.argtypes=[W.HMONITOR,C.POINTER(MonitorInfo)]
 U.GetMonitorInfoW.restype=W.BOOL
 U.GetMonitorInfoW.argtypes = [W.HMONITOR, C.POINTER(MonitorInfo)]
+
+G = C.WinDLL('gdi32', use_last_error=True)
+G.CreateRectRgn.argtypes=[C.c_int,C.c_int,C.c_int,C.c_int]
+G.CreateRectRgn.restype=W.HANDLE
+G.CombineRgn.argtypes=[W.HANDLE,W.HANDLE,W.HANDLE,C.c_int]
+G.DeleteObject.argtypes=[W.HANDLE]
+U.SetWindowRgn.argtypes=[W.HWND,W.HANDLE,W.BOOL]
+
+def set_ui_regions(window,destination,regions):
+    """Expose only native GPU UI targets under this project's passive HWND.
+
+    No original-window capture, style change, or input forwarding. Windows owns
+    a region after successful SetWindowRgn; temporaries always remain ours.
+    """
+    if not regions:
+        if not U.SetWindowRgn(window,None,True):raise C.WinError(C.get_last_error())
+        return
+    _,_,width,height=destination
+    region=G.CreateRectRgn(0,0,width,height)
+    if not region:raise C.WinError(C.get_last_error())
+    try:
+        for bounds in regions:
+            part=G.CreateRectRgn(*bounds)
+            if not part:raise C.WinError(C.get_last_error())
+            try:
+                if not G.CombineRgn(region,region,part,4):raise C.WinError(C.get_last_error()) # RGN_DIFF
+            finally:G.DeleteObject(part)
+        if not U.SetWindowRgn(window,region,True):raise C.WinError(C.get_last_error())
+        region=None
+    finally:
+        if region:G.DeleteObject(region)
 
 MODE_PATH = ROOT/'local/bridge/presentation-mode.json'
 STATE_PATH = ROOT/'local/bridge/presentation.json'
@@ -148,6 +180,15 @@ def frame_ready(source, render, game_pid, renderer_pid, now):
     except (KeyError, TypeError, ValueError):
         return False, False
 
+def poll_json(path,previous,errors,key):
+    try:return read_json(path)
+    except BlockingIOError as failure:
+        # A busy seqlock is not a source disconnect. Retain its exact last
+        # timestamp; ordinary expiry still uncovers a stopped/stale source.
+        errors[key]=str(failure);return previous
+    except (OSError,ValueError)as failure:
+        errors[key]=str(failure);return {}
+
 def run(args):
     try:U.SetProcessDpiAwarenessContext(C.c_void_p(-4))
     except AttributeError:U.SetProcessDPIAware()
@@ -160,7 +201,7 @@ def run(args):
         if lease: K.CloseHandle(lease)
         raise RuntimeError('A presentation controller already exists for this workspace')
     window = None; last_mode = None; last_apply = None; last_log = 0; last_event = 0; last_reason = None
-    latch=OverlayLatch();generation=None;preferred=(768,576)
+    latch=OverlayLatch();transition=Transition();load_transition=LoadingTransition();generation=None;preferred=(768,576);last_regions=None
     last_files = 0; source = {}; render = {}; mode = 'invalid'; began = time.monotonic()
     log = (ROOT/'logs/presentation.jsonl').open('a', encoding='utf-8')
     try:
@@ -186,10 +227,8 @@ def run(args):
                         generation=config.get('generation',mode)
                         preferred=preferred_size(config)
                     except (OSError, ValueError, KeyError, TypeError): mode = 'invalid'
-                    try: source = read_json(ROOT/'local/bridge/latest.json')
-                    except (OSError, ValueError) as failure: source = {};file_errors['source']=str(failure)
-                    try: render = read_json(ROOT/'local/bridge/render-state.json')
-                    except (OSError, ValueError) as failure: render = {};file_errors['renderer']=str(failure)
+                    source=poll_json(ROOT/'local/bridge/latest.json',source,file_errors,'source')
+                    render=poll_json(ROOT/'local/bridge/render-state.json',render,file_errors,'renderer')
                     last_files = tick
                 expected='side-by-side'if args.separate else'overlay'
                 if mode!=expected:mode='invalid'
@@ -208,9 +247,14 @@ def run(args):
                 # to the beginning of this poll, causing visible flicker.
                 now = time.time()
                 source_live, render_live = frame_ready(source, render, args.pid, args.renderer, now)
+                mirrored=error is None and ui_ready(render,source,ui,now)
+                loading=load_transition.active('MenuLoading'in ui.get('active_menus',[]),source_live and render_live,now)
+                menu_change=render.get('ui_menus')!=ui.get('active_menus')
+                holding=transition.hold((generation,source.get('session'),tuple(ui.get('active_menus',[]))),mirrored,now,.75 if menu_change else .15) if latch.shown and source_live and render_live and error is None and not loading else False
                 visible, reason = decide(mode, game_foreground=valid_game and foreground == game,
                     minimized=not valid_game or bool(U.IsIconic(game)), ui_known=error is None,
-                    native_ui=ui.get('native_ui', True), source_live=source_live, renderer_live=render_live)
+                    native_ui=ui.get('native_ui', True), source_live=source_live, renderer_live=render_live,
+                    ui_mirrored=mirrored,ui_transition=holding,native_loading=loading)
                 visible,reason=latch.apply(generation,mode,visible,reason)
                 # Reset transparency cache on all exceptional paths below.
                 if mode != last_mode:
@@ -224,6 +268,10 @@ def run(args):
                     last_mode = mode; last_apply = None
                 destination = target_rect(game, mode,preferred) if valid_game and mode in ('overlay', 'side-by-side') else None
                 if destination is None: visible = False;reason='no_free_view_space'
+                regions=ui_regions(render,destination,ui) if mode=='overlay' and visible and mirrored and destination else ()
+                region_key=(tuple(destination or []),regions)
+                if region_key!=last_regions:
+                    set_ui_regions(window,destination,regions);last_regions=region_key
                 if opacity(window) != (255 if visible else 0): last_apply = None
                 apply = (mode, visible, tuple(destination or []))
                 if apply != last_apply:
@@ -244,6 +292,7 @@ def run(args):
                         'alpha': alpha, 'rect': rect(window), 'foreground': int(foreground or 0),
                         'source_live': bool(source_live), 'renderer_live': bool(render_live),
                         'ui': ui, 'error': error, 'input_events_sent': 0,
+                        'ui_mirrored':mirrored,'native_ui_regions':regions,
                         'file_errors': file_errors,
                         'source_state': {k:source.get(k)for k in ('status','session','sequence','sample_unix_ns','scene_epoch','pid')},
                         'renderer_state': render,
@@ -264,6 +313,7 @@ def run(args):
         # A normal controller exit leaves the original game uncovered. Killing
         # this process is also handled by the UE heartbeat watchdog.
         if window and U.IsWindow(window) and owner(window) == args.renderer:
+            U.SetWindowRgn(window,None,True)
             set_visible(window,False)
             U.SetWindowPos(window, W.HWND(-2), 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
         log.close(); K.CloseHandle(lease); K.CloseHandle(renderer); reader.close()

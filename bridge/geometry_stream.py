@@ -27,6 +27,9 @@ from native_environment import capture as capture_environment,roles as environme
 from native_materials import discover as discover_flip,capture as capture_materials,FlipCapture
 from material_values import discover as discover_material,capture as capture_values
 from native_attributes import discover as discover_attributes,capture as capture_attributes,AttributeCapture
+from captured_states import CapturedStates
+from native_texture_stages import read as read_stages,convert as convert_stages
+from native_texture_effects import discover as discover_texture_effect,convert as convert_texture_effect,capture as capture_texture_effects,EffectCapture
 
 MAX_PACKET_BYTES=1024*1024
 
@@ -57,6 +60,7 @@ class Geometry:
         self.skin_sources={}
         self.cell=None
         self.catalog='';self.catalog_digest=''
+        self.binding_index=None
         self.signature=None
         self.last_refresh=0
         self.last_world_refresh=0
@@ -64,7 +68,6 @@ class Geometry:
         self.scene_key=None
         self.epoch=''
         self.catalog_history=deque()
-        self.transform_cache={}
         self.stream_cells=[]
         self.pose_requests=None
         self.membership_hash=''
@@ -74,6 +77,7 @@ class Geometry:
         self.scope=None;self.cell_generations={};self.generation_counter=0
         self.extra_generations={};self.effect_signature=();self.weapon_state=None
         self.material_flips=FlipCapture({})
+        self.texture_effects=EffectCapture({})
         self.material_values={}
         self.native_attributes={};self.attribute_captures={}
         self.node_identities={};self.native_switches={};self.light_owners={};self.continuity_views={};self.topology_dirty=False
@@ -81,15 +85,18 @@ class Geometry:
         self.prepared_definitions={};self.definitions_reused=0
 
     def close(self):
+        self._particle_metadata=None
+        self._palette_plan=None
         if self.executor:self.executor.shutdown(wait=True,cancel_futures=True)
         self.assets.close()
 
     def invalidate_scene(self):
+        self._particle_metadata=None
+        self._palette_plan=None
         self.shapes=[];self.skins={};self.skin_sources={};self.cell=None;self.signature=None
         self.light_pointers=[]
-        self.scene_key=None;self.epoch='';self.catalog='';self.catalog_digest='';self.last_refresh=0
+        self.scene_key=None;self.epoch='';self.catalog='';self.catalog_digest='';self.binding_index=None;self.last_refresh=0
         self.inventory={};self.assets.reset_scene()
-        self.transform_cache={}
         self.stream_cells=[]
         self.pose_requests=None
         self.membership_hash=''
@@ -99,6 +106,7 @@ class Geometry:
         self.cell_root_owners={}
         self.extra_generations={};self.effect_signature=();self.weapon_state=None
         self.material_flips=FlipCapture({})
+        self.texture_effects=EffectCapture({})
         self.material_values={}
         self.native_attributes={};self.attribute_captures={}
         self.node_identities={};self.native_switches={};self.light_owners={};self.continuity_views={};self.topology_dirty=False
@@ -162,7 +170,7 @@ class Geometry:
             shape['generation']=gen;shape['render_id']=gen+':'+shape['id'] if gen else shape['id']
         self.assets.begin_refresh()
         definitions={}
-        flips={};properties={};values={};value_properties={};attributes={}
+        flips={};properties={};values={};value_properties={};attributes={};texture_effects={}
         reused=[s for s in scene['shapes']if scene.get('world_reused')and s.get('prepared')and s.get('cell_key')in scene.get('reused_roles',())]
         bases={(s['prepared'][0]['file'],s['prepared'][0]['texture'],s['prepared'][0].get('alpha_mode','opaque'))for s in reused}
         if bases:
@@ -177,7 +185,9 @@ class Geometry:
         for shape in scene['shapes']:
             if cancellation is not None and cancellation.is_set():raise SceneReadChanged('Scene preparation cancelled during asset conversion')
             if scene.get('world_reused')and shape.get('prepared')and shape.get('cell_key')in scene.get('reused_roles',()):
-                definition,flip,material,mutable=shape['prepared'];definitions[shape['asset']]=definition
+                definition,flip,material,mutable,*stage_extra=shape['prepared'];definitions[shape['asset']]=definition
+                if stage_extra:flips.update(stage_extra[0])
+                if len(stage_extra)>1 and stage_extra[1]:texture_effects[stage_extra[1]['id']]=stage_extra[1]
                 if flip:flips[flip['id']]=flip
                 if material:values[material['id']]=material
                 if mutable:attributes[mutable['shape']]=mutable
@@ -186,10 +196,12 @@ class Geometry:
             # Only rigid world definitions qualify. Native poses, mutable sky,
             # water, particles, skins and first-person animation keep live lanes.
             eligible=recorder and not shape.get('particles')and shape.get('skin')=='0x0'and shape.get('controller','0x0')=='0x0'and not shape.get('cell_key','').startswith(('aux:','view:'))
-            descriptor=tuple(shape.get(k)for k in('model','skin','controller','texture','texture_property','material','color_mode','lighting_mode','alpha_mode','blend_native_opacity','vertex_count','triangle_count','generation','cell_key','terrain','native_lights','native_sun'))+(tuple(shape['transform']['position'])if shape.get('terrain')else None,)
+            descriptor=tuple(shape.get(k)for k in('model','skin','controller','texture','texture_property','material','color_mode','lighting_mode','alpha_mode','blend_native_opacity','alpha_flags','alpha_ref','vertex_count','triangle_count','generation','cell_key','terrain','native_lights','native_sun','native_environment_effect'))+(tuple(shape['transform']['position'])if shape.get('terrain')else None,)
             cached=previous_definitions.get(shape['render_id'])if eligible else None
             if cached and cached[0]==descriptor and recorder.matches(cached[3]):
-                _,tag,prepared,dependencies=cached;definition,flip,material,mutable=prepared
+                _,tag,prepared,dependencies=cached;definition,flip,material,mutable,*stage_extra=prepared
+                if stage_extra:flips.update(stage_extra[0])
+                if len(stage_extra)>1 and stage_extra[1]:texture_effects[stage_extra[1]['id']]=stage_extra[1];shape['texture_effect']=stage_extra[1]['id']
                 definitions[tag]=definition;shape['asset']=tag;shape['prepared']=prepared
                 if flip:flips[flip['id']]=flip;self.assets.used_textures.update(flip['names'])
                 if material:values[material['id']]=material
@@ -208,6 +220,7 @@ class Geometry:
             # dependencies, even when another shape uses the same property.
             if eligible or group not in properties:properties[group]=discover_flip(self.r,prop,shape['generation'])
             flip=properties[group]
+            stages=read_stages(self.r,prop,shape['generation'])
             source={**shape,'texture':flip['names'][0]}if flip else dict(shape)
             material_key=(shape.get('material'),shape['generation'],shape.get('cell_key',''),shape.get('color_mode',2),shape['model'])
             if eligible or material_key not in value_properties:value_properties[material_key]=discover_material(self.r,shape)
@@ -218,6 +231,14 @@ class Geometry:
                 attributes[mutable['shape']]=mutable
                 source['dynamic_attributes']=dict(positions=True,colors=mutable['colors'],uvs=mutable['uvs'],morph=mutable['morph'])
             definition=self.assets.mesh(source)
+            converted_stages,stage_flips=convert_stages(self.assets,source,stages)
+            if converted_stages:definition={**definition,'texture_stages':converted_stages}
+            texture_effect=None
+            if shape.get('native_environment_effect'):
+                texture_effect=discover_texture_effect(self.r,self.r.u32(int(shape['id'],16)+0x94),shape['generation'])
+                if not texture_effect or hex(texture_effect['pointer'])!=shape['native_environment_effect']:raise SceneReadChanged('Native environment membership changed during preparation')
+                definition={**definition,'environment_map':convert_texture_effect(self.assets,texture_effect)}
+                texture_effects[texture_effect['id']]=texture_effect;shape['texture_effect']=texture_effect['id']
             if material:definition={**definition,'material_state':material['id']}
             if mutable:definition={**definition,'dynamic_attributes':source['dynamic_attributes']}
             if flip:
@@ -237,17 +258,22 @@ class Geometry:
             if 'native_lights'in shape:shading.update(native_lights=sorted(set(shape['native_lights'])),native_sun=shape['native_sun'])
             if source_roles.get(int(shape['id'],16))=='atmosphere':shading['sky']=True
             definition={**definition,'shading':shading}
+            from native_blend import alpha_test
+            test=alpha_test(shape.get('alpha_flags',0),shape.get('alpha_ref',0))
+            if test:definition={**definition,'alpha_test':test}
             if shape['skin']!='0x0':
                 source_key=(shape['id'],shape['model'],shape['skin'],shape['generation'])
                 skin=self.skin_sources.get(source_key)
                 if skin is None:skin=Skin(self.r,shape);self.skin_sources[source_key]=skin
                 shape['skin_source']=skin
                 if not mutable:definition={**definition,'skin_file':skin.export_weights(self.assets.out),'skin_bones':len(skin.bones)+1}
-            digest=hashlib.sha256((definition['asset']+'|'+definition['texture']+'|'+definition.get('alpha_mode','opaque')+'|'+str(definition.get('blend_native_opacity',True))+'|'+definition.get('skin_file','')+'|'+json.dumps(shading,sort_keys=True,separators=(',',':'))+'|'+json.dumps(definition.get('texture_animation'),sort_keys=True,separators=(',',':'))+'|'+definition.get('material_state','')+'|'+json.dumps(definition.get('dynamic_attributes'),sort_keys=True,separators=(',',':'))+'|'+json.dumps(definition.get('terrain_tile'),separators=(',',':'))).encode('ascii')).digest()
+            digest=hashlib.sha256((definition['asset']+'|'+definition['texture']+'|'+definition.get('alpha_mode','opaque')+'|'+str(definition.get('blend_native_opacity',True))+'|'+json.dumps(definition.get('alpha_test'),sort_keys=True,separators=(',',':'))+'|'+definition.get('skin_file','')+'|'+json.dumps(shading,sort_keys=True,separators=(',',':'))+'|'+json.dumps(definition.get('texture_animation'),sort_keys=True,separators=(',',':'))+'|'+definition.get('material_state','')+'|'+json.dumps(definition.get('dynamic_attributes'),sort_keys=True,separators=(',',':'))+'|'+json.dumps(definition.get('terrain_tile'),separators=(',',':'))+'|'+json.dumps(converted_stages,sort_keys=True,separators=(',',':'))).encode('ascii')).digest()
+            if texture_effect:digest=hashlib.sha256(digest+json.dumps(definition['environment_map'],sort_keys=True,separators=(',',':')).encode('ascii')).digest()
             tag=base64.b32encode(digest).rstrip(b'=').decode('ascii').lower()
             definitions[tag]=definition
             shape['asset']=tag
-            shape['prepared']=(definition,flip,material,mutable)
+            flips.update(stage_flips)
+            shape['prepared']=(definition,flip,material,mutable,stage_flips,texture_effect)
             if eligible:
                 dependencies=recorder.end_definition()
                 size=sum(n for _,n,_ in dependencies)if dependencies else 0
@@ -255,6 +281,12 @@ class Geometry:
                     next_definitions[shape['render_id']]=(descriptor,tag,shape['prepared'],dependencies);definition_bytes+=size
         self.prepared_definitions=next_definitions
         if bases:self.assets.used_meshes.update(k for k,v in self.assets.meshes.items()if(v['file'],v['texture'],v.get('alpha_mode','opaque'))in bases)
+        for shape in scene['shapes']:
+            prepared=shape['prepared']
+            for row in prepared[0].get('texture_stages',{}).get('maps',()):self.assets.used_textures.add(row['source_texture'])
+            if len(prepared)>4:
+                for flip in prepared[4].values():self.assets.used_textures.update(flip['names'])
+            if len(prepared)>5 and prepared[5]:self.assets.used_textures.update(prepared[5]['names'])
         self.assets.trim_cache()
         if cancellation is not None and cancellation.is_set():raise SceneReadChanged('Scene preparation cancelled before catalog conversion')
         signature=(key,tuple((s['render_id'],s['model'],s['skin'],s['asset'],s.get('cell_key')if cells else None) for s in scene['shapes']))
@@ -264,21 +296,26 @@ class Geometry:
                      'cells':[{k:c[k]for k in ('key','grid')}for c in cells],
                      'bindings':[dict(id=s['render_id'],source_id=s['id'],asset=s['asset'],**({'effect_target':s['effect_target']}if s.get('effect_target')else{}),**({'cell_key':s['cell_key']}if s.get('cell_key')in generations else {}),**({'layer':s['cell_key'].split(':',1)[1]}if s.get('cell_key')in extra_generations else {}))for s in scene['shapes']],
                      'unsupported':{'particles':sum(count for kind,count in scene['counts'].items()if 'Particles'in kind)-scene['counts'].get('rendered_particle_systems',0),
-                                    'particle_limitations':'billboard quads; quaternion rotation, animated atlas UVs and blend factors outside the documented common RGB policies are deferred',
+                                    'particle_limitations':'verified vanilla camera-facing quads/fixed UVs; mesh-particle subclasses, sorter overrides and arbitrary mod blend factors remain unverified',
                                     'blend_approximations':[dict(node=s['id'],**s['blend_fallback'])for s in scene['shapes']if s.get('blend_fallback')],
-                                    'alpha_test_limitations':'masked cutoff is approximate; combined alpha testing/blending is not yet mirrored',
-                                    'unhandled_geometry_types':{kind:count for kind,count in scene['counts'].items()if kind in ('NiTriStrips','NiLines')},
+                                    'alpha_test_limitations':'native alpha function/reference is separate from common RGB blending; arbitrary mod blend combinations and pixel parity remain unverified',
+                                    'unsupported_uv_animations':[dict(node=s['id'],uv_set=s['unsupported_uv_animation'])for s in scene['shapes']if 'unsupported_uv_animation'in s],
+                                    'unhandled_geometry_types':{},
+                                    'supported_geometry_types':['NiTriShape','NiTriStrips','NiLines','NiParticles'],
                                     'traversal_errors':scene['errors'],'missing_textures':self.assets.missing,
                                     'invalid_native_normals':[dict(asset=tag,source_texture=value['source_texture'])for tag,value in definitions.items()if value.get('normal_source')=='generated_invalid_native'],
                                     'lighting':'native resolved sun/ambient/fog and bounded local lights; per-object light selection/specular/shadows are approximate'}}
             catalog_bytes=json.dumps(catalog,separators=(',',':')).encode('utf-8')
             (self.assets.out/filename).write_bytes(catalog_bytes)
             self.catalog_digest=hashlib.md5(catalog_bytes).hexdigest()
+            from binding_index import publish as publish_bindings
+            self.binding_index=publish_bindings(self.assets.out,filename,catalog,self.catalog_digest)
             self.catalog=filename
             self.signature=signature
             self.catalog_history.append(filename)
             while len(self.catalog_history)>8:
-                (self.assets.out/self.catalog_history.popleft()).unlink(missing_ok=True)
+                retired=self.catalog_history.popleft();(self.assets.out/retired).unlink(missing_ok=True)
+                (self.assets.out/('bindings-'+retired[8:-5]+'.bin')).unlink(missing_ok=True)
         valid=set()
         for shape in scene['shapes']:
             if shape['skin']!='0x0':
@@ -305,6 +342,7 @@ class Geometry:
         self.native_switches=scene.get('switches',{});self.actor_owners=scene.get('actor_owners',{});self.topology_dirty=False;self.continuity_views={}
         self.cell_root_owners=scene.get('cell_root_owners',{})
         self.material_flips=FlipCapture(flips)
+        self.texture_effects=EffectCapture(texture_effects)
         self.material_values=values
         self.native_attributes=attributes
         self.attribute_captures={}
@@ -334,7 +372,7 @@ class Geometry:
         self.water_pointers={int(s['id'],16)for s in self.shapes if s.get('cell_key')in('aux:water','aux:ripple')}
         self.water_visibility_roots={int(a['root'],16)for a in aux if a['layer']in('water','ripple')}
         self.player_pointers={int(s['id'],16)for s in self.shapes if s.get('cell_key')=='aux:player'and not s.get('effect_target')}
-        self.pose_layout=PoseLayout(self.records,self.view_pointers,read_plan=self.pose_requests,switches=switches,water_pointers=self.water_pointers,node_identities=self.node_identities,player_pointers=self.player_pointers,water_visibility_roots=self.water_visibility_roots,actor_owners=self.actor_owners,native_light_states={int(s['id'],16):s['native_light_state']for s in self.shapes if'native_light_state'in s},shadow_casters=self.shadow_caster_pointers,shadow_distance=self.shadow_distance,near_pass_camera=bool(int(base.get('first_person_camera_ptr','0x0'),16)),cell_root_owners=self.cell_root_owners)
+        self.pose_layout=PoseLayout(self.records,self.view_pointers,read_plan=self.pose_requests,switches=switches,water_pointers=self.water_pointers,node_identities=self.node_identities,player_pointers=self.player_pointers,water_visibility_roots=self.water_visibility_roots,actor_owners=self.actor_owners,native_light_states={int(s['id'],16):s['native_light_state']for s in self.shapes if'native_light_state'in s},shadow_casters=self.shadow_caster_pointers,shadow_distance=self.shadow_distance,near_pass_camera=bool(int(base.get('first_person_camera_ptr','0x0'),16)),cell_root_owners=self.cell_root_owners,reflection_excluded={int(s['id'],16)for s in self.shapes if s.get('cell_key')=='aux:weather'})
         self.cell_definitions=[]
         for c in cells:
             members=[s for s in self.shapes if s['cell_key']==c['key']]
@@ -342,7 +380,6 @@ class Geometry:
                 instances=len(members),terrain_instances=sum(bool(s.get('terrain'))for s in members),
                 generation=generations[c['key']][1],membership_md5=hashlib.md5('|'.join(sorted(s['render_id']+':'+s['asset']for s in members)).encode('ascii')).hexdigest()))
         current_ids={int(s['id'],16) for s in self.shapes}
-        self.transform_cache={ptr:v for ptr,v in self.transform_cache.items() if ptr in current_ids}
         self.cell=scene['cell_ptr']
         self.stream_cells=cells
         self.inventory={k:v for k,v in scene.items() if k not in ('shapes','errors')}
@@ -380,6 +417,8 @@ class Geometry:
             pointers={r[0]for r in view.records};properties={int(s.get('texture_property','0x0'),16)for s in view.shapes}
             materials={int(s.get('material','0x0'),16)for s in view.shapes}
             view.material_flips=self.material_flips.subset(properties)
+            groups={s.get('texture_effect')for s in view.shapes}
+            view.texture_effects=EffectCapture({k:v for k,v in getattr(self,'texture_effects',EffectCapture({})).items.items()if k in groups})
             view.material_values={k:v for k,v in self.material_values.items()if v['property']in materials}
             view.native_attributes={p:v for p,v in self.native_attributes.items()if p in pointers};view.attribute_captures={}
             view.skins={k:v for k,v in self.skins.items()if int(k[0],16)in pointers}
@@ -400,7 +439,7 @@ class Geometry:
                     for address,pointer in checks:requests[address]=max(4,requests.get(address,0))
             view.pose_requests=ReadPlan(sorted(requests.items()));view.view_pointers=self.view_pointers&pointers;view.water_pointers=self.water_pointers&pointers
             view.player_pointers=getattr(self,'player_pointers',set())&pointers
-            view.pose_layout=PoseLayout(view.records,view.view_pointers,read_plan=view.pose_requests,switches=switches,water_pointers=view.water_pointers,node_identities=self.node_identities,player_pointers=view.player_pointers,water_visibility_roots=getattr(self,'water_visibility_roots',()),actor_owners=getattr(self,'actor_owners',{}),native_light_states=getattr(getattr(self,'pose_layout',None),'native_light_states',{}),shadow_casters=getattr(self,'shadow_caster_pointers',set())&pointers,shadow_distance=getattr(self,'shadow_distance',0),near_pass_camera=getattr(getattr(self,'pose_layout',None),'near_pass_camera',False),cell_root_owners=getattr(self,'cell_root_owners',{}))
+            view.pose_layout=PoseLayout(view.records,view.view_pointers,read_plan=view.pose_requests,switches=switches,water_pointers=view.water_pointers,node_identities=self.node_identities,player_pointers=view.player_pointers,water_visibility_roots=getattr(self,'water_visibility_roots',()),actor_owners=getattr(self,'actor_owners',{}),native_light_states=getattr(getattr(self,'pose_layout',None),'native_light_states',{}),shadow_casters=getattr(self,'shadow_caster_pointers',set())&pointers,shadow_distance=getattr(self,'shadow_distance',0),near_pass_camera=getattr(getattr(self,'pose_layout',None),'near_pass_camera',False),cell_root_owners=getattr(self,'cell_root_owners',{}),reflection_excluded={int(s['id'],16)for s in view.shapes if s.get('cell_key')=='aux:weather'})
             view.continuity_indices=selected
             if len(self.continuity_views)>=8:self.continuity_views.clear()
             self.continuity_views[key]=view
@@ -408,8 +447,10 @@ class Geometry:
         view.continuity_excluded=frozenset(excluded)
         packet=view.snapshot(base,prepared=True)
         if view.topology_dirty:self.topology_dirty=True
-        states=[(False,)]*len(self.records)
-        for i,state in zip(view.continuity_indices,packet['instance_states']):states[i]=state
+        if isinstance(packet['instance_states'],CapturedStates):states=packet['instance_states'].remap(len(self.records),view.continuity_indices)
+        else:
+            states=[(False,)]*len(self.records)
+            for i,state in zip(view.continuity_indices,packet['instance_states']):states[i]=state
         packet['instance_states']=states;packet['geometry_stats']['instances']=len(states)
         packet['geometry_stats']['masked_layers']=list(key)
         return packet
@@ -440,6 +481,14 @@ class Geometry:
         if self.stream_cells:self.cell=base['cell_ptr']
         if self.cell!=base['cell_ptr']:
             raise RuntimeError('Geometry/current cell mismatch')
+
+    def particle_metadata(self):
+        """Cache immutable descriptors only, tied to this exact binding list."""
+        cached=getattr(self,'_particle_metadata',None)
+        if cached is None or cached[0]is not self.shapes:
+            items=tuple(s for s in self.shapes if s.get('particles'))
+            cached=(self.shapes,items,frozenset(int(s['id'],16)for s in items));self._particle_metadata=cached
+        return cached[1],cached[2]
 
     def capture_pose(self,base):
         """Read each shared node once, before any deformation or JSON work.
@@ -472,11 +521,19 @@ class Geometry:
                 raise SceneReadChanged('Native node retired during pose capture')from error
             nodes_ms=(time.perf_counter()-nodes_started)*1000
             pose_batch=getattr(self.r,'last_batch_stats',{}).copy()
+            nodes_end=self.r.u32(int(anchor['world'],16)+0x24)
+            nodes_elapsed=(time.perf_counter()-started)*1000
             view_metrics={}
             # The independent native camera process now owns the compact arms
             # capture. Do not recopy the entire world buffer for 79 near nodes.
             classify_started=time.perf_counter()
-            try:raw=PoseFrame(raw,self.pose_layout,anchor.get('camera',{}),anchor.get('first_person_active',True),all(item.get('visible',True)for item in anchor.get('aux_roots',[])if item['layer']in('water','ripple')),anchor.get('first_person_items_active',True))
+            water_visible=all(item.get('visible',True)for item in anchor.get('aux_roots',[])if item['layer']in('water','ripple'))
+            reflection_plane=None
+            if water_visible and getattr(self,'water_pointers',()):
+                cell=int(anchor['cell_ptr'],16);flags=self.r.u32(cell+0x18)
+                outside=not flags&1 or bool(flags&0x80)
+                if outside or flags&2:reflection_plane=struct.unpack('<f',self.r.read(cell+0x90,4))[0]if not outside else 0.
+            try:raw=PoseFrame(raw,self.pose_layout,anchor.get('camera',{}),anchor.get('first_person_active',True),water_visible,anchor.get('first_person_items_active',True),reflection_plane=reflection_plane)
             except SceneReadChanged:
                 self.last_refresh=0;raise
             if raw.invalid_count or raw.light_membership_changed:self.topology_dirty=True;self.last_refresh=0
@@ -484,7 +541,7 @@ class Geometry:
             # Retain every native particle binding in the immutable catalog,
             # but only copy buffers that can be drawn in this captured view.
             # Dormant/off-camera capacity must not crowd out visible effects.
-            candidates=[s for s in self.shapes if s.get('particles')]
+            candidates=self.particle_metadata()[0]
             if candidates:
                 candidates=[s for s in candidates if raw.shape_visible(int(s['id'],16))]
             part_started=time.perf_counter()
@@ -508,9 +565,15 @@ class Geometry:
                 self.last_refresh=0
                 raise SceneReadChanged('Native mutable attributes changed during capture: '+str(error))from error
             parts['attributes']=(time.perf_counter()-part_started)*1000
+            pose_end=self.r.u32(int(anchor['world'],16)+0x24)
             part_started=time.perf_counter()
             preferred={p for p,indices in getattr(self,'native_light_membership',{}).items()if raw.unhidden[indices].any()}
-            try:environment=capture_environment(self.r,anchor,self.light_pointers,self.light_owners,preferred)
+            try:
+                previous=getattr(self,'environment_light_selection',None)
+                epoch=getattr(self,'epoch','')
+                previous=previous[1] if previous and previous[0]==epoch else ()
+                environment=capture_environment(self.r,anchor,self.light_pointers,self.light_owners,preferred,previous)
+                self.environment_light_selection=(epoch,tuple(v['id']for v in environment.get('lights',())))
             except(OSError,ValueError)as error:
                 self.last_refresh=0
                 raise SceneReadChanged('Native environment changed during capture: '+str(error))from error
@@ -518,6 +581,8 @@ class Geometry:
                 parts['environment']=(time.perf_counter()-part_started)*1000
                 part_started=time.perf_counter()
                 materials=capture_materials(self.r,self.material_flips)
+                effects,effect_frames=capture_texture_effects(self.r,getattr(self,'texture_effects',{}))
+                materials['frames'].update(effect_frames)
                 parts['texture_frames']=(time.perf_counter()-part_started)*1000
                 texture_batch=getattr(self.r,'last_batch_stats',{}).copy()if isinstance(self.material_flips,FlipCapture)and self.material_flips.records else{}
                 part_started=time.perf_counter()
@@ -526,7 +591,7 @@ class Geometry:
             except(OSError,ValueError,RuntimeError)as error:
                 self.last_refresh=0
                 raise SceneReadChanged('Native material changed during capture: '+str(error))from error
-            anchor={**anchor,'environment':environment,'material_frames':materials,'material_values':values}
+            anchor={**anchor,'environment':environment,'material_frames':materials,'material_values':values,'texture_effects':effects}
             end=self.r.u32(int(anchor['world'],16)+0x24)
             if self.r.u32(0x7C67DC)!=int(anchor['world'],16) or self.r.u32(int(anchor['data'],16)+0xB540)!=int(self.cell,16):
                 raise SceneReadChanged('Scene changed during pose capture')
@@ -535,12 +600,18 @@ class Geometry:
             # A slow pass already spans an original frame; repeating the same
             # full read cannot make it atomic and doubles camera/pose latency.
             # Retry only a short pass that happened to straddle a boundary.
-            skipped=end!=anchor['frame_ms']and attempt==0 and elapsed>=8
-            if end==anchor['frame_ms'] or attempt==1 or skipped:
+            # The complete bone/node block has already been copied before
+            # classification. CPU classification or later metadata advancing
+            # the native clock cannot change that owned block. Retry a short
+            # node copy that crosses a frame, never the time spent processing
+            # it. Particle/morph buffers have their own identity fences; this
+            # external reader does not claim an atomic whole-engine snapshot.
+            skipped=nodes_end!=anchor['frame_ms']and attempt==0 and nodes_elapsed>=8
+            if nodes_end==anchor['frame_ms'] or attempt==1 or skipped:
                 return anchor,raw,particles,attributes,{'pose_read_ms':elapsed,'pose_parts_ms':parts,'texture_frame_batch':texture_batch,'pose_attempts':attempt+1,
                     'pose_nodes_ms':nodes_ms,
                     'pose_batch':pose_batch,
-                    'pose_sample_unix_ns':capture_ns,'source_frame_ms_end':end,
+                    'pose_sample_unix_ns':capture_ns,'source_frame_ms_end':end,'nodes_frame_ms_end':nodes_end,'nodes_spanned_frames':nodes_end!=anchor['frame_ms'],'pose_frame_ms_end':pose_end,'pose_spanned_frames':pose_end!=anchor['frame_ms'],
                     'sample_spanned_frames':end!=anchor['frame_ms'],'retry_skipped_for_budget':skipped}
 
     def snapshot(self,base,*,prepared=False):
@@ -553,48 +624,46 @@ class Geometry:
         # Skin.deform must never fall back to a new process read mid-calculation.
         needed=set()
         for i in raw.visible_indices:
-            skin=self.records[i][3]
-            if skin is not None:needed.update((skin.shape,skin.root,*skin.bones))
+            ptr,identity,parents,skin,cell=self.records[i]
+            if skin is not None and ptr in attributes:needed.update((skin.shape,skin.root,*skin.bones))
         worlds=raw.worlds(needed)
-        states=[(False,)]*len(self.records);visible_counts=[0]*len(self.cell_definitions);visible_count=0;view_visible=0;view_pointers=getattr(self,'view_pointers',set())
+        from skin_palette import PalettePlan
+        plan=getattr(self,'_palette_plan',None)
+        if plan is None or plan.layout is not raw.layout:self._palette_plan=plan=PalettePlan(raw.layout)
+        palettes=plan.capture(raw,attributes)
+        visibility=raw.visible.copy();payloads={};visible_counts=[0]*len(self.cell_definitions);visible_count=0;view_visible=0;view_pointers=getattr(self,'view_pointers',set())
         culled=int(np.count_nonzero(raw.unhidden&~raw.visible));deformed_count=0
-        particle_shapes={int(s['id'],16)for s in self.shapes if s.get('particles')}
+        particle_items,particle_shapes=self.particle_metadata()
+        # Keep the original float32 matrices in an owned dense block. Only
+        # particles/morphs need a per-shape matrix view during translation.
+        transforms=raw.nodes['transform'][raw.layout.shape_indices]
         for index in raw.visible_indices:
             ptr,identity,visibility_nodes,skin,owner=self.records[index]
-            if ptr in particle_shapes and ptr not in particles:continue
-            data=raw[ptr]
+            if ptr in particle_shapes and ptr not in particles:visibility[index]=False;continue
             visible_count+=1
             if ptr in view_pointers:view_visible+=1
             if owner is not None:visible_counts[owner]+=1
-            transform_bytes=data[0x40:0x74]
-            previous=self.transform_cache.get(ptr)
-            if previous and previous[0]==transform_bytes:transform=previous[1]
-            else:
-                transform=[round(value,6) for value in struct.unpack('<13f',transform_bytes)]
-                self.transform_cache[ptr]=(transform_bytes,transform)
-            state=[True,transform]
             if ptr in particles:
-                points,colors=particle_quads(particles[ptr],transform,anchor['camera'])
-                state.extend((points,colors))
+                points,colors=particle_quads(particles[ptr],transforms[index],anchor['camera'])
+                payloads[index]=(points,colors)
                 deformed_count+=1
             elif ptr in attributes:
                 local,colors,uvs=attributes[ptr]
                 if skin is not None:
                     points=skin.deform(worlds,strict=True,vertices=local)
                 else:
-                    placement=matrix(transform);points=local@placement[:3,:3].T+placement[:3,3]
+                    placement=matrix(transforms[index]);points=local@placement[:3,:3].T+placement[:3,3]
                 if uvs is not None:
-                    state.append(dict(points=points.reshape(-1),uvs=uvs.reshape(-1),**({'colors':colors.reshape(-1)}if colors is not None else{})))
+                    payloads[index]=(dict(points=points.reshape(-1),uvs=uvs.reshape(-1),**({'colors':colors.reshape(-1)}if colors is not None else{})),)
                 else:
-                    state.append(points.reshape(-1))
-                    if colors is not None:state.append(colors.reshape(-1))
+                    payloads[index]=(points.reshape(-1),)+( (colors.reshape(-1),)if colors is not None else())
                 deformed_count+=1
             elif ptr in self.native_attributes:
                 raise SceneReadChanged('Visible mutable native attributes were not captured')
             elif skin is not None:
-                state.append(dict(palette=skin.palette(worlds),bound=struct.unpack_from('<4f',data,0x1C)))
+                payloads[index]=(dict(palette=palettes[index],bound=raw.bounds[index].tolist()),)
                 deformed_count+=1
-            states[index]=state
+        states=CapturedStates(transforms,visibility,payloads)
         if self.r.u32(self.r.u32(0x7C67E0)+0xB540)!=int(self.cell,16):
             raise SceneReadChanged('Cell changed while reading render poses')
         cell_stats=[{**cell,'visible':count}for cell,count in zip(self.cell_definitions,visible_counts)]
@@ -629,16 +698,17 @@ class Geometry:
         return {**anchor,**metrics,'geometry_version':6 if any(item['uvs']for item in self.native_attributes.values())else 5,'scene_epoch':self.epoch,'stream_cells':cell_stats,
                 'scene_catalog':self.catalog,'instance_states':states,
                 **({'view_layout':self.view_layout}if getattr(self,'view_layout',None)else{}),
-                **({'scene_bindings_version':1,'scene_catalog_md5':self.catalog_digest}if getattr(self,'catalog_digest','')else{}),
+                **({'scene_bindings_version':2 if getattr(self,'binding_index',None)else 1,'scene_catalog_md5':self.catalog_digest,**({'scene_binding_index':self.binding_index}if getattr(self,'binding_index',None)else{})}if getattr(self,'catalog_digest','')else{}),
                 'geometry_stats':{'instances':len(states),'skinned_shapes':len(self.skins),
                                   'visible':visible_count,
                                   'frustum_culled':culled,'deformed_shapes':deformed_count,
                                   'offscreen_shadow_casters':int(np.count_nonzero(raw.offscreen_casters)),
+                                  'offscreen_reflection_candidates':int(np.count_nonzero(raw.offscreen_reflections)),
                                   'terrain_instances':self.terrain_count,
                                   'first_person_instances':len(view_pointers),'first_person_visible':view_visible,
-                                  'particle_systems':sum(bool(s.get('particles'))for s in self.shapes),
+                                  'particle_systems':len(particle_items),
                                   'particle_sampled_systems':len(particles),'particle_active':sum(p[1]for p in particles.values()),
-                                  'particle_capture_dropped':sum(bool(s.get('particles'))and raw.shape_visible(int(s['id'],16))and int(s['id'],16)not in particles for s in self.shapes),
+                                  'particle_capture_dropped':sum(raw.shape_visible(p)and p not in particles for p in particle_shapes),
                                   'mutable_shapes':len(self.native_attributes),'mutable_sampled_shapes':len(attributes),
                                   'membership_md5':self.membership_hash,
                                   'mesh_cache_entries':len(self.assets.meshes),
@@ -779,6 +849,8 @@ def main():
     channel=None
     from camera_lane import CameraLane
     camera_lane=None
+    distant_worker=None
+    ui_worker=None
     started=time.perf_counter()
     sequence=0
     last_log=0
@@ -787,6 +859,10 @@ def main():
     try:
         channel=None if args.file_transport else Writer(args.pid,session)
         camera_lane=CameraLane(args.pid,session)
+        from distant_stream import start as start_distant
+        distant_worker=start_distant(args.pid,session)
+        from ui_stream import start as start_ui
+        ui_worker=start_ui(args.pid,session)
         with (ROOT/'logs/geometry-bridge.jsonl').open('a',encoding='utf-8') as log:
             while True:
                 tick=time.perf_counter()
@@ -863,6 +939,14 @@ def main():
                 geometry.prioritize_pose(False)
                 time.sleep(max(0,1/args.hz-(time.perf_counter()-tick)))
     finally:
+        if ui_worker:
+            ui_worker.terminate()
+            try:ui_worker.wait(timeout=3)
+            except __import__('subprocess').TimeoutExpired:pass
+        if distant_worker:
+            distant_worker.terminate()
+            try:distant_worker.wait(timeout=3)
+            except __import__('subprocess').TimeoutExpired:pass
         geometry.prioritize_pose(False)
         if camera_lane:camera_lane.close()
         geometry.close();reader.close()

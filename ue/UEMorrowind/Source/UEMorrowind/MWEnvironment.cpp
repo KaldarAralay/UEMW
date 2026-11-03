@@ -34,7 +34,7 @@ bool MWDecodeEnvironment(const TSharedPtr<FJsonObject>& J,FMWEnvironmentState& O
     Out.Pixels.SetNumZeroed(8*33);Out.LightCount=Lights->Num();Out.OmittedLights=Omitted;
     Out.Pixels[0]=RGB(Ambient,1);Out.Pixels[1]=RGB(Sun,1);Out.Pixels[2]=XYZ(Direction,Density);Out.Pixels[3]=RGB(FogColor,Fog?1:0);
     Out.Pixels[4]=FVector4f(Clip[0],Clip[1],Lights->Num(),Underwater?1:0);Out.Pixels[5]=RGB(Sky,Transition);Out.Pixels[6]=XYZ(Wind,Thunder);Out.Pixels[7]=FVector4f(Water,HasWater?1:0,Current,Next);
-    TSet<FString> Ids;Out.LightIds.Empty();
+    TSet<FString> Ids;Out.LightIds.Empty();Out.LightNominalPeaks.Empty();
     for(int32 i=0;i<Lights->Num();++i) {
         const TSharedPtr<FJsonObject>* L=nullptr;FString Id;double Kind=0,Dimmer=0,Radius=0,Angle=0,Exponent=0;bool Enabled=false;
         TArray<double> Position,Diffuse,LocalAmbient,LightDirection,Attenuation;
@@ -45,7 +45,7 @@ bool MWDecodeEnvironment(const TSharedPtr<FJsonObject>& J,FMWEnvironmentState& O
             !Array(*L,TEXT("direction"),LightDirection,3) || !Array(*L,TEXT("attenuation"),Attenuation,3) ||
             !Scalar(*L,TEXT("spot_angle"),Angle) || Angle<0 || Angle>180 || !Scalar(*L,TEXT("spot_exponent"),Exponent) || Exponent<0)return false;
         for(double A:Attenuation)if(A<0)return false;
-        Ids.Add(Id);Out.LightIds.Add(Id);const int32 Row=(i+1)*8;const float Scale=Enabled?Dimmer:0;
+        Ids.Add(Id);Out.LightIds.Add(Id);Out.LightNominalPeaks.Add(FMath::Max(0.,FMath::Max3(Diffuse[0],Diffuse[1],Diffuse[2]))*FMath::Max(1.,Dimmer));const int32 Row=(i+1)*8;const float Scale=Enabled?Dimmer:0;
         Out.Pixels[Row]=XYZ(Position,Kind);Out.Pixels[Row+1]=RGB(LocalAmbient,Enabled?1:0);Out.Pixels[Row+1].X*=Scale;Out.Pixels[Row+1].Y*=Scale;Out.Pixels[Row+1].Z*=Scale;
         Out.Pixels[Row+2]=RGB(Diffuse,Radius);Out.Pixels[Row+2].X*=Scale;Out.Pixels[Row+2].Y*=Scale;Out.Pixels[Row+2].Z*=Scale;
         Out.Pixels[Row+3]=XYZ(LightDirection,FMath::Cos(FMath::DegreesToRadians((float)Angle)));Out.Pixels[Row+4]=FVector4f(Attenuation[0],Attenuation[1],Attenuation[2],Exponent);

@@ -6,6 +6,8 @@
 #include "MWMaterials.h"
 #include "MWFrame.h"
 #include "MWRain.h"
+#include "MWReflection.h"
+#include "RenderCommandFence.h"
 #include "MWLive.generated.h"
 
 class UCameraComponent;
@@ -35,8 +37,14 @@ class UMWNativeSkyComponent;
 struct FMWPresentationSamples;
 class ULightComponent;
 struct FMWEnvironmentState;
+struct FMWDistantView;
+struct FMWUIView;
 
+using FMWResourceIdentity=TSharedPtr<const FString,ESPMode::ThreadSafe>;
+struct FMWTextureStage {int32 Slot=0,Clamp=3,Filter=2,UVSet=0;bool Supported=true;FString Texture,FrameGroup;TArray<FString> Frames;TArray<float> Bump;};
+struct FMWTextureEffectState {float Values[16]{};bool operator==(const FMWTextureEffectState& Other) const {return FMemory::Memcmp(Values,Other.Values,sizeof(Values))==0;}};
 struct FMWMeshData {
+    FMWResourceIdentity Continuity;
     TArray<FVector> Vertices;
     TArray<FVector> Normals;
     TArray<FVector2D> UVs;
@@ -46,6 +54,14 @@ struct FMWMeshData {
     FString TextureFrameGroup;
     FString MaterialValueGroup;
     TArray<FString> TextureFrames;
+    TArray<FMWTextureStage> TextureStages;
+    int32 TextureApply=2;
+    FString TextureEffectGroup;
+    bool TextureEffectSupported=false;
+    bool NativeAlphaTest=false;
+    uint8 AlphaTestFunction=0,AlphaTestReference=0;
+    FString StageUVFile;
+    TArray<FVector2D> StageUV1,StageUV2;
     TArray<FVector2D> SkinUVs;
     TArray<FVector4f> SkinWeights;
     int32 SkinBones=0;
@@ -58,11 +74,11 @@ struct FMWMeshData {
     int32 EffectKind=0;
     int32 CelestialKind=0;
     float SoftDistance=0;
-    bool NativeParticle=false,Glass=false,BlendFiltered=false,Transparent=false;
+    bool NativeParticle=false,Glass=false,BlendFiltered=false,Transparent=false,Lines=false;
     TArray<FString> NativeLightSet;
     bool HaveNativeLightSet=false,NativeSunActive=true;
 };
-struct FMWBinding {FString Id,Asset,Cell;};
+struct FMWBinding {FString Id,Asset,Cell;FMWResourceIdentity Continuity;};
 struct FMWRigidSlot {FString Asset;int32 Id;};
 struct FMWVertexPose {TArray<float> Points,Colors,UVs;};
 struct FMWResourceJob {
@@ -117,9 +133,16 @@ public:
     bool EffectFidelityEnabled=true;
     UPROPERTY() USceneCaptureComponent2D* WaterReflectionCapture=nullptr;
     UPROPERTY() UTextureRenderTarget2D* WaterReflectionTarget=nullptr;
+    UPROPERTY() TArray<UTextureRenderTarget2D*> WaterReflectionBuffers;
+    FRenderCommandFence WaterReflectionFence;
+    FMWReflectionImage PendingWaterImage,DisplayedWaterImage;
+    bool WaterReflectionPending=false;
     bool WaterReflectionEnabled=true,WaterReflectionActive=false,NativeReflectionHasWater=false;
     double NativeReflectionHeight=0,LastWaterReflection=0;
     uint64 WaterReflectionRequests=0;
+    uint64 WaterReflectionCompleted=0,WaterReflectionDiscarded=0;
+    double NextWaterReflection=0;
+    int32 WaterReflectionTransparentComponents=0;
     int32 WaterReflectionComponents=0;
     FString WaterReflectionEpoch;
     FLinearColor NativeReflectionSky=FLinearColor::Black;
@@ -195,13 +218,35 @@ public:
     int32 ObjectCount=0;
     int64 Sequence=-1;
     uint32 SourcePid=0;
+    bool AuxiliaryGeometry=false;
+    bool DistantEnabled=true;
+    UPROPERTY() AMWLive* DistantGeometry=nullptr;
+    FMWDistantView* DistantView=nullptr;
+    FString DistantStatus=TEXT("waiting for original exterior");
+    int32 DistantVisible=0,DistantBindings=0;
+    double DistantNativeStamp=0;
+    FMWUIView* UIView=nullptr;
+    UPROPERTY() TMap<FString,UTexture2D*> UITextures;
+    bool UIReady=false,UINativeMenu=false;
+    FString UIStatus=TEXT("waiting for native UI");
+    TArray<FString> UIMenus;
+    int32 UIDraws=0;
+    int64 UISequence=0;
+    double UIStamp=0;
+    TArray<FVector4d> UIRegions;
+    int32 UIWidth=0,UIHeight=0;
     double ReadMs=0;
     bool HavePlayerStats=false;
     bool NativeMenuOpen=true;
     bool GameplayHudVisible() const;
     FVector2D Health,Magicka,Fatigue;
 private:
+    friend struct FMWDistantView;
+    friend struct FMWUIView;
+    friend class FMWUITest;
+    friend class FMWDistantTest;
     friend class FMWRainInterpolationTest;
+    friend class FMWTopologyTest;
     friend class FMWRenderSelectionTest;
     friend class FMWOutdoorMaterialTest;
     friend class FMWLightingTest;
@@ -213,6 +258,9 @@ private:
     friend class FMWResourceProgressTest;
     friend class FMWRigidReuseTest;
     friend class FMWStreamingTest;
+    friend class FMWMaterialContinuityTest;
+    friend class FMWNativeTextureStagesTest;
+    friend class FMWNativeAlphaTest;
     friend class FMWWitnessTest;
     friend class FMWNativePoseReuseTest;
     friend class FMWCameraLaneTest;
@@ -270,6 +318,8 @@ private:
     void HideInstance(const FString& Id);
     void AdvanceGeometryResources(double Budget=.003,int32 MaxJobs=64);
     void PrepareResourceIdentity(const FString& Id,const FString& Asset);
+    bool PrepareRigidBatch(const FString& Asset);
+    void RetargetCompatibleResources(const TArray<FMWBinding>& Bindings);
     void RemoveRigid(const FString& Id);
     void HideRigid(const FString& Id);
     void FlushRigidBatches();
@@ -283,17 +333,23 @@ private:
     bool SceneShown=false,DiagnosticVisibility=false;
     TMap<FString,int32> CurrentMaterialFrames,AppliedMaterialFrames;
     TMap<FString,FMWMaterialValue> CurrentMaterialValues,AppliedMaterialValues;
+    TMap<FString,FMWTextureEffectState> CurrentTextureEffects,AppliedTextureEffects;
     TMap<FString,TArray<float>> UploadedBonePalettes;
     TMap<FString,FMWVertexPose> UploadedVertexPoses;
     int32 PerfBonePoseUpdates=0,PerfTextureFrameUpdates=0,PerfMaterialValueUpdates=0,PerfVertexPoseUpdates=0;
     bool ApplyMaterialFrames(const TMap<FString,int32>& Frames);
     bool ApplyMaterialValues(const TMap<FString,FMWMaterialValue>& Values);
+    bool ApplyTextureEffects();
     double LastDiagnostic=0;
     double LastHealthLog=0;
     int32 HealthFrames=0;
     double HealthMaxDelta=0;
     // Actor ticks and accepted native states; neither measures displayed frames.
     TArray<double> PerfAgeMs,PerfPollMs,PerfApplyMs,PerfDecodeMs,PerfStageMs,PerfTickMs,PerfCameraAgeMs,PerfPartialAgeMs,PerfPartialApplyMs;
+    FString LastMotionSession,LastMotionEpoch;
+    double LastMotionFrame=-1;
+    int32 PerfNativeMotionFrames=0;
+    int32 PerfResourceRetargets=0,PerfResourceRebindHides=0,PerfSharedMeshAliases=0;
     TArray<double> PerfFrameIntervalMs,PerfGPUFrameMs;
     TArray<double> PerfManifestReadMs,PerfManifestJsonMs,PerfBodyReadMs,PerfBodyHashMs,PerfBodyDecodeMs,PerfDecodeOtherMs;
     TArray<double> PerfChannelReadMs;
@@ -326,6 +382,7 @@ private:
     void RecordPoseApplication(double Stamp,double ApplyStarted);
     FString AcceptedSnapshotText;
     double AcceptedSnapshotStamp=0;
+    int64 AcceptedGeometrySequence=-1;
     double SourcePacketStamp=0;
     double CaptureStarted=0,LastRecordCapture=0;
     int32 RecordSeconds=0,RecordFrame=0;
@@ -351,7 +408,7 @@ private:
     void ShowScene();
     void RejectGeometry();
     void ResetScene();
-    bool UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native=nullptr,const TMap<FString,int32>* MaterialFrames=nullptr,const TMap<FString,FMWMaterialValue>* MaterialValues=nullptr,const TArray<FMWBinding>* IncomingBindings=nullptr,const TMap<FString,int32>* IncomingIndex=nullptr);
+    bool UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native=nullptr,const TMap<FString,int32>* MaterialFrames=nullptr,const TMap<FString,FMWMaterialValue>* MaterialValues=nullptr,const TArray<FMWBinding>* IncomingBindings=nullptr,const TMap<FString,int32>* IncomingIndex=nullptr,const TMap<FString,FMWTextureEffectState>* TextureEffects=nullptr);
     bool LoadCatalog(const FString& Name);
     void CreateGeometryMaterial();
     void SetVisualReference(bool Reference);

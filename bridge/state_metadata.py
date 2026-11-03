@@ -31,7 +31,7 @@ def vector(value,count,limit=1e8,low=None,high=None):
 
 
 def key(value,limit=96):
-    if not isinstance(value,str)or not 1<=len(value)<=limit or any(not 32<=ord(c)<=126 for c in value):raise ValueError('Invalid packed metadata ID')
+    if not isinstance(value,str)or not 1<=len(value)<=limit or not value.isascii()or not value.isprintable():raise ValueError('Invalid packed metadata ID')
     raw=value.encode('ascii');return bytes([len(raw)])+raw
 
 

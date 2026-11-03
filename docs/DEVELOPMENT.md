@@ -9,7 +9,9 @@ Test-UEMW.cmd -Repository
 Test-UEMW.cmd -Renderer
 ```
 
-The first runs the Python suite and public-file audit. The second also runs all 26 owned-data checks in the packaged UE executable. `python tools/run_tests.py` is the direct unit-test entry point; it sets the runtime/developer/test import paths. Tests need Windows/Python/NumPy/Pillow, not game data or UE. Build `tools/build-read-batch.ps1` to include the real owned-allocation native ABI tests. Four optional crash-watchdog tests skip unless the separate diagnostic helpers were built with `tools/build-diagnostics.ps1 -IncludeTests`. CI uses `-AllowNewerCompiler` only for the small read helper; it does not relax the full UE build's 14.34 pin.
+The first runs the Python suite and public-file audit. The second also runs all 33 owned-data checks in the packaged UE executable. `python tools/run_tests.py` is the direct unit-test entry point; it sets the runtime/developer/test import paths. Tests need Windows/Python/NumPy/Pillow, not game data or UE. Build `tools/build-read-batch.ps1` to include the real owned-allocation native ABI tests. Four optional crash-watchdog tests skip unless the separate diagnostic helpers were built with `tools/build-diagnostics.ps1 -IncludeTests`. CI uses `-AllowNewerCompiler` only for the small read helper; it does not relax the full UE build's 14.34 pin.
+
+The optional `tools/test-client-alpha-gpu.ps1` uses the packaged D3D11 client and owned textures to check all eight native alpha comparisons immediately below, at and above a byte threshold, for masked and translucent policies. It runs hidden, writes a fresh diagnostic log, records no video and is separate from the NullRHI tests.
 
 `tools/test-portability.ps1` checks PowerShell syntax, nondefault Steam-library discovery, path spacing and actual venv worker PID identification using owned fixtures. Full setup was designed to be repeatable and to report all missing build prerequisites before installing packages or changing private files.
 
@@ -27,7 +29,7 @@ Developer probes live in `dev/diagnostics`; invoke them through `python dev/run.
 
 Useful starting points include `benchmark`, `profile_bridge`, `check_first_person_motion`, `check_native_motion`, `check_render_stability` and `check_focus_stages`. A current first-person probe is `python dev/run.py check_first_person_motion --pid <private-PID> --seconds 12 --draw-cycles 2`; it expects the equipped eighteen-section iron sword/hands fixture and the original focused. Reload a disposable checkpoint afterwards.
 
-Default launch is passive two-window D3D11 with the original rendering enabled. `tools/start-session.ps1 -Overlay` is an experimental overlay; `-Editor`, `-DiagnosticScreenshots`, `-DiagnosticTrace`, `-PresentationStats` and crash capture are explicit development options. Alternate launchers are under `dev/launchers`. Normal launch records nothing. Measurements must distinguish actor ticks, applied state rate, GPU timestamps and actual displayed frames.
+Default launch is passive two-window D3D11 with the original rendering enabled. `Start-UEMW-Unified.cmd` (or `tools/start-session.ps1 -Overlay`) translates native UI over the UE scene; `-Editor`, `-DiagnosticScreenshots`, `-DiagnosticTrace`, `-PresentationStats` and crash capture are explicit development options. Alternate launchers are under `dev/launchers`. Normal launch records nothing. Measurements must distinguish actor ticks, applied state rate, GPU timestamps and actual displayed frames.
 
 Full-world and per-cell membership hashes are expensive and disabled during normal play. For a focused diagnostic run, set `UEMW_MEMBERSHIP_DIAGNOSTICS=1` before starting a new renderer (or pass the renderer argument `-UEMWDiagnosticMembership`). The small health/performance reports and independent fail-safe heartbeat remain enabled.
 

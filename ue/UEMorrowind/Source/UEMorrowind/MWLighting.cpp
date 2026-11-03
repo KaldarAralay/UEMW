@@ -77,8 +77,8 @@ float MWNativeSunAngle(int32 Current,int32 Next,float Transition) {
 }
 TArray<FString> MWChooseNativeShadows(const TArray<FMWShadowCandidate>& Candidates,const TArray<FString>& Previous,bool Stable,int32 Budget) {
     TArray<FMWShadowCandidate> Sorted;
-    for(const auto& C:Candidates)if(!C.Id.IsEmpty() && FMath::IsFinite(C.Distance) && C.Distance>=0)Sorted.Add(C);
-    auto Rank=[&](const FMWShadowCandidate& C){return (C.Distance+128)*(Stable && Previous.Contains(C.Id)?1./1.35:1.);};
+    for(const auto& C:Candidates)if(!C.Id.IsEmpty() && FMath::IsFinite(C.Distance) && C.Distance>=0 && FMath::IsFinite(C.Importance) && C.Importance>0)Sorted.Add(C);
+    auto Rank=[&](const FMWShadowCandidate& C){return (C.Distance+128)/FMath::Sqrt(Stable?FMath::Clamp(C.Importance,1e-6,1024.):1.)*(Stable && Previous.Contains(C.Id)?1./1.35:1.);};
     Sorted.Sort([&](const FMWShadowCandidate& A,const FMWShadowCandidate& B){const double X=Rank(A),Y=Rank(B);return X==Y?A.Id<B.Id:X<Y;});
     TArray<FString> Out;for(const auto& C:Sorted)if(!Out.Contains(C.Id)){Out.Add(C.Id);if(Out.Num()>=FMath::Clamp(Budget,1,4))break;}return Out;
 }

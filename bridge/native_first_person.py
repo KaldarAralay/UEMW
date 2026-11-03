@@ -22,7 +22,7 @@ NAME=re.compile(r'view-[0-9a-f]{64}\.json\Z')
 
 def surface_key(definition,weights=None):
     shading=dict(definition['shading']);shading.pop('first_person',None)
-    return json.dumps([definition['asset'],definition['texture'],definition.get('alpha_mode','opaque'),definition.get('blend_native_opacity',True),shading,weights],sort_keys=True,separators=(',',':'))
+    return json.dumps([definition['asset'],definition['texture'],definition.get('alpha_mode','opaque'),definition.get('blend_native_opacity',True),definition.get('alpha_test'),shading,weights,definition.get('texture_stages'),definition.get('environment_map')],sort_keys=True,separators=(',',':'))
 
 
 def publish_layout(value,folder):
@@ -57,8 +57,17 @@ class DefinitionCache:
         prefix=definition['rows'][0]['id'].rsplit(':',1)[0]+':'if':'in definition['rows'][0]['id']else''
         for shape in shapes:
             shape=dict(shape,generation=prefix[:-1],cell_key='view:first-person')
+            if shape.get('native_environment_effect'):return None
             if discover(r,shape)or material(r,shape)or flip(r,int(shape.get('texture_property','0x0'),16),shape['generation']):return None
             converted=self.assets.mesh(shape);skin=Skin(r,shape)if shape['skin']!='0x0'else None
+            from native_texture_stages import read as read_stages,convert as convert_stages
+            if not hasattr(self.assets,'used_textures'):self.assets.used_textures=set()
+            stages,flips=convert_stages(self.assets,shape,read_stages(r,int(shape.get('texture_property','0x0'),16),shape['generation']))
+            if flips:return None
+            if stages:converted={**converted,'texture_stages':stages}
+            from native_blend import alpha_test
+            test=alpha_test(shape.get('alpha_flags',0),shape.get('alpha_ref',0))
+            if test:converted={**converted,'alpha_test':test}
             key=surface_key(converted,skin.export_weights(self.assets.out)if skin else None);asset=self.entries.get(key)
             if asset is None:return None
             p=int(shape['id'],16);parents=(*shape['parents'],p);nodes.update(parents)

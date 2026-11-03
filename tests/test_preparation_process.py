@@ -10,6 +10,29 @@ from game_assets import Assets
 from scene_reader import SceneReader
 
 class ProcessTransferTests(unittest.TestCase):
+    def test_prepared_layout_replacement_adopts_worker_arrays_and_keeps_native_hide_fences(self):
+        from pose_frame import PoseLayout,PoseFrame
+        from native_switches import SwitchLayout
+        from test_pose_frame import header,CAMERA
+        record=(0x10000,(0x20000,0),(),None,None)
+        g=types.SimpleNamespace(records=[record],skins={},view_pointers=set(),water_pointers=set(),player_pointers=set(),water_visibility_roots=set(),actor_owners={},shapes=[dict(id='0x10000')])
+        node_ids={0x10000:(0,0),0x30000:(0,0)}
+        plan=ReadPlan([(0x10000,0xac),(0x30000,0x74)])
+        replacement=[(record[0],record[1],(0x30000,),None,None)]
+        ready=PoseLayout(replacement,read_plan=plan,switches=SwitchLayout([],{}),node_identities=node_ids)
+        fields={k:v for k,v in ready.__dict__.items()if k not in('records','read_plan')}
+        payload=loads(dumps(dict(records=replacement,node_identities=node_ids,read_plan=plan,switches=ready.switches,shape_gates={},prepared_layout=fields)),None)
+        with patch.object(PoseLayout,'__init__',side_effect=AssertionError('Layout rebuilt on pose owner')):apply_layout_patch(g,payload)
+        self.assertIs(g.pose_layout.header_offsets,payload['prepared_layout']['header_offsets'])
+        raw={0x10000:header((0x20000,0)),0x30000:header()}
+        self.assertTrue(PoseFrame(raw,g.pose_layout,CAMERA).visible[0])
+        raw[0x30000]=header(flags=1)
+        self.assertFalse(PoseFrame(raw,g.pose_layout,CAMERA).visible[0])
+        accepted=g.pose_layout
+        bad={**payload,'records':[record],'prepared_layout':{**fields,'expected':np.zeros((1,2),dtype='<u4')}}
+        with self.assertRaises(ValueError):apply_layout_patch(g,bad)
+        self.assertIs(g.pose_layout,accepted)
+
     def test_process_transfer_preserves_live_cell_slot_retirement_fences(self):
         from pose_frame import PoseLayout,PoseFrame
         from test_pose_frame import header,CAMERA

@@ -92,6 +92,7 @@ class AsyncGeometry:
         fields=('scope','signature','scene_key','epoch','catalog','generation_counter')
         result={key:getattr(old,key)for key in fields}
         if hasattr(old,'catalog_digest'):result['catalog_digest']=old.catalog_digest
+        if hasattr(old,'binding_index'):result['binding_index']=old.binding_index
         if hasattr(old,'last_world_refresh'):result['last_world_refresh']=old.last_world_refresh
         if hasattr(old,'scene_read_plan'):result['scene_read_plan']=old.scene_read_plan
         if hasattr(old,'prepared_definitions'):result['prepared_definitions']=old.prepared_definitions
@@ -197,6 +198,8 @@ class AsyncGeometry:
             if CATALOG.fullmatch(name)and(not self.state or name!=self.state.catalog):
                 try:(ready.assets.out/name).unlink(missing_ok=True)
                 except PermissionError:pass
+                try:(ready.assets.out/('bindings-'+name[8:-5]+'.bin')).unlink(missing_ok=True)
+                except PermissionError:pass
         ready.close()
 
     def compatible(self,ready,base,context):
@@ -245,10 +248,10 @@ class AsyncGeometry:
             else:self.discard(ready)
             return
         old=self.state
-        if old:
-            ids={int(s['id'],16)for s in ready.shapes}
-            ready.transform_cache={k:v for k,v in old.transform_cache.items()if k in ids}
         ready.r=self.r;ready.scene.r=self.r
+        if old and getattr(old,'epoch',None)==getattr(ready,'epoch',None):
+            selection=getattr(old,'environment_light_selection',None)
+            if selection is not None:ready.environment_light_selection=selection
         self.state=ready;self.completed+=1;self.error=''
         if self.process_preparation:self.process_fingerprint=message['fingerprint']
         self.remember_catalog(ready)

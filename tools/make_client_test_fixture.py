@@ -11,6 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'bridge'))
 from live_binary import encode,HEADER
 from frame_transport import filename
+from binding_index import encode as encode_bindings
 
 folder=ROOT/'local/test-temp/client-fixture'
 for part in ('meshes','textures','frames'):(folder/part).mkdir(parents=True,exist_ok=True)
@@ -81,11 +82,31 @@ material_catalog={**catalog,'meshes':{key:{**value,'material_state':'native:mate
 mutable_catalog=dict(format='uemw.assets',version=1,cells=[],meshes={'mutable':{**mesh,'dynamic_attributes':dict(positions=True,colors=True,uvs=True,morph=True)}},bindings=[dict(id='mutable-instance',asset='mutable')])
 (folder/'catalog-native-attributes.json').write_text(json.dumps(mutable_catalog,separators=(',',':')),encoding='utf-8')
 (folder/'catalog-rigid-modes.json').write_text(json.dumps(dict(format='uemw.assets',version=1,cells=[],meshes={'rigid':mesh},bindings=[dict(id='rigid-mode',asset='rigid')]),separators=(',',':')),encoding='utf-8')
-resource_meshes={**catalog['meshes'],'mutable':mutable_catalog['meshes']['mutable']}
+resource_meshes={key:{**value,'shading':dict(lit=True,fog=True,sky=False,emissive=[0,0,0])}for key,value in {**catalog['meshes'],'mutable':mutable_catalog['meshes']['mutable']}.items()}
 for phase in (0,1):
     bindings=[dict(id=f'resource-{i if phase==0 or i<48 else i+96}',asset=('rigid','skin','mutable')[(i+(1 if phase and i<12 else 0))%3])for i in range(96)]
     (folder/f'catalog-resources-{phase}.json').write_text(json.dumps(dict(format='uemw.assets',version=1,cells=[],meshes=resource_meshes,bindings=bindings),separators=(',',':')),encoding='utf-8')
 (folder/'catalog-resources-pending.json').write_bytes((folder/'catalog-resources-0.json').read_bytes())
+lighting_meshes={key+'-lighting':{**value,'shading':{**value.get('shading',{}),'native_lights':['0x2222'],'native_sun':False}}for key,value in resource_meshes.items()}
+lighting_bindings=[dict(id=f'resource-{i}',asset=('rigid','skin','mutable')[i%3]+'-lighting')for i in range(96)]
+(folder/'catalog-resources-lighting.json').write_text(json.dumps(dict(format='uemw.assets',version=1,cells=[],meshes=lighting_meshes,bindings=lighting_bindings),separators=(',',':')),encoding='utf-8')
+stage_uvs=np.asarray([[[0,0],[.25,.5],[1,0]],[[1,0],[2,0],[0,1]],[[0,1],[0,3],[.5,.5]]],dtype='<f4')
+(folder/'meshes/stages.uuv').write_bytes(struct.pack('<4sII',b'UUV1',3,3)+stage_uvs.tobytes())
+staged=copy.deepcopy(catalog)
+for value in staged['meshes'].values():
+    value['texture_stages']=dict(version=1,apply=2,uv_file='meshes/stages.uuv',unsupported=[],maps=[dict(slot=slot,texture='textures/white.png',source_texture='owned-stage',uv_set=1 if slot==2 else 0,clamp=slot%4,filter=slot%6,**(dict(animation=dict(id='native:glow',frames=['textures/white.png','textures/blue.png']))if slot==4 else{}))for slot in (0,1,2,4,6)])
+(folder/'catalog-stages.json').write_text(json.dumps(staged,separators=(',',':')),encoding='utf-8')
+effect_state=dict(version=1,values={'native:environment':[1,1,3,2,.5,0,0,0,-.5,0,0,0,0,.5,.5,0]})
+(folder/'texture-effects.json').write_text(json.dumps(effect_state),encoding='utf-8')
+staged_environment=copy.deepcopy(staged)
+for value in staged_environment['meshes'].values():value['environment_map']=dict(version=1,id='native:environment',texture='textures/white.png',coordinates=2,supported=True,animation=dict(id='native:environment',frames=['textures/white.png','textures/blue.png']))
+(folder/'catalog-stages-environment.json').write_text(json.dumps(staged_environment,separators=(',',':')),encoding='utf-8')
+binding_catalog='catalog-'+'b'*32+'.json'
+binding_bytes=(folder/'catalog-resources-lighting.json').read_bytes();binding_digest=hashlib.md5(binding_bytes).hexdigest()
+(folder/binding_catalog).write_bytes(binding_bytes)
+binding_body=encode_bindings(json.loads(binding_bytes),binding_digest);binding_file='bindings-'+'b'*32+'.bin'
+(folder/binding_file).write_bytes(binding_body)
+(folder/'binding-index-reference.json').write_text(json.dumps(dict(catalog=binding_catalog,catalog_md5=binding_digest,reference=dict(file=binding_file,bytes=len(binding_body),md5=hashlib.md5(binding_body).hexdigest()))),encoding='utf-8')
 reuse_bindings=[dict(id=f'reuse-{i}',asset='skin'if i==1 else'mutable'if i==2 else'rigid')for i in range(6144)]
 (folder/'catalog-native-reuse.json').write_text(json.dumps(dict(format='uemw.assets',version=1,cells=[],meshes=resource_meshes,bindings=reuse_bindings),separators=(',',':')),encoding='utf-8')
 (folder/'catalog-native-reuse-pending.json').write_text(json.dumps(dict(format='uemw.assets',version=1,cells=[],meshes=resource_meshes,bindings=[{**b,'id':'replacement-4'}if i==4 else b for i,b in enumerate(reuse_bindings)]),separators=(',',':')),encoding='utf-8')
@@ -135,4 +156,64 @@ store_metadata_fixture('light-count',203,True,lambda b:struct.pack_into('<I',b,b
 store_metadata_fixture('material',204,True,lambda b:struct.pack_into('<f',b,len(b)-4,.5))
 store_metadata_fixture('truncated',205,True,lambda b:b.__delitem__(slice(-5,None)))
 store_metadata_fixture('trailing',206,True,lambda b:b.append(0))
+alpha_fixture=copy.deepcopy(json.loads((folder/'catalog-fixture.json').read_text()))
+for n,mesh in enumerate(alpha_fixture['meshes'].values()):
+    mesh['alpha_mode']='translucent'
+    mesh['alpha_test']=dict(version=1,function=4,reference=137)
+(folder/'catalog-alpha-test.json').write_text(json.dumps(alpha_fixture),encoding='utf-8')
+alpha_fixture['meshes'][next(iter(alpha_fixture['meshes']))]['alpha_test']['reference']=256
+(folder/'catalog-alpha-test-invalid.json').write_text(json.dumps(alpha_fixture),encoding='utf-8')
+# An owned line list uses the same colour/UV arrays, with carrier triples.
+line=struct.pack('<4sII',b'UML2',4,6)+np.asarray([[-150,0,0],[150,0,0],[-150,100,0],[150,100,0]],dtype='<f4').tobytes()+bytes(4*8)+bytes([255,0,0,255])*4+struct.pack('<6H',0,1,1,2,3,3)
+(folder/'meshes/lines.umesh').write_bytes(line)
+lines=dict(format='uemw.assets',version=1,cells=[],meshes={'lines':dict(file='meshes/lines.umesh',texture='',alpha_mode='opaque',shading=dict(lit=False,fog=False,sky=False,emissive=[0,0,0]))},bindings=[dict(id='line-instance',asset='lines')])
+(folder/'catalog-lines.json').write_text(json.dumps(lines),encoding='utf-8')
+bad=bytearray(line);struct.pack_into('<H',bad,len(bad)-2,2);(folder/'meshes/lines-invalid.umesh').write_bytes(bad)
+lines['meshes']['lines']['file']='meshes/lines-invalid.umesh';(folder/'catalog-lines-invalid.json').write_text(json.dumps(lines),encoding='utf-8')
 print('Synthetic test fixture:',folder)
+
+# Self-contained distant-scene roots never read a live game or licensed data.
+def distant_fixture(label,pose_mutation=None,manifest_mutation=None):
+    root=folder/('distant-'+label);assets=root/'local/distant-assets';(assets/'meshes').mkdir(parents=True,exist_ok=True);(assets/'textures').mkdir(exist_ok=True);(root/'local/bridge').mkdir(parents=True,exist_ok=True)
+    (assets/'meshes/triangle.umesh').write_bytes(payload);(assets/'textures/white.png').write_bytes((folder/'textures/white.png').read_bytes())
+    definition=dict(file='meshes/triangle.umesh',texture='textures/white.png',source_texture='owned.dds',vertices=3,alpha_mode='opaque',distant_terrain=True,shading=dict(lit=False,fog=False,sky=False,emissive=[0,0,0]))
+    c=dict(format='uemw.assets',version=1,source_kind='installed-distant-stat-land',cells=[dict(key='distant:3,0',grid=[3,0])],meshes={'owned':definition},bindings=[dict(id='distant:land:3,0',asset='owned',cell_key='distant:3,0')],terrain_tiles=[dict(tile=[48,0],texture='textures/white.png',source_texture='owned.dds')])
+    encoded=json.dumps(c,separators=(',',':')).encode();digest=hashlib.md5(encoded).hexdigest();name='catalog-'+digest+'.json';(assets/name).write_bytes(encoded)
+    data=bytearray(struct.pack('<4sII13f',b'UDF1',1,1,1,0,0,0,1,0,0,0,1,10,20,30,1))
+    if pose_mutation:pose_mutation(data)
+    pd=hashlib.md5(data).hexdigest();pose='poses-distant-'+pd+'.udf';(assets/pose).write_bytes(data)
+    j=dict(protocol='uemw.distant',version=1,status='live',pid=42,session='11112222-3333-4444-5555-666677778888',scene_epoch='99990000-aaaa-bbbb-cccc-ddddeeeeffff',source_sample_unix_ns=1700000000000000000,native_sample_unix_ns=1700000000000000000,catalog=name,catalog_md5=digest,poses=pose,poses_md5=pd,bindings=1,center=[0,0],excluded_grids=[[0,0]])
+    if manifest_mutation:manifest_mutation(j)
+    (root/'local/bridge/distant.json').write_text(json.dumps(j),encoding='utf-8')
+distant_fixture('good')
+distant_fixture('nan',lambda b:struct.pack_into('<f',b,12,float('nan')))
+distant_fixture('visible',lambda b:struct.pack_into('<I',b,8,2))
+distant_fixture('trailing',lambda b:b.append(0))
+distant_fixture('path',manifest_mutation=lambda j:j.update(poses='../'+j['poses']))
+distant_fixture('hash',manifest_mutation=lambda j:j.update(poses_md5='0'*32,poses='poses-distant-'+'0'*32+'.udf'))
+distant_fixture('count',manifest_mutation=lambda j:j.update(bindings=4097))
+
+# Original-UI-format owned data: alpha-zero full-screen geometry and a white
+# half-alpha texture on a red inset. A real Canvas pass must preserve the scene.
+from ui_scene import encode as encode_ui
+def ui_fixture(label,body_mutation=None,manifest_mutation=None):
+    root=folder/('ui-'+label);assets=root/'local/ui-assets';frames=root/'local/bridge/ui-frames';assets.mkdir(parents=True,exist_ok=True);frames.mkdir(parents=True,exist_ok=True)
+    image=struct.pack('<4sII',b'UTX1',1,1)+bytes([255,255,255,128]);sha=hashlib.sha256(image).hexdigest();(assets/(sha+'.utx')).write_bytes(image)
+    def quad(identity,rect,colour,texture):
+        a,b,c,d=rect
+        return dict(id=identity,texture=texture,vertices=np.array([[a,b,0,0,*colour],[c,b,1,0,*colour],[c,d,1,1,*colour],[a,d,0,1,*colour]]),indices=np.array([[0,1,2],[0,2,3]],dtype=np.uint16))
+    sample=dict(width=640,height=480,draws=[quad(0x10000,[0,0,640,480],[0,0,0,0],0xffffffff),quad(0x20000,[160,120,480,360],[1,0,0,1],0)])
+    session='11112222-3333-4444-5555-666677778888';name='ui-frames/'+session.replace('-','')+'-17.uui';body=bytearray(encode_ui(sample,session,17,1700000000000000000,42))
+    if body_mutation:body_mutation(body)
+    (root/'local/bridge'/name).write_bytes(body)
+    j=dict(protocol='uemw.ui',version=1,status='live',pid=42,session=session,sequence=17,sample_unix_ns=1700000000000000000,width=640,height=480,draws=2,ui=dict(native_ui=True,active_menus=['MenuInventory']),native_regions=[dict(kind='original-ui-render-target',menu='MenuInventory',rect=[22,400,100,460])],textures=[dict(file=sha+'.utx',sha256=sha,md5=hashlib.md5(image).hexdigest(),width=1,height=1,bytes=len(image))],frame_ref=dict(file=name,md5=hashlib.md5(body).hexdigest(),bytes=len(body)))
+    if manifest_mutation:manifest_mutation(j)
+    (root/'local/bridge/ui.json').write_text(json.dumps(j),encoding='utf-8')
+ui_fixture('good')
+ui_fixture('nan',lambda b:struct.pack_into('<f',b,72,float('nan')))
+ui_fixture('index',lambda b:struct.pack_into('<H',b,len(b)-2,4))
+ui_fixture('trailing',lambda b:b.append(0))
+ui_fixture('identity',lambda b:struct.pack_into('<I',b,40,43))
+ui_fixture('path',manifest_mutation=lambda j:j['frame_ref'].update(file='../other.uui'))
+ui_fixture('region',manifest_mutation=lambda j:j['native_regions'][0].update(rect=[-1,0,100,100]))
+ui_fixture('region-menu',manifest_mutation=lambda j:j['ui'].update(active_menus=['MenuDialog']))

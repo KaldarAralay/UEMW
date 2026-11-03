@@ -1,6 +1,6 @@
 import struct
 import unittest
-from native_environment import capture,light
+from native_environment import capture,light,select_lights
 
 class Memory:
     def __init__(self):
@@ -21,6 +21,33 @@ class Memory:
         raise AssertionError((p,n))
 
 class EnvironmentTests(unittest.TestCase):
+    def test_light_budget_uses_native_attenuation_not_selection_radius(self):
+        def item(i,x,radius=256,energy=1):
+            return dict(id=hex(i),kind=2,enabled=True,dimmer=1,position=[x,0,0],radius=radius,diffuse=[energy]*3,ambient=[0]*3,attenuation=[1,.01,0])
+        far=item(1,4000,4e9);near=item(2,100,32)
+        chosen=select_lights([far,near],[0,0,0],budget=1)
+        self.assertEqual([v['id']for v in chosen],['0x2'])
+        # A physically meaningful original source can still win at distance.
+        far['diffuse']=[1000]*3
+        self.assertEqual(select_lights([far,near],[0,0,0],budget=1)[0]['id'],'0x1')
+
+    def test_light_budget_hysteresis_keeps_current_identity_but_never_retired_light(self):
+        a=dict(id='0x1',kind=2,enabled=True,dimmer=1,position=[200,0,0],radius=32,diffuse=[1]*3,ambient=[0]*3,attenuation=[1,0,0])
+        b={**a,'id':'0x2','position':[210,0,0]}
+        self.assertEqual(select_lights([a,b],[110,0,0],previous=['0x2'],budget=1)[0]['id'],'0x2')
+        b['enabled']=False
+        self.assertEqual(select_lights([a,b],[110,0,0],previous=['0x2'],budget=1)[0]['id'],'0x1')
+        self.assertEqual(select_lights([a],[110,0,0],previous=['0x2'],budget=1)[0]['id'],'0x1')
+
+    def test_native_flicker_changes_shading_without_reshuffling_budget(self):
+        a=dict(id='0x1',kind=2,enabled=True,dimmer=1,position=[100,0,0],radius=32,diffuse=[1]*3,ambient=[0]*3,attenuation=[1,.01,0])
+        b={**a,'id':'0x2','position':[110,0,0]}
+        for dimmer in (1,.2,0,.9):
+            a['dimmer']=dimmer
+            selected=select_lights([a,b],[0,0,0],budget=1)
+            self.assertEqual(selected[0]['id'],'0x1')
+            self.assertEqual(selected[0]['dimmer'],dimmer)
+
     def setUp(self):
         self.memory=Memory();self.base=dict(world='0x10000',data='0x20000',cell_ptr='0x40000',camera=dict(position=[0,0,0],frustum=[-1,1,1,-1,1,7168]))
     def test_resolved_sun_fog_weather_and_native_water_are_copied(self):

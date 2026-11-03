@@ -8,8 +8,65 @@ import numpy as np
 from live_binary import encode,decode,HEADER,transform_bytes
 from frame_transport import FrameStore,resolve
 from skin_math import Skin
+from captured_states import CapturedStates
 
 class BinaryTests(unittest.TestCase):
+    def test_owned_capture_matches_generic_wire_and_never_reuses_mutated_source(self):
+        rng=np.random.default_rng(92);count=1024
+        transforms=rng.normal(size=(count,13)).astype('<f4');visible=np.arange(count)%3!=0
+        payloads={i:(dict(palette=np.eye(4,dtype='<f4')[:3],bound=[1,2,3,4]),)for i in range(1,count,9)}
+        owned=CapturedStates(transforms,visible,payloads)
+        p={**self.packet,'instance_states':owned};wire=encode(p)
+        self.assertEqual(wire,encode({**p,'instance_states':list(owned)},batch_transforms=False))
+        transforms[:]=123;visible[:]=False;payloads.clear()
+        self.assertEqual(wire,encode(p))
+        with self.assertRaises(ValueError):owned[1][1][0]=5
+        indices=np.arange(count,dtype=np.int32)*2+1
+        remapped=owned.remap(count*2,indices)
+        expected=[(False,)]*(count*2)
+        for i,row in zip(indices,owned):expected[i]=row
+        self.assertEqual(encode({**p,'instance_states':remapped}),encode({**p,'instance_states':expected},batch_transforms=False))
+        for invalid in (np.zeros(count,dtype=int),indices+count*2,indices.astype(float),indices[:-1]):
+            with self.assertRaises(ValueError):owned.remap(count*2,invalid)
+        next_capture=CapturedStates(transforms,visible,{})
+        self.assertNotEqual(wire,encode({**p,'instance_states':next_capture}))
+        self.assertTrue(all(row==[False]for row in decode(encode({**p,'instance_states':next_capture}),p)['instance_states']))
+        for bad in (float('nan'),float('inf'),1e9):
+            transforms[1,0]=bad;visible[1]=True
+            with self.assertRaises(ValueError):encode({**p,'instance_states':CapturedStates(transforms,visible,{})})
+
+    def test_batched_transforms_preserve_the_scalar_wire_for_mixed_fresh_states(self):
+        rng=np.random.default_rng(81);p=copy.deepcopy(self.packet);p['geometry_version']=6;p['instance_states']=[]
+        for i in range(1024):
+            t=rng.normal(size=13).tolist();t[i%13]=-0. if i%5==0 else t[i%13]
+            kind=i%6
+            row=[False]if kind==0 else [True,t]
+            if kind==2:row.append([1,2,3])
+            elif kind==3:row.extend(([1,2,3],[1,.5,0,1]))
+            elif kind==4:row.append(dict(palette=np.eye(4,dtype='<f4')[:3].reshape(1,3,4),bound=[1,2,3,4]))
+            elif kind==5:row.append(dict(points=[1,2,3],uvs=[-.25,.5],colors=[1,.5,0,1]))
+            p['instance_states'].append(row)
+        original=float(np.float32(p['instance_states'][1][1][9]))
+        raw=encode(p);self.assertEqual(raw,encode(p,batch_transforms=False))
+        transforms=np.asarray([row[1]if row[0]else [0.]*13 for row in p['instance_states']],dtype='<f4')
+        visibility=np.asarray([row[0]for row in p['instance_states']],dtype=bool)
+        payloads={i:tuple(row[2:])for i,row in enumerate(p['instance_states'])if len(row)>2}
+        typed={**p,'instance_states':CapturedStates(transforms,visibility,payloads)}
+        self.assertEqual(raw,encode(typed))
+        p['instance_states'][1][1][9]=123;p['instance_states'][2]=[False]
+        fresh=encode(p);self.assertNotEqual(raw,fresh);self.assertEqual(fresh,encode(p,batch_transforms=False))
+        self.assertEqual(decode(fresh,p)['instance_states'][2],[False])
+        self.assertEqual(decode(raw,p)['instance_states'][1][1][9],original)
+
+    def test_batched_validation_rejects_original_precision_overflow_and_wrong_types(self):
+        p=copy.deepcopy(self.packet);p['instance_states']=[[True,[1.]*13]for _ in range(128)]
+        for bad in (1e8+.1,-1e8-.1,float('nan'),float('inf'),-(2**63),2**64-1,'0.25',1+0j,None):
+            p['instance_states'][99][1][5]=bad
+            for batch in (False,True):
+                with self.subTest(value=bad,batch=batch),self.assertRaises(ValueError):encode(p,batch_transforms=batch)
+        p['instance_states'][99][1][5]=1e8
+        self.assertEqual(encode(p),encode(p,batch_transforms=False))
+
     def setUp(self):
         self.packet=dict(protocol='uemw.live',version=1,status='live',session=str(uuid.uuid4()),scene_epoch=str(uuid.uuid4()),
             pid=42,sequence=123,sample_unix_ns=1793497851123456789,geometry_version=5,

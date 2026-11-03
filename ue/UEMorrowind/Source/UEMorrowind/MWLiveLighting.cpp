@@ -86,6 +86,10 @@ void AMWLive::UpdateNativeLighting(const FMWEnvironmentState& Environment) {
         WaterFogMaterial->SetScalarParameterValue(TEXT("NativeExteriorFog"),ExteriorFogEnabled && !Interior && !NativeUnderwater && !VisualReference?1:0);
     }
     const auto Sun=P[1];const float Peak=FMath::Max3(Sun.X,Sun.Y,Sun.Z);
+    // Match the captured native horizon within the source caster envelope.
+    // Avoid a second hard 6000-unit edge inside the original visible range.
+    const float ShadowReach=FMath::Clamp(P[4].Y,512.f,ActiveCellKey.StartsWith(TEXT("exterior:"))?8192.f:4096.f);
+    if(FMath::Abs(NativeSun->DynamicShadowDistanceMovableLight-ShadowReach)>1.f)NativeSun->SetDynamicShadowDistanceMovableLight(ShadowReach);
     CelestialSunPeak=FMath::Max(0.f,Peak);
     const FVector Direction(P[2].X,P[2].Y,P[2].Z);
     NativeSun->SetWorldRotation(Direction.GetSafeNormal().Rotation());
@@ -98,7 +102,10 @@ void AMWLive::UpdateNativeLighting(const FMWEnvironmentState& Environment) {
         Settings.Add(MWNativeLightSettings(&P[(I+1)*8],LightingFidelityEnabled && NativeAttenuationMaterial,Interior?4096.f:1024.f));
         const auto& S=Settings.Last();
         const double Distance=FVector::Distance(S.Position,Camera->GetComponentLocation());
-        if(S.Kind>1 && S.Intensity>0 && Distance<S.Radius+1000)ShadowCandidates.Add({Environment.LightIds[I],Distance});
+        const auto* R=&P[(I+1)*8];
+        const double Nominal=Environment.LightNominalPeaks.IsValidIndex(I)?Environment.LightNominalPeaks[I]:FMath::Max3(R[2].X,R[2].Y,R[2].Z);
+        const double Importance=Nominal*MWNativeAttenuation(R[4],Distance);
+        if(S.Kind>1 && S.Intensity>0 && Distance<S.Radius+1000)ShadowCandidates.Add({Environment.LightIds[I],Distance,Importance});
     }
     auto Selected=MWChooseNativeShadows(ShadowCandidates,NativeShadowIds,EnhancedInterior || (!Interior && OutdoorLightingEnabled),EnhancedInterior?4:2);
     bool Same=Selected.Num()==NativeShadowIds.Num();for(const auto& Id:Selected)Same&=NativeShadowIds.Contains(Id);

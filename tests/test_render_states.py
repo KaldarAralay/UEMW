@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 from geometry_stream import Geometry
 from live_probe import SceneReadChanged
+from skin_math import Skin
 import numpy as np
 
 class StateTests(unittest.TestCase):
@@ -17,13 +18,10 @@ class StateTests(unittest.TestCase):
             struct.pack_into('<2I',data,0x98,*identity);raw[ptr]=data
         struct.pack_into('<H',raw[0x41000],0x14,1)
         struct.pack_into('<4f',raw[0x42000],0x1c,0,-1000,0,1)
-        class Skin:
-            shape=0x40000;root=0x40000;bones=(0x40000,)
-            def palette(self,worlds):
-                if set(worlds)!={0x40000}:raise AssertionError('Late/uncaptured pose')
-                return np.array([[[1,0,0,1],[0,1,0,2],[0,0,1,3]]],dtype='<f4')
-        geometry.records=[(p,identity,(p,),Skin()if p==0x40000 else None,0)for p in raw]
-        geometry.skins={'original':Skin()};geometry.transform_cache={};geometry.cell_definitions=[dict(key='exterior:0,0')]
+        skin=Skin.__new__(Skin);skin.shape=skin.root=0x40000;skin.bones=(0x40000,)
+        skin.skin_transform=np.eye(4);skin.skin_transform[:3,3]=[1,2,3];skin.binds=[np.eye(4)]
+        geometry.records=[(p,identity,(p,),skin if p==0x40000 else None,0)for p in raw]
+        geometry.skins={'original':skin};geometry.cell_definitions=[dict(key='exterior:0,0')]
         geometry.terrain_count=2;geometry.epoch='epoch';geometry.catalog='catalog';geometry.membership_hash='membership';geometry.catalog_history=[]
         geometry.assets=SimpleNamespace(meshes={},textures={})
         geometry.shapes=[];geometry.native_attributes={}
@@ -37,11 +35,22 @@ class StateTests(unittest.TestCase):
         geometry,_=self.fixture();result=geometry.snapshot({})
         rows=result['instance_states']
         self.assertEqual(rows[1:],[(False,),(False,)])
-        np.testing.assert_array_equal(rows[0][2]['palette'][0,:,3],[1.,2.,3.]);self.assertEqual(rows[0][1][10],10)
+        np.testing.assert_array_equal(rows[0][2]['palette'][0,:,3],[0.,10.,0.])
+        np.testing.assert_array_equal(rows[0][2]['palette'][1,:,3],[1.,12.,3.]);self.assertEqual(rows[0][1][10],10)
         self.assertEqual(result['stream_cells'][0]['visible'],1)
         self.assertEqual(result['geometry_stats']['instances'],3)
         self.assertEqual(result['geometry_stats']['frustum_culled'],1)
-        self.assertEqual(set(geometry.transform_cache),{0x40000})
+
+    def test_transforms_preserve_native_float_bits_and_own_each_capture(self):
+        geometry,raw=self.fixture()
+        values=(1.,0.,0.,0.,1.,0.,0.,0.,1.,.123456789,10.,1e-7,1.)
+        struct.pack_into('<13f',raw[0x40000],0x40,*values)
+        first=geometry.snapshot({})['instance_states'][0][1]
+        self.assertEqual(struct.pack('<13f',*first),bytes(raw[0x40000][0x40:0x74]))
+        struct.pack_into('<f',raw[0x40000],0x64,.987654321)
+        second=geometry.snapshot({})['instance_states'][0][1]
+        self.assertNotEqual(first[9],second[9])
+        self.assertEqual(first[9],struct.unpack('<f',struct.pack('<f',values[9]))[0])
 
     def test_hidden_address_reuse_still_invalidates_the_whole_pose(self):
         geometry,raw=self.fixture();struct.pack_into('<I',raw[0x41000],0x98,0xdeadbeef)

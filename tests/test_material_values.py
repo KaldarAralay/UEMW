@@ -56,7 +56,7 @@ class MaterialValueTests(unittest.TestCase):
                 return {0x10088:struct.pack('<2I',0x30000,0),0x20088:bytes(8),0x30018:struct.pack('<2I',0,0)}[p]
         scene=SceneReader(M());scene.ancestry=lambda ptr:['NiVertexColorProperty']
         props=scene.render_properties(0x10000,(1,2,3,2))
-        self.assertEqual(props,(1,2,3,0,0));self.assertEqual(scene.render_properties(0x20000,props),props)
+        self.assertEqual(props,(1,2,3,0,0,0));self.assertEqual(scene.render_properties(0x20000,props),props)
 
     def test_resolved_color_alpha_and_emission_follow_native_values(self):
         r=MaterialMemory();group=discover(r,r.shape());groups={group['id']:group}

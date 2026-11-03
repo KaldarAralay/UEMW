@@ -42,4 +42,5 @@ if(!$Controller){
     Set-Content -LiteralPath $ControllerFile $Controller.Id
 }
 Write-Output "Presentation controller PID: $($Controller.ProcessId ?? $Controller.Id); mode: $Mode"
-Write-Output 'Select original Morrowind once. Native UI uncovers automatically. Start-UEMW.cmd selects the fallback. No recording.'
+if($TwoWindows){Write-Output 'Keep original Morrowind focused; native UI remains beside the passive UE view. No recording.'}
+else{Write-Output 'Keep original Morrowind focused. UE presents its native HUD and menus; loading/unsupported UI uncovers the original. No recording.'}

@@ -6,6 +6,11 @@ from live_probe import SceneReadChanged
 from native_particles import capture,expand
 
 class ParticleTests(unittest.TestCase):
+    def test_corner_and_texture_orientation_matches_the_vanilla_draw_path(self):
+        sample=(1,1,1.,struct.pack('<3f',0,0,0),None,None,(1.,1.,1.,1.))
+        points,_=expand(sample,[1,0,0,0,1,0,0,0,1,0,0,0,1],dict(forward=[0,1,0],up=[0,0,1]))
+        # The native DX8 writer places UV(0,0) at camera-right/down.
+        np.testing.assert_array_equal(np.asarray(points).reshape(4,3),[[1,0,-1],[-1,0,-1],[-1,0,1],[1,0,1]])
     def test_retiring_emitter_does_not_drop_an_independent_current_emitter(self):
         class Memory:
             def read(self,p,n):
@@ -56,5 +61,11 @@ class ParticleTests(unittest.TestCase):
 
     def test_nonfinite_native_values_are_rejected(self):
         with self.assertRaises(ValueError):expand((1,1,1,struct.pack('<3f',float('nan'),0,0),None,None,(1,1,1,1)),[1,0,0,0,1,0,0,0,1,0,0,0,1],dict(forward=[0,1,0],up=[0,0,1]))
+
+    def test_reused_data_type_cannot_retain_particle_identity(self):
+        class Memory:
+            def read(self,p,n):
+                h=bytearray(0x44);struct.pack_into('<I',h,0,0x99999);return bytes(h)
+        with self.assertRaises(SceneReadChanged):capture(Memory(),[dict(particles=True,particle_capacity=2,model='0x10000',id='0x40000',particle_data_vtable=0x88888)])
 
 if __name__=='__main__':unittest.main()

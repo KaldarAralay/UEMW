@@ -2,7 +2,9 @@
 
 Layouts: pinned MWSE NIParticles.h / NIGeometryData.h. The original engine
 owns active count, positions, sizes and colors. Billboard expansion is visual
-translation only. Quaternion orientation and animated atlas UVs are deferred.
+translation only. The pinned vanilla DX8 draw path (0x6AD0A0) reads neither
+RotatingParticlesData.quaternions nor GeometryData.textureCoords. It expands
+camera-facing corners and fixed full-texture UVs even for rotating particles.
 """
 import math
 import struct
@@ -39,6 +41,8 @@ def capture(reader,shapes,tolerate=False):
     result={}
     for shape in particles:
         model=int(shape['model'],16);raw=reader.read(model,0x44)
+        table=struct.unpack_from('<I',raw)[0]
+        if 'particle_data_vtable'in shape and table!=shape['particle_data_vtable']:raise SceneReadChanged('Native particle data type changed')
         count,active,radius,pointers=header(raw,shape['particle_capacity'])
         xyz,color,sizes=pointers
         if not xyz:raise ValueError('Missing native particle vertices')
@@ -57,7 +61,7 @@ def capture(reader,shapes,tolerate=False):
         # Counts/pointers changing implies buffer reuse; drop rather than read
         # retired memory into a new emitter. The outer source-frame fence also
         # records/retries updates that overlap an original engine frame.
-        if header(end,count)[3]!=pointers or struct.unpack_from('<H',end,0x3c)[0]!=active:
+        if end[:4]!=raw[:4] or header(end,count)[3]!=pointers or struct.unpack_from('<H',end,0x3c)[0]!=active:
             raise SceneReadChanged('Native particle storage changed during capture')
         result[int(shape['id'],16)]=(count,active,radius,positions,colors,scales,tint)
     return result
@@ -78,7 +82,9 @@ def expand(sample,transform,camera):
         right=np.cross(forward,up);length=np.linalg.norm(right)
         if length<1e-8:raise ValueError('Invalid particle billboard basis')
         right/=length;up/=np.linalg.norm(up)
-        corners=np.array([-right-up,right-up,right+up,-right+up])
+        # Native 0x6AD395..6AD532: right-down, left-down, left-up,
+        # right-up, paired with UV (0,0),(1,0),(1,1),(0,1).
+        corners=np.array([right-up,-right-up,-right+up,right+up])
         half=scales*radius*abs(m[12])
         points[:active]=centers[:,None,:]+half[:,None,None]*corners[None,:,:]
         if bgra is not None:rgba[:active]=np.frombuffer(bgra,dtype=np.uint8).reshape(active,4)[:,[2,1,0,3]]/255.

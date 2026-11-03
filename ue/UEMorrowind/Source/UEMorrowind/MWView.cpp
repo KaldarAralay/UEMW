@@ -3,6 +3,7 @@
 #include "MWCamera.h"
 #include "MWMesh.h"
 #include "MWSkin.h"
+#include "MWTextureStages.h"
 #include "Camera/CameraComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -15,7 +16,7 @@ void AMWLive::EnsureRenderSelection() {
     ViewAssets.Empty();FrameAssets.Empty();ValueAssets.Empty();ViewInstances.Empty();FrameInstances.Empty();ValueInstances.Empty();AssetInstances.Empty();
     for(const auto& Pair:MeshData) {
         if(!TargetedRenderUpdates || Pair.Value.Background || Pair.Value.FirstPerson)ViewAssets.Add(Pair.Key);
-        if(!TargetedRenderUpdates || !Pair.Value.TextureFrameGroup.IsEmpty())FrameAssets.Add(Pair.Key);
+        if(!TargetedRenderUpdates || !Pair.Value.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(Pair.Value))FrameAssets.Add(Pair.Key);
         if(!TargetedRenderUpdates || !Pair.Value.MaterialValueGroup.IsEmpty())ValueAssets.Add(Pair.Key);
     }
     for(const auto& Pair:InstanceAssets) {

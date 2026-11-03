@@ -12,8 +12,8 @@ FString MWTerrainSignature(const TArray<FMWTerrainTile>& Tiles) {
     TArray<FString> Rows;for(const auto& T:Tiles)Rows.Add(FString::Printf(TEXT("%d,%d:%s:%s"),T.Tile.X,T.Tile.Y,*T.Texture,*T.SourceName));
     Rows.Sort();FString Text;for(const auto& R:Rows)Text+=R+TEXT("\n");return FMD5::HashAnsiString(*Text);
 }
-FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& AssetsPath,const FMWTextureUpgradeIndex& Upgrades,const FThreadSafeBool& Cancelled,const FString& KnownPool) {
-    if(!Tiles.Num() || Tiles.Num()>4096 || Cancelled)return nullptr;
+FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& AssetsPath,const FMWTextureUpgradeIndex& Upgrades,const FThreadSafeBool& Cancelled,const FString& KnownPool,int32 Resolution) {
+    if(!Tiles.Num() || Tiles.Num()>16384 || Cancelled || (Resolution!=256 && Resolution!=512))return nullptr;
     auto Out=MakeShared<FMWTerrainData,ESPMode::ThreadSafe>();Out->Signature=MWTerrainSignature(Tiles);Out->TileCount=Tiles.Num();
     FIntPoint Min=Tiles[0].Tile,Max=Min;TMap<FIntPoint,FString> Assignments;TMap<FString,FString> Names;
     for(const auto& T:Tiles) {
@@ -22,11 +22,11 @@ FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& 
         Assignments.Add(T.Tile,T.Texture);Names.Add(T.Texture,T.SourceName);
     }
     Out->Origin=Min;Out->Size=Max-Min+FIntPoint(1,1);Names.GetKeys(Out->Textures);Out->Textures.Sort();
-    if(Out->Size.X>64 || Out->Size.Y>64 || Out->Textures.Num()>64)return nullptr;
+    if(Out->Size.X>128 || Out->Size.Y>128 || Out->Textures.Num()>64)return nullptr;
     Out->Map.Init(FVector4f(0,0,0,0),Out->Size.X*Out->Size.Y);
     for(const auto& Pair:Assignments)Out->Map[(Pair.Key.Y-Min.Y)*Out->Size.X+Pair.Key.X-Min.X]=FVector4f(Out->Textures.IndexOfByKey(Pair.Value)+1,0,0,0);
     const int32 Layers=Out->Textures.Num();
-    FString PoolKey;
+    FString PoolKey=FString::FromInt(Resolution)+TEXT("\n");
     for(const auto& Key:Out->Textures){PoolKey+=Key+TEXT(":")+Names[Key]+TEXT("\n");const auto F=MWArtworkFinish(Names[Key]);Out->Finishes.Add(FVector4f(F.Roughness,F.Specular,F.DetailStrength,F.RoughnessVariation));}
     Out->PoolSignature=FMD5::HashAnsiString(*PoolKey);if(Out->PoolSignature==KnownPool)return Out;
     for(int32 Layer=0;Layer<Layers;++Layer) {
@@ -39,9 +39,9 @@ FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& 
         Image.GammaSpace=EGammaSpace::sRGB;
         TArray<FImage> OriginalMips,OriginalDetail;
         if(!MWBuildTextureMips(Image,OriginalMips,&Cancelled) || !MWBuildSurfaceDetail(OriginalMips,OriginalDetail,&Cancelled))return nullptr;
-        FImage DetailBase;OriginalDetail[0].ResizeTo(DetailBase,512,512,ERawImageFormat::BGRA8,EGammaSpace::Linear);
+        FImage DetailBase;OriginalDetail[0].ResizeTo(DetailBase,Resolution,Resolution,ERawImageFormat::BGRA8,EGammaSpace::Linear);
         FImage Enhanced;const bool Upgraded=MWTryTextureUpgrade(Upgrades,Key,Bytes,Image,Enhanced);if(Upgraded)Image=MoveTemp(Enhanced);
-        FImage Resized;Image.ResizeTo(Resized,512,512,ERawImageFormat::BGRA8,EGammaSpace::sRGB);
+        FImage Resized;Image.ResizeTo(Resized,Resolution,Resolution,ERawImageFormat::BGRA8,EGammaSpace::sRGB);
         TArray<FImage> Color,Detail;if(!MWBuildTextureMips(Resized,Color,&Cancelled) || !MWBuildTextureMips(DetailBase,Detail,&Cancelled))return nullptr;
         if(Layer==0)for(int32 M=0;M<Color.Num();++M){Out->Color.Emplace(Color[M].SizeX,Color[M].SizeY,Layers,ERawImageFormat::BGRA8,EGammaSpace::sRGB);Out->Detail.Emplace(Detail[M].SizeX,Detail[M].SizeY,Layers,ERawImageFormat::BGRA8,EGammaSpace::Linear);}
         for(int32 M=0;M<Color.Num();++M) {

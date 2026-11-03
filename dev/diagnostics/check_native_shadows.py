@@ -22,7 +22,14 @@ def pair(reader,label,roi):
     require_foreground(reader)
     report=dict(passed=False,recording=False,save_writes=False,roi=roi,shots=[])
     try:
-        if reader.player_render_state(reader.u32(0x7c67dc)).get('vanity'):pulse(reader,'key',0x11,.05)
+        world=reader.u32(0x7c67dc)
+        if reader.player_render_state(world).get('vanity'):
+            pulse(reader,'key',0x11,.12)
+            wait(lambda:not reader.player_render_state(world).get('vanity'),3)
+        if reader.player_render_state(world).get('third_person'):
+            pulse(reader,'key',0x0f,.15)
+        wait(lambda:reader.camera_sample()['first_person_active'],4)
+        time.sleep(.5)
         for enabled in(False,True):
             witness([],shadow_maps=enabled)
             def ready():
