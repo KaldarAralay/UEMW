@@ -12,7 +12,7 @@ from read_batch import RangeCapture
 NODE=np.dtype({'names':['table','flags','parent','bound','transform'],'formats':['<u4','<u2','<u4',('<f4',4),('<f4',13)],'offsets':[0,0x14,0x18,0x1c,0x40],'itemsize':0x74})
 
 class PoseLayout:
-    def __init__(self,records,view_pointers=(),read_plan=None,switches=None,water_pointers=(),node_identities=None,player_pointers=(),water_visibility_roots=(),actor_owners=None,native_light_states=None,shadow_casters=(),shadow_distance=0,near_pass_camera=False):
+    def __init__(self,records,view_pointers=(),read_plan=None,switches=None,water_pointers=(),node_identities=None,player_pointers=(),water_visibility_roots=(),actor_owners=None,native_light_states=None,shadow_casters=(),shadow_distance=0,near_pass_camera=False,cell_root_owners=None):
         self.records=records
         self.near_pass_camera=near_pass_camera
         self.switches=switches
@@ -28,6 +28,7 @@ class PoseLayout:
         self.node_identities=np.asarray([(node_identities or{}).get(p,(0,0))for p in self.pointers],dtype='<u4').reshape(-1,2)
         self.node_known=np.asarray([p in(node_identities or{})for p in self.pointers],dtype=bool)
         self.actor_owners={p:v for p,v in (actor_owners or{}).items()if p in self.index}
+        self.cell_root_owners={p:v for p,v in (cell_root_owners or{}).items()if p in self.index}
         self.expected=np.asarray([r[1]for r in records],dtype='<u4').reshape(-1,2)
         self.native_light_states={p:v for p,v in(native_light_states or{}).items()if p in self.shape_index}
         self.expected_light_states=np.asarray(list(self.native_light_states.values()),dtype='<u4')
@@ -106,6 +107,13 @@ class PoseFrame(Mapping):
             # Reference identity/node pointer is the membership fence. Actor
             # render-parent changes must not masquerade as object removal.
             if matches(raw.get(owner['reference'],b''),owner['identity']):bad_parent[n]=False
+            else:bad_owner[n]=True
+        from node_ownership import cell_root_matches
+        for p,checks in layout.cell_root_owners.items():
+            n=layout.index[p]
+            # Morrowind borrows whole cell roots for secondary render passes.
+            # TES cell slots, not the pass-local parent, own their lifetime.
+            if cell_root_matches(raw,checks):bad_parent[n]=False
             else:bad_owner[n]=True
         invalid=bad_owner|(layout.node_known&((self.nodes['table']!=layout.node_identities[:,0])|bad_parent))
         blocked=replaced.copy()

@@ -112,10 +112,14 @@ class GraphTests(unittest.TestCase):
                     struct.pack_into('<2I',shape,0x98,p+0x600,0);m.put(p+0x200,shape)
                     model=bytearray(0x36);struct.pack_into('<H',model,8,3);struct.pack_into('<H',model,0x34,1);m.put(p+0x600,model)
                 m.put(p,header)
-            cells.append(dict(key=f'exterior:{grid[0]},{grid[1]}',roots=roots,cell_ptr=hex(0x20000+index*0x1000)))
+            cell=0x20000+index*0x1000;land=cell+0x400
+            header=bytearray(0x1c);struct.pack_into('<I',header,0,int(roots[0],16));struct.pack_into('<I',header,0xc,land);struct.pack_into('<I',header,0x18,int(roots[1],16))
+            m.put(cell+0x14,header);m.put(land+0x10,struct.pack('<I',int(roots[2],16)))
+            cells.append(dict(key=f'exterior:{grid[0]},{grid[1]}',roots=roots,cell_ptr=hex(cell)))
         reader=SceneReader(m);reader.types={0xaaa:['NiNode'],0xbbb:['NiTriShape']}
         scene=reader.collect(cells=cells)
         self.assertFalse(scene['errors']);self.assertEqual(len(scene['shapes']),4)
+        self.assertEqual(len(scene['cell_root_owners']),6)
         for c in cells:
             members=[s for s in scene['shapes'] if s['cell_key']==c['key']]
             self.assertEqual(len(members),2);self.assertEqual(sum(s['terrain']for s in members),1)

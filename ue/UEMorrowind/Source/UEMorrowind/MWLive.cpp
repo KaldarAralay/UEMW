@@ -215,6 +215,7 @@ struct FMWDecodedFrame {
     TSharedPtr<FJsonObject> Packet;
     TArray<FMWGeometryState> States;
     TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> Bindings;
+    TSharedPtr<const TMap<FString,int32>,ESPMode::ThreadSafe> BindingIndex;
     FMWEnvironmentState Environment;
     TMap<FString,int32> MaterialFrames;
     bool HaveMaterialFrames=false;
@@ -237,6 +238,7 @@ struct FMWFrameReader {
     FMWChannelReader Channel;
     FString BindingName,BindingDigest;
     TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> BindingCache;
+    TSharedPtr<const TMap<FString,int32>,ESPMode::ThreadSafe> BindingIndexCache;
     FString Path;
     FCriticalSection Mutex;
     FThreadSafeBool StopRequested=false;
@@ -303,12 +305,16 @@ struct FMWFrameReader {
                                 else {
                                     if(!BindingCache.IsValid() || BindingName!=Name || BindingDigest!=Digest) {
                                         auto Rows=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>();
-                                        if(MWReadCatalogBindings(Name,Digest,FPaths::GetPath(FPaths::GetPath(Path))/TEXT("assets"),*Rows)){BindingCache=Rows;BindingName=Name;BindingDigest=Digest;}
+                                        if(MWReadCatalogBindings(Name,Digest,FPaths::GetPath(FPaths::GetPath(Path))/TEXT("assets"),*Rows)){
+                                            auto Index=MakeShared<TMap<FString,int32>,ESPMode::ThreadSafe>();Index->Reserve(Rows->Num());
+                                            for(int32 I=0;I<Rows->Num();++I)Index->Add((*Rows)[I].Id,I);
+                                            BindingCache=Rows;BindingIndexCache=Index;BindingName=Name;BindingDigest=Digest;
+                                        }
                                         else Result.Error=TEXT("INVALID NATIVE BINDING TABLE");
                                     }
                                     if(Result.Error.IsEmpty()) {
                                         if(BindingCache->Num()!=Result.States.Num())Result.Error=TEXT("NATIVE BINDING COUNT MISMATCH");
-                                        else Result.Bindings=BindingCache;
+                                        else {Result.Bindings=BindingCache;Result.BindingIndex=BindingIndexCache;}
                                     }
                                 }
                             }
@@ -384,11 +390,42 @@ AMWLive::AMWLive() {
     Camera->PostProcessSettings.bOverride_AmbientOcclusionRadiusInWS=true;Camera->PostProcessSettings.AmbientOcclusionRadiusInWS=true;
 }
 
-AMWLive::~AMWLive() {delete CameraReader;CameraReader=nullptr;delete FrameReader;FrameReader=nullptr;delete CatalogLoader;CatalogLoader=nullptr;}
+struct FMWPresentationHost {double Stamp=0;bool Separate=false;};
+struct FMWPresentationWriter {
+    TFuture<FMWPresentationHost> Write;
+    FMWPresentationHost Host;
+    ~FMWPresentationWriter(){if(Write.IsValid())Write.Wait();}
+    void Poll(){if(Write.IsValid() && Write.IsReady())Host=Write.Get();}
+    void Submit(const FString& Path,FString Text) {
+        // One bounded in-flight write; never accumulate old live heartbeats.
+        // The sampled timestamp travels unchanged through a delayed write.
+        if(Write.IsValid() && !Write.IsReady())return;
+        Poll();
+        const uint32 Owner=FPlatformProcess::GetCurrentProcessId();
+        Write=Async(EAsyncExecution::ThreadPool,[Path,Owner,Text=MoveTemp(Text)](){
+            TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_WritePresentationState);
+            FMWPresentationHost Result;const FString Folder=FPaths::GetPath(Path);
+            FString Body;TSharedPtr<FJsonObject> Json;double Stamp=0,Pid=0;
+            if(MWReadSnapshot(Folder/TEXT("presentation.json"),Body,16384) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Body),Json) && Json.IsValid() &&
+                Json->TryGetNumberField(TEXT("unix_ns"),Stamp) && FMath::IsFinite(Stamp) && Json->TryGetNumberField(TEXT("renderer_pid"),Pid) && Pid==Owner)Result.Stamp=Stamp/1e9;
+            Body.Empty();Json.Reset();FString Mode;
+            if(MWReadSnapshot(Folder/TEXT("presentation-mode.json"),Body,8192) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Body),Json) && Json.IsValid() && Json->TryGetStringField(TEXT("mode"),Mode))Result.Separate=Mode==TEXT("side-by-side");
+            if(FFileHelper::SaveStringToFile(Text,*(Path+TEXT(".tmp")),FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM)) {
+#if PLATFORM_WINDOWS
+                MoveFileExW(*(Path+TEXT(".tmp")),*Path,MOVEFILE_REPLACE_EXISTING);
+#endif
+            }
+            return Result;
+        });
+    }
+};
+
+AMWLive::~AMWLive() {delete PresentationWriter;PresentationWriter=nullptr;delete CameraReader;CameraReader=nullptr;delete FrameReader;FrameReader=nullptr;delete CatalogLoader;CatalogLoader=nullptr;}
 
 void AMWLive::EndPlay(const EEndPlayReason::Type Reason) {
     BackgroundView.Reset();
     ClearPrimitiveFilters();
+    delete PresentationWriter;PresentationWriter=nullptr;
     delete CameraReader;CameraReader=nullptr;delete FrameReader;FrameReader=nullptr;delete CatalogLoader;CatalogLoader=nullptr;
     Super::EndPlay(Reason);
 }
@@ -428,6 +465,8 @@ void AMWLive::BeginPlay() {
     CameraReader=new FMWCameraReader(FPaths::GetPath(SnapshotPath)/TEXT("camera.json"));
     CreateGeometryMaterial();
     DiagnosticScreenshots=FParse::Param(FCommandLine::Get(),TEXT("UEMWDiagnosticScreenshots"));
+    DiagnosticMembership=FParse::Param(FCommandLine::Get(),TEXT("UEMWDiagnosticMembership")) || FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_MEMBERSHIP_DIAGNOSTICS"))==TEXT("1");
+    DiagnosticVisibility=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_VISIBILITY_DIAGNOSTICS"))==TEXT("1");
     if(FParse::Param(FCommandLine::Get(),TEXT("UEMWPresentationStats")))PresentationSamples=MakeShared<FMWPresentationSamples,ESPMode::ThreadSafe>();
     FParse::Value(FCommandLine::Get(),TEXT("UEMWRecordSeconds="),RecordSeconds);
     RecordSeconds=FMath::Clamp(RecordSeconds,0,600);
@@ -443,6 +482,8 @@ void AMWLive::BeginPlay() {
 }
 
 void AMWLive::HideScene() {
+    if(SceneShown)UE_LOG(LogTemp,Warning,TEXT("UEMW scene hidden seq=%lld catalog=%s reason=%s"),Sequence,*Catalog,*Status);
+    SceneShown=false;
     InvalidateWaterReflection();
     if(WaterFogMaterial)WaterFogMaterial->SetScalarParameterValue(TEXT("NativeWaterFogActive"),0);
     SetLightingVisible(false);
@@ -458,6 +499,8 @@ void AMWLive::HideScene() {
 }
 
 void AMWLive::ShowScene() {
+    if(!SceneShown)UE_LOG(LogTemp,Display,TEXT("UEMW scene restored seq=%lld catalog=%s"),Sequence,*Catalog);
+    SceneShown=true;
     if(WaterFogMaterial)WaterFogMaterial->SetScalarParameterValue(TEXT("NativeWaterFogActive"),WaterFogMode);
     SetLightingVisible(true);
     if(auto* PC=GetWorld()->GetFirstPlayerController())PC->HiddenActors.Remove(this);
@@ -473,9 +516,13 @@ void AMWLive::RejectGeometry() {
 
 void AMWLive::ResetScene() {
     NativeMenuOpen=true;HavePlayerStats=false;
-    NativePoseValid=false;AppliedNativeStates.Empty();AppliedNativeCatalog.Empty();
+    NativePoseValid=false;AppliedNativeStates.Empty();AppliedNativeBindings.Empty();AppliedNativeCatalog.Empty();NativeResourceInvalidations.Empty();
+    SourceBindingSnapshot.Reset();CatalogBindingSnapshot.Reset();AppliedBindingSnapshot.Reset();SourceBindingCatalog.Empty();
+    BindingTraits.Empty();BindingTraitsCatalog.Empty();PreparedPoseRemap.Empty();PreparedPoseSourceCatalog.Empty();PreparedPoseSourceCount=0;
+    RetainedGeometryIndices.Empty();RetainedGeometryScratch.Empty();RetainedIncomingCatalog.Empty();RetainedIncomingDigest.Empty();RetainedTargetCatalog.Empty();RetainedIncomingCount=0;
     ClearPrimitiveFilters();
     ResourceJobs.Empty();QueuedResources.Empty();ResourceBindings.Empty();ResourceJobIndex=0;ResourceCatalog.Empty();ResourceError.Empty();
+    PreparedResourceBindings.Empty();PreparedResourceCatalog.Empty();
     RequestedCatalog.Empty();GeometryPartial=false;PendingGeometryInstances=0;
     delete CatalogLoader;CatalogLoader=nullptr;
     const bool HadAssets=GeometryComponents.Num()>0 || MeshData.Num()>0;
@@ -485,7 +532,7 @@ void AMWLive::ResetScene() {
     for(auto& Pair:Markers)Pair.Value->DestroyComponent();
     GeometryComponents.Empty();Markers.Empty();InstanceAssets.Empty();InstanceCells.Empty();LastRigidTransforms.Empty();GeometryBindings.Empty();
     MeshData.Empty();GeometryMaterials.Empty();GeometryTextures.Empty();MaskedTextures.Empty();BlendTextures.Empty();DetailTextures.Empty();UpgradedTextureKeys.Empty();Catalog.Empty();SceneEpoch.Empty();
-    ViewAssets.Empty();FrameAssets.Empty();ValueAssets.Empty();ViewInstances.Empty();FrameInstances.Empty();ValueInstances.Empty();RenderSelectionDirty=true;
+    ViewAssets.Empty();FrameAssets.Empty();ValueAssets.Empty();ViewInstances.Empty();FrameInstances.Empty();ValueInstances.Empty();AssetInstances.Empty();RenderSelectionDirty=true;
     RainPoses.Empty();
     TerrainColorPool=PendingTerrainColorPool=nullptr;TerrainDetailPool=PendingTerrainDetailPool=nullptr;TerrainTileMap=TerrainFinishes=nullptr;TerrainSignature.Empty();TerrainPoolSignature.Empty();TerrainLayers=TerrainTiles=0;TerrainPoolBytes=0;
     SharedMeshes.Empty();RigidBatches.Empty();RigidSlots.Empty();VisibleInstances.Empty();
@@ -602,9 +649,14 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         const FString UpgradeFolder=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_TEXTURE_UPGRADES"))==TEXT("0")?FString():FPaths::GetPath(AssetsPath)/TEXT("texture-upgrades");
         const auto Upgrades=Loader.UpgradeIndex;
         const FString KnownTerrain=TerrainSignature,KnownPool=TerrainPoolSignature;
+        const FString PoseSourceCatalog=Catalog;
+        auto PoseSourceBindings=CatalogBindingSnapshot;
+        if(!PoseSourceBindings.IsValid() || PoseSourceBindings->Num()!=GeometryBindings.Num())PoseSourceBindings=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>(GeometryBindings);
         const FThreadSafeBool* Cancel=&Loader.Cancelled;
-        Loader.Future=Async(EAsyncExecution::ThreadPool,[Name,Folder,KnownMeshes=MoveTemp(KnownMeshes),KnownTextures=MoveTemp(KnownTextures),Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool]() {
-            return MWReadCatalog(Name,Folder,KnownMeshes,KnownTextures,*Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool);
+        Loader.Future=Async(EAsyncExecution::ThreadPool,[Name,Folder,KnownMeshes=MoveTemp(KnownMeshes),KnownTextures=MoveTemp(KnownTextures),Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool,PoseSourceCatalog,PoseSourceBindings=MoveTemp(PoseSourceBindings)]() {
+            auto Data=MWReadCatalog(Name,Folder,KnownMeshes,KnownTextures,*Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool);
+            if(Data.IsValid() && !*Cancel && MWBuildPoseRemap(*PoseSourceBindings,Data->Bindings,Data->PoseRemap)){Data->PoseSourceCatalog=PoseSourceCatalog;Data->PoseSourceCount=PoseSourceBindings->Num();}
+            return Data;
         });
         return false;
     }
@@ -627,9 +679,10 @@ bool AMWLive::LoadCatalog(const FString& Name) {
     if(!Loader.BindingsCommitted) {
         // The background decoder validated every definition and image. Adopt
         // binding order and CPU metadata together before constructing UObjects.
-        for(auto& Pair:Data.Meshes){if(Pair.Value.FirstPerson && ViewCachedAssets.Num()<128)ViewCachedAssets.Add(Pair.Key);MeshData.Add(Pair.Key,MoveTemp(Pair.Value));}
+        EnsureRenderSelection();
+        for(auto& Pair:Data.Meshes){const auto& D=Pair.Value;SetRenderAssetTraits(Pair.Key,(!TargetedRenderUpdates || D.Background || D.FirstPerson?1:0)|(!TargetedRenderUpdates || !D.TextureFrameGroup.IsEmpty()?2:0)|(!TargetedRenderUpdates || !D.MaterialValueGroup.IsEmpty()?4:0));if(D.FirstPerson && ViewCachedAssets.Num()<128)ViewCachedAssets.Add(Pair.Key);MeshData.Add(Pair.Key,MoveTemp(Pair.Value));}
         Data.Meshes.Empty();
-        for(auto It=MeshData.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key()))It.RemoveCurrent();
+        for(auto It=MeshData.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key())){SetRenderAssetTraits(It.Key(),0);It.RemoveCurrent();}
         for(auto It=GeometryMaterials.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()) && !ViewCachedAssets.Contains(It.Key()))It.RemoveCurrent();
         for(auto It=GeometryTextures.CreateIterator();It;++It)if(!Data.WantedTextures.Contains(It.Key()))It.RemoveCurrent();
         for(auto It=MaskedTextures.CreateIterator();It;++It)if(!Data.WantedMaskedTextures.Contains(It.Key()))It.RemoveCurrent();
@@ -637,7 +690,13 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         for(auto It=DetailTextures.CreateIterator();It;++It)if(!Data.WantedDetailTextures.Contains(It.Key()))It.RemoveCurrent();
         for(auto It=AppliedMaterialFrames.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
         for(auto It=AppliedMaterialValues.CreateIterator();It;++It)if(!Data.WantedAssets.Contains(It.Key()))It.RemoveCurrent();
-        GeometryBindings=MoveTemp(Data.Bindings);Catalog=Name;Loader.BindingsCommitted=true;RenderSelectionDirty=true;
+        GeometryBindings=MoveTemp(Data.Bindings);Catalog=Name;Loader.BindingsCommitted=true;
+        CatalogBindingSnapshot=SourceBindingCatalog==Catalog && SourceBindingSnapshot.IsValid() && SourceBindingSnapshot->Num()==GeometryBindings.Num()?SourceBindingSnapshot:nullptr;
+        RenderSelectionCatalog=Catalog;RenderSelectionMeshes=MeshData.Num();RenderSelectionInstances=InstanceAssets.Num();RenderSelectionDirty=false;
+        PreparedPoseSourceCatalog=MoveTemp(Data.PoseSourceCatalog);PreparedPoseSourceCount=Data.PoseSourceCount;PreparedPoseRemap=MoveTemp(Data.PoseRemap);
+        PreparedResourceCatalog=Catalog;PreparedResourceBindings=MoveTemp(Data.BindingAssets);
+        BindingTraits.SetNum(GeometryBindings.Num());BindingTraitsCatalog=Catalog;
+        for(int32 I=0;I<GeometryBindings.Num();++I){const auto& D=MeshData[GeometryBindings[I].Asset];BindingTraits[I]=(D.FirstPerson?1:0)|(D.Rain?2:0)|(!D.MaterialValueGroup.IsEmpty() || !D.TextureFrameGroup.IsEmpty()?4:0);}
         UpgradedTextureKeys=Data.UpgradedTextures;TextureUpgradeReservedBytes=Data.UpgradeReservedBytes;TextureUpgradeBudgetSkipped=Data.UpgradeBudgetSkipped;
         CelestialSunIds.Empty();for(const auto& B:GeometryBindings)if(const auto* M=MeshData.Find(B.Asset))if(M->CelestialKind==4)CelestialSunIds.Add(B.Id);
         return true; // No placeholder becomes visible merely by adopting bindings.
@@ -798,7 +857,7 @@ bool AMWLive::ApplyMaterialValues(const TMap<FString,FMWMaterialValue>& Values) 
     return true;
 }
 
-bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native,const TMap<FString,int32>* MaterialFrames,const TMap<FString,FMWMaterialValue>* MaterialValues,const TArray<FMWBinding>* IncomingBindings) {
+bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native,const TMap<FString,int32>* MaterialFrames,const TMap<FString,FMWMaterialValue>* MaterialValues,const TArray<FMWBinding>* IncomingBindings,const TMap<FString,int32>* IncomingIndex) {
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UpdateGeometry);
     double PartBegan=FPlatformTime::Seconds();GeometryCpuMs.Empty();
     auto Part=[&](const TCHAR* Name){const double T=FPlatformTime::Seconds();GeometryCpuMs.Add(Name,(T-PartBegan)*1000);PartBegan=T;};
@@ -811,12 +870,22 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     if(MaterialValues)CurrentMaterialValues=*MaterialValues;
     const FString Name=Packet->GetStringField(TEXT("scene_catalog"));
     RequestedCatalog=Name;
-    bool Retained=false;int32 RetainedMissing=0;TArray<FMWGeometryState> RetainedStates;
+    bool Retained=false;int32 RetainedMissing=0;
     if(Name!=Catalog && !LoadCatalog(Name)) {
         // Every surviving object receives the NEW native pose, remapped by
         // exact id AND asset. Removed/replaced objects become hidden. This is
         // never a fallback to a previously accepted pose or across an epoch.
-        if(!GeometryLoading || !ResourceError.IsEmpty() || Catalog.IsEmpty() || !Native || !IncomingBindings || !MWRemapRetainedGeometry(*IncomingBindings,*Native,GeometryBindings,RetainedStates,RetainedMissing))return false;
+        if(!GeometryLoading || !ResourceError.IsEmpty() || Catalog.IsEmpty() || !Native || !IncomingBindings || Native->Num()!=IncomingBindings->Num())return false;
+        FString Digest;Packet->TryGetStringField(TEXT("scene_catalog_md5"),Digest);
+        // Only immutable binding indices are cached. Pose bytes below are
+        // replaced from every fresh frame, including creation/removal/hides.
+        if(Digest.IsEmpty() || RetainedIncomingCatalog!=Name || RetainedIncomingDigest!=Digest || RetainedTargetCatalog!=Catalog || RetainedIncomingCount!=IncomingBindings->Num()) {
+            if(!MWBuildRetainedRemap(*IncomingBindings,GeometryBindings,RetainedGeometryIndices,IncomingIndex))return false;
+            RetainedIncomingCatalog=Name;RetainedIncomingDigest=Digest;RetainedTargetCatalog=Catalog;RetainedIncomingCount=IncomingBindings->Num();
+        }
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RemapRetainedFrame);
+        if(!MWApplyRetainedRemap(*Native,RetainedGeometryIndices,RetainedGeometryScratch,RetainedMissing))return false;
+        auto& RetainedStates=RetainedGeometryScratch;
         int32 Ready=0;
         for(int32 I=0;I<RetainedStates.Num();++I)if(RetainedStates[I].Visible) {
             const auto* Data=MeshData.Find(GeometryBindings[I].Asset);
@@ -829,10 +898,11 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     }
     if(CatalogLoader && CatalogLoader->Name==Name && !CatalogLoader->Error.IsEmpty())return false;
     if(!Native && CatalogStaging()){GeometryLoading=true;return false;}
+    const bool DenseTraits=BindingTraitsCatalog==Catalog && BindingTraits.Num()==GeometryBindings.Num();
     TSet<FString> RequiredAssets;
-    if(Native) {
+    if(Native && !Retained) {
         if(Native->Num()!=GeometryBindings.Num())return false;
-        for(int32 I=0;I<Native->Num();++I)if((*Native)[I].Visible)RequiredAssets.Add(GeometryBindings[I].Asset);
+        for(int32 I=0;I<Native->Num();++I)if((*Native)[I].Visible && (!DenseTraits || (BindingTraits[I]&4)))RequiredAssets.Add(GeometryBindings[I].Asset);
     }
     for(const auto& Pair:MeshData) {
         if(Retained)continue; // visible retained dependencies were checked above
@@ -855,10 +925,21 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     if(Compact && StateCount!=GeometryBindings.Num())return false;
     if(StateCount>16384) return false;
     TBitArray<> Unchanged;
-    const bool Reuse=NativePoseReuseEnabled && Native && AppliedNativeCatalog==Catalog &&
-        ResourceCatalog==Catalog && ResourceError.IsEmpty() && AppliedNativeStates.Num()==StateCount;
+    TArray<FMWGeometryState> Rebased;TBitArray<> CacheMatches;bool RebasedCache=false;
+    if(NativePoseReuseEnabled && Native && AppliedNativeCatalog!=Catalog && ResourceError.IsEmpty()) {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RebasePoseCache);
+        if(PreparedPoseSourceCatalog==AppliedNativeCatalog && PreparedPoseSourceCount==AppliedNativeStates.Num() && PreparedPoseRemap.Num()==GeometryBindings.Num())
+            RebasedCache=MWMovePoseCache(AppliedNativeStates,PreparedPoseRemap,Rebased,CacheMatches);
+        else RebasedCache=MWRebasePoseCache(AppliedBindingSnapshot.IsValid()?*AppliedBindingSnapshot:AppliedNativeBindings,AppliedNativeStates,GeometryBindings,Rebased,CacheMatches);
+    }
+    const auto& Cached=RebasedCache?Rebased:AppliedNativeStates;
+    const bool Reuse=NativePoseReuseEnabled && Native && ResourceError.IsEmpty() && Cached.Num()==StateCount &&
+        (RebasedCache || (AppliedNativeCatalog==Catalog && ResourceCatalog==Catalog));
+    // Catalog promotion can reorder or add a handful of bindings. Exact old
+    // ID/asset/cell matches may still skip component work, but only after byte
+    // comparison against THIS fresh source frame and resource invalidations.
     if(Reuse){Unchanged.Init(false,StateCount);for(int32 I=0;I<StateCount;++I){const auto& B=GeometryBindings[I];const auto& S=(*Native)[I];
-        Unchanged[I]=!MeshData[B.Asset].FirstPerson && MWGeometryStateEqual(AppliedNativeStates[I],S) && (HadNativePose || (InstanceSubmitted(B.Id)==S.Visible && (!S.Visible || GeometryResourceReady(B,S))));}}
+        Unchanged[I]=(!RebasedCache || CacheMatches[I]) && (DenseTraits?!(BindingTraits[I]&1):!MeshData[B.Asset].FirstPerson) && MWGeometryStateEqual(Cached[I],S) && !NativeResourceInvalidations.Contains(B.Id) && (HadNativePose || (InstanceSubmitted(B.Id)==S.Visible && (!S.Visible || GeometryResourceReady(B,S))));}}
     if(Native && !EnsureGeometryResources(*Native,Reuse?&Unchanged:nullptr))return false;
     // The complete-world read has no coherent arms-camera capture. While the
     // separately fenced near lane is fresh, it exclusively owns those poses.
@@ -871,14 +952,14 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     ON_SCOPE_EXIT {const double T=FPlatformTime::Seconds();FlushRigidBatches();GeometryCpuMs.Add(TEXT("rigid_flush"),(FPlatformTime::Seconds()-T)*1000);};
     double RainStamp=0;Packet->TryGetNumberField(TEXT("sample_unix_ns"),RainStamp);RainStamp/=1e9;
     for(int32 Index=0;Index<StateCount;++Index) {
-        if(Native && (*Native)[Index].Visible) {
+        if(Native && (*Native)[Index].Visible && (!DenseTraits || (BindingTraits[Index]&2))) {
             const auto& B=GeometryBindings[Index];const auto* D=MeshData.Find(B.Asset);
             if(D && D->Rain && GeometryComponents.Contains(B.Id)) {
                 double M[13];for(int32 J=0;J<13;++J)M[J]=(*Native)[Index].Transform[J];
                 if(MWCanInstance(M))MWCaptureRainPose(RainPoses.FindOrAdd(B.Id),MWNativeTransform(M),RainStamp,LastCameraStamp);
             }
         }
-        if(Reuse && Unchanged[Index]){if(Reconcile)Present.Add(GeometryBindings[Index].Id);++PerfNativeStateReused;continue;}
+        if(Reuse && Unchanged[Index]){++PerfNativeStateReused;continue;}
         if(Native)++PerfNativeStateChanged;
         const auto Value=Native?TSharedPtr<FJsonValue>():Instances[Index];
         const auto Instance=Compact?TSharedPtr<FJsonObject>():Value->AsObject();
@@ -892,19 +973,19 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         else InstanceCells.Remove(Id);
         const auto* Data=MeshData.Find(Asset);
         if(!Data) return false;
-        if(Reconcile)Present.Add(Id);
+        if(Reconcile && !Native)Present.Add(Id);
         if(PreserveView && Data->FirstPerson && ViewLaneIds.Contains(Id))continue;
         const bool Visible=(Typed?Typed->Visible:Compact?(*Row)[0]->AsBool():Instance->GetBoolField(TEXT("visible"))) && (!Data->Background || BackgroundGeometryVisible);
+        if(DiagnosticVisibility && !Visible && SkinnedComponents.Contains(Id) && InstanceSubmitted(Id))UE_LOG(LogTemp,Display,TEXT("UEMW source hide seq=%lld id=%s asset=%s"),Sequence,*Id,*Asset);
         if(Visible && Data->NativeVertices && (!Typed || Typed->Points.Num()!=Data->Vertices.Num()*3 ||
             (Typed->Colors.Num()>0)!=Data->NativeColors || (Typed->UVs.Num()>0)!=Data->NativeUVs))return false;
-        if(Typed && Visible && !GeometryResourceReady(GeometryBindings[Index],*Typed)){HideInstance(Id);continue;}
+        if(Typed && Visible && !GeometryResourceReady(GeometryBindings[Index],*Typed)){if(DiagnosticVisibility && SkinnedComponents.Contains(Id) && InstanceSubmitted(Id))UE_LOG(LogTemp,Display,TEXT("UEMW resource hide seq=%lld id=%s asset=%s"),Sequence,*Id,*Asset);HideInstance(Id);continue;}
         if(Visible)VisibleInstances.Add(Id);else VisibleInstances.Remove(Id);
         if(auto* Slot=RigidSlots.Find(Id))if(Slot->Asset!=Asset)RemoveRigid(Id);
         const bool AssetChanged=InstanceAssets.FindRef(Id)!=Asset;
         if(AssetChanged) {
-            RenderSelectionDirty=true;
             RainPoses.Remove(Id);
-            InstanceAssets.Add(Id,Asset);LastRigidTransforms.Remove(Id);
+            SetInstanceAsset(Id,Asset);LastRigidTransforms.Remove(Id);
             UploadedBonePalettes.Remove(Id);
             UploadedVertexPoses.Remove(Id);
             if(auto** Old=SkinnedComponents.Find(Id))(*Old)->DestroyComponent();SkinnedComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);
@@ -1006,7 +1087,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         if(!Visible) {
             if(BindingChanged) {
                 Component->ClearAllMeshSections();
-                InstanceAssets.Add(Id,Asset);LastRigidTransforms.Remove(Id);
+                SetInstanceAsset(Id,Asset);LastRigidTransforms.Remove(Id);
                 if(!Component->IsRegistered())Component->RegisterComponent();
             }
             continue;
@@ -1076,7 +1157,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             ++NewResources;
             if(!Component->IsRegistered())Component->RegisterComponent();
             if(GeometryComponents.Num()<=3) UE_LOG(LogTemp,Display,TEXT("UEMW mesh %s verts=%d triangles=%d origin=%s bounds=%s"),*Id,World.Num(),Data->Triangles.Num()/3,*Component->GetComponentLocation().ToString(),*Component->Bounds.ToString());
-            InstanceAssets.Add(Id,Asset);
+            SetInstanceAsset(Id,Asset);
         } else {
             // Creation already preserves raw native vertex channels. UE's
             // update overload defaults to sRGB conversion, unlike creation.
@@ -1089,10 +1170,10 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     Part(TEXT("submit_changed"));
     if(Reconcile && !Native) {
     for(auto It=GeometryComponents.CreateIterator();It;++It) {
-        if(!Present.Contains(It.Key())) {It.Value()->DestroyComponent();InstanceAssets.Remove(It.Key());InstanceCells.Remove(It.Key());LastRigidTransforms.Remove(It.Key());It.RemoveCurrent();}
+        if(!Present.Contains(It.Key())) {It.Value()->DestroyComponent();RemoveInstanceAsset(It.Key());InstanceCells.Remove(It.Key());LastRigidTransforms.Remove(It.Key());It.RemoveCurrent();}
     }
     TArray<FString> Retired;for(const auto& Pair:InstanceAssets)if(!Present.Contains(Pair.Key))Retired.Add(Pair.Key);
-    for(const FString& Id:Retired){RemoveRigid(Id);if(auto** Old=SkinnedComponents.Find(Id))(*Old)->DestroyComponent();SkinnedComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);InstanceAssets.Remove(Id);InstanceCells.Remove(Id);LastRigidTransforms.Remove(Id);}
+    for(const FString& Id:Retired){RemoveRigid(Id);if(auto** Old=SkinnedComponents.Find(Id))(*Old)->DestroyComponent();SkinnedComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);RemoveInstanceAsset(Id);InstanceCells.Remove(Id);LastRigidTransforms.Remove(Id);}
     TSet<FString> Used;for(const auto& Pair:RigidSlots)Used.Add(Pair.Value.Asset);
     for(auto It=RigidBatches.CreateIterator();It;++It)if(!MeshData.Contains(It.Key())){It.Value()->DestroyComponent();RigidRows.Remove(It.Key());DirtyRigidAssets.Remove(It.Key());It.RemoveCurrent();}
     for(const auto& Pair:SkinnedComponents)Used.Add(InstanceAssets.FindRef(Pair.Key));
@@ -1113,9 +1194,14 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     if(BonePoseChanged)++PerfBonePoseUpdates;
     if(VertexPoseChanged)++PerfVertexPoseUpdates;
     if(NativePoseReuseEnabled && Native && ResourceError.IsEmpty()) {
+        if(RebasedCache)AppliedNativeStates=MoveTemp(Rebased);
         AppliedNativeStates.SetNum(StateCount);
         for(int32 I=0;I<StateCount;++I)if(!Reuse || !Unchanged[I]){AppliedNativeStates[I]=(*Native)[I];if(AppliedNativeStates[I].Visible && !VisibleInstances.Contains(GeometryBindings[I].Id))AppliedNativeStates[I].Visible=false;}
-        AppliedNativeCatalog=Catalog;NativePoseValid=true;
+        if(AppliedNativeCatalog!=Catalog || (!AppliedBindingSnapshot.IsValid() && AppliedNativeBindings.Num()!=GeometryBindings.Num())) {
+            AppliedBindingSnapshot=CatalogBindingSnapshot;
+            if(AppliedBindingSnapshot.IsValid())AppliedNativeBindings.Empty();else AppliedNativeBindings=GeometryBindings;
+        }
+        AppliedNativeCatalog=Catalog;NativePoseValid=true;NativeResourceInvalidations.Empty();
     }
     Part(TEXT("reconcile_cache"));
     const TSharedPtr<FJsonObject>* PoseCamera=nullptr;
@@ -1213,21 +1299,17 @@ void AMWLive::PublishPresentationState() {
     const FString Folder=FPaths::GetPath(SnapshotPath);
     // A dead controller must uncover Morrowind even if it was killed before
     // its finally block. This watchdog is independent of geometry validity.
-    FString StateText;TSharedPtr<FJsonObject> State;double Stamp=0,RendererPid=0;
-    const bool HostAlive=MWReadSnapshot(Folder/TEXT("presentation.json"),StateText) &&
-        FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(StateText),State) && State.IsValid() &&
-        State->TryGetNumberField(TEXT("unix_ns"),Stamp) && FMath::IsFinite(Stamp) &&
-        State->TryGetNumberField(TEXT("renderer_pid"),RendererPid) && RendererPid==GetCurrentProcessId() &&
-        Now-Stamp/1e9>=0 && Now-Stamp/1e9<.5;
+    if(!PresentationWriter)PresentationWriter=new FMWPresentationWriter;
+    PresentationWriter->Poll();
+    const auto& Host=PresentationWriter->Host;
+    const bool HostAlive=Host.Stamp>0 && Now-Host.Stamp>=0 && Now-Host.Stamp<.5;
     if(!HostAlive) {
         // A separate view that cannot cover the original needs no opacity
         // toggle on a controller hitch. An overlapping/unknown view still
         // fails closed so native dialogue and controls remain accessible.
-        FString ModeText,Mode;TSharedPtr<FJsonObject> Config;RECT NativeRect={},VisualRect={},Overlap={};DWORD NativeOwnerPid=0;
+        RECT NativeRect={},VisualRect={},Overlap={};DWORD NativeOwnerPid=0;
         if(OriginalWindow)GetWindowThreadProcessId((HWND)OriginalWindow,&NativeOwnerPid);
-        const bool SafeSeparate=MWReadSnapshot(Folder/TEXT("presentation-mode.json"),ModeText,8192) &&
-            FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(ModeText),Config) && Config.IsValid() &&
-            Config->TryGetStringField(TEXT("mode"),Mode) && Mode==TEXT("side-by-side") && NativeOwnerPid==SourcePid && !IsIconic((HWND)OriginalWindow) &&
+        const bool SafeSeparate=Host.Separate && NativeOwnerPid==SourcePid && !IsIconic((HWND)OriginalWindow) &&
             GetWindowRect((HWND)OriginalWindow,&NativeRect) && GetWindowRect((HWND)VisualWindow,&VisualRect) && !IntersectRect(&Overlap,&NativeRect,&VisualRect);
         if(!SafeSeparate) {
             if(GetWindowLongPtr((HWND)VisualWindow,GWL_EXSTYLE)&WS_EX_LAYERED)SetLayeredWindowAttributes((HWND)VisualWindow,0,0,LWA_ALPHA);
@@ -1246,8 +1328,7 @@ void AMWLive::PublishPresentationState() {
     Json->SetNumberField(TEXT("renderer_pid"),GetCurrentProcessId());
     Json->SetNumberField(TEXT("pid"),SourcePid);
     FString Text;FJsonSerializer::Serialize(Json,TJsonWriterFactory<TCHAR,TCondensedJsonPrintPolicy<TCHAR>>::Create(&Text));
-    if(FFileHelper::SaveStringToFile(Text,*(Path+TEXT(".tmp")),FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))
-        MoveFileExW(*(Path+TEXT(".tmp")),*Path,MOVEFILE_REPLACE_EXISTING);
+    PresentationWriter->Submit(Path,MoveTemp(Text));
 #endif
 }
 
@@ -1304,6 +1385,7 @@ void AMWLive::Tick(float Delta) {
     const double HealthTime=FPlatformTime::Seconds();
     ++HealthFrames;HealthMaxDelta=FMath::Max(HealthMaxDelta,(double)Delta);
     if(HealthTime-LastHealthLog>=1) {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_HealthDiagnostics);
         const double HealthSeconds=HealthTime-LastHealthLog;
         if(LastHealthLog>0) {
             auto Perf=MakeShared<FJsonObject>();
@@ -1380,10 +1462,15 @@ void AMWLive::Tick(float Delta) {
             PerfPolls=PerfBodies=PerfRepeats=0;
         }
         const int32 VisibleCount=VisibleInstances.Num();
+        UE_LOG(LogTemp,Display,TEXT("UEMW health status=%s session=%s seq=%lld visible=%d game_thread_hz=%.1f max_tick_ms=%.2f meshes=%d textures=%d components=%d epoch=%s"),*Status,*Session,Sequence,VisibleCount,LastHealthLog>0?HealthFrames/HealthSeconds:0,HealthMaxDelta*1000,MeshData.Num(),GeometryTextures.Num(),InstanceCount(),*SceneEpoch);
+        // Full membership hashing sorts thousands of strings and rescans the
+        // whole world for each cell. Keep it out of normal frame delivery.
+        // The small health/perf records and fail-safe heartbeat remain live.
+        if(DiagnosticMembership) {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_MembershipDiagnostics);
         TArray<FString> Membership;
         for(const auto& Pair:InstanceAssets)Membership.Add(Pair.Key+TEXT(":")+Pair.Value);
         Membership.Sort();const FString MembershipHash=FMD5::HashAnsiString(*FString::Join(Membership,TEXT("|")));
-        UE_LOG(LogTemp,Display,TEXT("UEMW health status=%s session=%s seq=%lld visible=%d game_thread_hz=%.1f max_tick_ms=%.2f meshes=%d textures=%d components=%d epoch=%s"),*Status,*Session,Sequence,VisibleCount,LastHealthLog>0?HealthFrames/HealthSeconds:0,HealthMaxDelta*1000,MeshData.Num(),GeometryTextures.Num(),InstanceCount(),*SceneEpoch);
         UE_LOG(LogTemp,Display,TEXT("UEMW membership epoch=%s seq=%lld md5=%s"),*SceneEpoch,Sequence,*MembershipHash);
         TSet<FString> CellKeys;for(const auto& Pair:InstanceCells)CellKeys.Add(Pair.Value);
         for(const auto& Key:CellKeys) {
@@ -1402,6 +1489,7 @@ void AMWLive::Tick(float Delta) {
                 Components.Sort();const FString ComponentHash=FMD5::HashAnsiString(*FString::Join(Components,TEXT("|")));
                 UE_LOG(LogTemp,Display,TEXT("UEMW cell-membership epoch=%s key=%s count=%d visible=%d md5=%s components_md5=%s"),*SceneEpoch,*Key,Members.Num(),Visible,*Hash,*ComponentHash);
             }
+        }
         }
         // Explicit one-shot inspection, never automatic screenshot/video capture.
         const FString Inspect=DataRoot/TEXT("local/bridge/capture.once");
@@ -1520,6 +1608,7 @@ void AMWLive::Tick(float Delta) {
         ActiveCellKey=FString::Printf(TEXT("exterior:%d,%d"),(int32)(*Grid)[0]->AsNumber(),(int32)(*Grid)[1]->AsNumber());
     ReadMs=Packet->GetNumberField(TEXT("read_ms"));
     GeometryActive=Packet->HasField(TEXT("geometry_version"));
+    SourceBindingSnapshot=Decoded.Bindings;SourceBindingCatalog.Empty();Packet->TryGetStringField(TEXT("scene_catalog"),SourceBindingCatalog);
     UpdatePresentation(Packet); // Bind the original window without activating either application.
     const double ApplyStarted=FPlatformTime::Seconds();
     if(Decoded.HaveEnvironment && !MWUploadFloatPixels(EnvironmentTexture,8,33,Decoded.Environment.Pixels)) {Status=TEXT("NATIVE ENVIRONMENT UPLOAD FAILED");HideScene();return;}
@@ -1532,7 +1621,7 @@ void AMWLive::Tick(float Delta) {
         BackgroundView->Color=FLinearColor(Fog.X,Fog.Y,Fog.Z,1);
     }
     const int32 GeometryVersion=GeometryActive?Packet->GetIntegerField(TEXT("geometry_version")):0;
-    if(GeometryActive && ((GeometryVersion!=1 && GeometryVersion!=2 && GeometryVersion!=3 && GeometryVersion!=4 && GeometryVersion!=5 && GeometryVersion!=6) || !UpdateGeometry(Packet,GeometryVersion>=5?&Decoded.States:nullptr,Decoded.HaveMaterialFrames?&Decoded.MaterialFrames:nullptr,Decoded.HaveMaterialValues?&Decoded.MaterialValues:nullptr,Decoded.Bindings.Get()))) {
+    if(GeometryActive && ((GeometryVersion!=1 && GeometryVersion!=2 && GeometryVersion!=3 && GeometryVersion!=4 && GeometryVersion!=5 && GeometryVersion!=6) || !UpdateGeometry(Packet,GeometryVersion>=5?&Decoded.States:nullptr,Decoded.HaveMaterialFrames?&Decoded.MaterialFrames:nullptr,Decoded.HaveMaterialValues?&Decoded.MaterialValues:nullptr,Decoded.Bindings.Get(),Decoded.BindingIndex.Get()))) {
         RejectGeometry();
         return;
     }

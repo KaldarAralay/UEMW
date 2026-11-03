@@ -25,6 +25,7 @@ class UTextureRenderTarget2D;
 class FJsonObject;
 struct FMWFrameReader;
 struct FMWCameraReader;
+struct FMWPresentationWriter;
 struct FMWCameraSample;
 struct FMWGeometryState;
 struct FMWCatalogLoader;
@@ -84,6 +85,7 @@ public:
     // change. Live poses, texture indices and material values are never cached.
     TSet<FString> ViewAssets,FrameAssets,ValueAssets;
     TMap<FString,FString> ViewInstances,FrameInstances,ValueInstances;
+    TMap<FString,TSet<FString>> AssetInstances;
     FString RenderSelectionCatalog;
     int32 RenderSelectionMeshes=-1,RenderSelectionInstances=-1;
     bool RenderSelectionDirty=true;
@@ -92,6 +94,10 @@ public:
     TMap<FString,FMWRainPose> RainPoses;
     void UpdateRainInterpolation();
     void EnsureRenderSelection();
+    void SetInstanceAsset(const FString& Id,const FString& Asset);
+    void RemoveInstanceAsset(const FString& Id);
+    void SetRenderAssetTraits(const FString& Asset,uint8 Traits);
+    int32 RenderSelectionRebuilds=0;
     bool CanReflectPrimitive(UPrimitiveComponent* Component,const FString& Asset) const;
     UPROPERTY() UCameraComponent* Camera;
     UPROPERTY() TMap<FString,UStaticMeshComponent*> Markers;
@@ -231,6 +237,8 @@ private:
     TArray<FMWResourceJob> ResourceJobs;
     TSet<FString> QueuedResources;
     TMap<FString,FString> ResourceBindings;
+    TMap<FString,FString> PreparedResourceBindings;
+    FString PreparedResourceCatalog;
     int32 ResourceJobIndex=0,PerfResourceBuilds=0;
     FString ResourceCatalog,ResourceError;
     FString RequestedCatalog;
@@ -241,8 +249,20 @@ private:
     void QueueGeometryResource(uint8 Kind,const FString& Id,const FString& Asset,const FVector4f& Bound);
     TSet<FString> ViewCachedAssets;
     TArray<FMWGeometryState> AppliedNativeStates;
+    TArray<FMWBinding> AppliedNativeBindings;
+    TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> SourceBindingSnapshot,CatalogBindingSnapshot,AppliedBindingSnapshot;
+    FString SourceBindingCatalog;
+    TArray<uint8> BindingTraits; // first-person, rain, controlled material
+    FString BindingTraitsCatalog,PreparedPoseSourceCatalog;
+    int32 PreparedPoseSourceCount=0;
+    TArray<int32> PreparedPoseRemap;
+    TArray<int32> RetainedGeometryIndices;
+    TArray<FMWGeometryState> RetainedGeometryScratch;
+    FString RetainedIncomingCatalog,RetainedIncomingDigest,RetainedTargetCatalog;
+    int32 RetainedIncomingCount=0;
     FString AppliedNativeCatalog;
     bool NativePoseValid=false;
+    TSet<FString> NativeResourceInvalidations;
     bool NativePoseReuseEnabled=true; // headless comparisons can exercise the original full-walk path
     int32 PerfNativeStateReused=0,PerfNativeStateChanged=0;
     bool GeometryResourceReady(const FMWBinding& Binding,const FMWGeometryState& State) const;
@@ -257,8 +277,10 @@ private:
     void ClearPrimitiveFilters();
     FMWFrameReader* FrameReader=nullptr;
     FMWCameraReader* CameraReader=nullptr;
+    FMWPresentationWriter* PresentationWriter=nullptr;
     FMWCatalogLoader* CatalogLoader=nullptr;
     bool GeometryLoading=false;
+    bool SceneShown=false,DiagnosticVisibility=false;
     TMap<FString,int32> CurrentMaterialFrames,AppliedMaterialFrames;
     TMap<FString,FMWMaterialValue> CurrentMaterialValues,AppliedMaterialValues;
     TMap<FString,TArray<float>> UploadedBonePalettes;
@@ -310,6 +332,7 @@ private:
     FString CaptureFolder;
     bool PresentationConfigured=false;
     bool DiagnosticScreenshots=false;
+    bool DiagnosticMembership=false;
     TSharedPtr<FMWBackgroundView,ESPMode::ThreadSafe> BackgroundView;
     bool Overlay=false;
     bool ManagedPresentation=false;
@@ -328,7 +351,7 @@ private:
     void ShowScene();
     void RejectGeometry();
     void ResetScene();
-    bool UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native=nullptr,const TMap<FString,int32>* MaterialFrames=nullptr,const TMap<FString,FMWMaterialValue>* MaterialValues=nullptr,const TArray<FMWBinding>* IncomingBindings=nullptr);
+    bool UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native=nullptr,const TMap<FString,int32>* MaterialFrames=nullptr,const TMap<FString,FMWMaterialValue>* MaterialValues=nullptr,const TArray<FMWBinding>* IncomingBindings=nullptr,const TMap<FString,int32>* IncomingIndex=nullptr);
     bool LoadCatalog(const FString& Name);
     void CreateGeometryMaterial();
     void SetVisualReference(bool Reference);

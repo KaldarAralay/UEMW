@@ -77,6 +77,7 @@ class Geometry:
         self.material_values={}
         self.native_attributes={};self.attribute_captures={}
         self.node_identities={};self.native_switches={};self.light_owners={};self.continuity_views={};self.topology_dirty=False
+        self.cell_root_owners={}
         self.prepared_definitions={};self.definitions_reused=0
 
     def close(self):
@@ -95,6 +96,7 @@ class Geometry:
         self.cell_definitions=[]
         self.records=[];self.terrain_count=0;self.view_pointers=set()
         self.scope=None;self.cell_generations={}
+        self.cell_root_owners={}
         self.extra_generations={};self.effect_signature=();self.weapon_state=None
         self.material_flips=FlipCapture({})
         self.material_values={}
@@ -301,6 +303,7 @@ class Geometry:
         self.light_pointers=scene.get('lights',[])
         self.light_owners=scene.get('light_owners',{});self.node_identities=scene.get('node_identities',{})
         self.native_switches=scene.get('switches',{});self.actor_owners=scene.get('actor_owners',{});self.topology_dirty=False;self.continuity_views={}
+        self.cell_root_owners=scene.get('cell_root_owners',{})
         self.material_flips=FlipCapture(flips)
         self.material_values=values
         self.native_attributes=attributes
@@ -318,6 +321,8 @@ class Geometry:
         requests={ptr:0xAC if ptr in shape_nodes else 0x74 for ptr in nodes}
         for ptr,size in switches.requests():requests[ptr]=max(requests.get(ptr,0),size)
         for owner in self.actor_owners.values():requests[owner['reference']]=0x50
+        for checks in self.cell_root_owners.values():
+            for address,pointer in checks:requests[address]=max(4,requests.get(address,0))
         self.pose_requests=ReadPlan(sorted(requests.items()))
         owners={c['key']:index for index,c in enumerate(cells)}
         self.records=[(int(s['id'],16),(int(s['model'],16),int(s['skin'],16)),s['visibility_nodes'],
@@ -329,7 +334,7 @@ class Geometry:
         self.water_pointers={int(s['id'],16)for s in self.shapes if s.get('cell_key')in('aux:water','aux:ripple')}
         self.water_visibility_roots={int(a['root'],16)for a in aux if a['layer']in('water','ripple')}
         self.player_pointers={int(s['id'],16)for s in self.shapes if s.get('cell_key')=='aux:player'and not s.get('effect_target')}
-        self.pose_layout=PoseLayout(self.records,self.view_pointers,read_plan=self.pose_requests,switches=switches,water_pointers=self.water_pointers,node_identities=self.node_identities,player_pointers=self.player_pointers,water_visibility_roots=self.water_visibility_roots,actor_owners=self.actor_owners,native_light_states={int(s['id'],16):s['native_light_state']for s in self.shapes if'native_light_state'in s},shadow_casters=self.shadow_caster_pointers,shadow_distance=self.shadow_distance,near_pass_camera=bool(int(base.get('first_person_camera_ptr','0x0'),16)))
+        self.pose_layout=PoseLayout(self.records,self.view_pointers,read_plan=self.pose_requests,switches=switches,water_pointers=self.water_pointers,node_identities=self.node_identities,player_pointers=self.player_pointers,water_visibility_roots=self.water_visibility_roots,actor_owners=self.actor_owners,native_light_states={int(s['id'],16):s['native_light_state']for s in self.shapes if'native_light_state'in s},shadow_casters=self.shadow_caster_pointers,shadow_distance=self.shadow_distance,near_pass_camera=bool(int(base.get('first_person_camera_ptr','0x0'),16)),cell_root_owners=self.cell_root_owners)
         self.cell_definitions=[]
         for c in cells:
             members=[s for s in self.shapes if s['cell_key']==c['key']]
@@ -390,9 +395,12 @@ class Geometry:
             for p,n in switches.requests():requests[p]=max(n,requests.get(p,0))
             for p,owner in getattr(self,'actor_owners',{}).items():
                 if p in nodes:requests[owner['reference']]=0x50
+            for p,checks in getattr(self,'cell_root_owners',{}).items():
+                if p in nodes:
+                    for address,pointer in checks:requests[address]=max(4,requests.get(address,0))
             view.pose_requests=ReadPlan(sorted(requests.items()));view.view_pointers=self.view_pointers&pointers;view.water_pointers=self.water_pointers&pointers
             view.player_pointers=getattr(self,'player_pointers',set())&pointers
-            view.pose_layout=PoseLayout(view.records,view.view_pointers,read_plan=view.pose_requests,switches=switches,water_pointers=view.water_pointers,node_identities=self.node_identities,player_pointers=view.player_pointers,water_visibility_roots=getattr(self,'water_visibility_roots',()),actor_owners=getattr(self,'actor_owners',{}),native_light_states=getattr(getattr(self,'pose_layout',None),'native_light_states',{}),shadow_casters=getattr(self,'shadow_caster_pointers',set())&pointers,shadow_distance=getattr(self,'shadow_distance',0),near_pass_camera=getattr(getattr(self,'pose_layout',None),'near_pass_camera',False))
+            view.pose_layout=PoseLayout(view.records,view.view_pointers,read_plan=view.pose_requests,switches=switches,water_pointers=view.water_pointers,node_identities=self.node_identities,player_pointers=view.player_pointers,water_visibility_roots=getattr(self,'water_visibility_roots',()),actor_owners=getattr(self,'actor_owners',{}),native_light_states=getattr(getattr(self,'pose_layout',None),'native_light_states',{}),shadow_casters=getattr(self,'shadow_caster_pointers',set())&pointers,shadow_distance=getattr(self,'shadow_distance',0),near_pass_camera=getattr(getattr(self,'pose_layout',None),'near_pass_camera',False),cell_root_owners=getattr(self,'cell_root_owners',{}))
             view.continuity_indices=selected
             if len(self.continuity_views)>=8:self.continuity_views.clear()
             self.continuity_views[key]=view
@@ -592,7 +600,7 @@ class Geometry:
         cell_stats=[{**cell,'visible':count}for cell,count in zip(self.cell_definitions,visible_counts)]
         trace=os.environ.get('UEMW_VISIBILITY_TRACE')
         focus=base.get('focus')or{}
-        if trace in ('before','after') and (raw.invalid_count or focus.get('name')=='Indrele Rathryon'):
+        if trace in ('before','after','hitch') and (trace=='hitch' or raw.invalid_count or focus.get('name')=='Indrele Rathryon'):
             # Opt-in diagnosis of the captured visibility decision. This writes
             # local data only; no gameplay flags or process memory are changed.
             try:
@@ -605,12 +613,18 @@ class Geometry:
                         n=raw.layout.index[p]
                         if raw.nodes['flags'][n]&1:hidden.append(hex(p))
                         if raw.layout.node_known[n] and tuple((int(raw.nodes['table'][n]),int(raw.nodes['parent'][n])))!=tuple(raw.layout.node_identities[n]):invalid.append(dict(node=hex(p),expected=[hex(int(v))for v in raw.layout.node_identities[n]],observed=[hex(int(raw.nodes[k][n]))for k in ('table','parent')]))
-                    if root is None and not invalid:continue
-                    rows.append(dict(id=s['render_id'],visible=bool(raw.visible[i]),unhidden=bool(raw.unhidden[i]),inside=bool(raw.inside[i]),bound=raw.bounds[i].tolist(),hidden=hidden,invalid=invalid))
-                    if root is None and len(rows)>=16:break
-                with (ROOT/f'logs/npc-visibility-source-{trace}.jsonl').open('a',encoding='utf-8')as log:
-                    log.write(json.dumps(dict(stamp=metrics['pose_sample_unix_ns'],camera=anchor['camera'],rows=rows))+'\n')
-            except(OSError,ValueError,KeyError):pass
+                    if trace!='hitch' and root is None and not invalid:continue
+                    rows.append(dict(id=s.get('render_id',s.get('generation','')+':'+s['id']),visible=bool(raw.visible[i]),unhidden=bool(raw.unhidden[i]),inside=bool(raw.inside[i]),bound=raw.bounds[i].tolist(),hidden=hidden,invalid=invalid))
+                    if trace!='hitch' and root is None and len(rows)>=16:break
+                signature=tuple((v['id'],v['visible'],v['unhidden'],tuple(v['hidden']),str(v['invalid']))for v in rows)
+                if trace!='hitch' or signature!=getattr(self,'visibility_trace_signature',None):
+                    with (ROOT/f'logs/npc-visibility-source-{trace}.jsonl').open('a',encoding='utf-8')as log:
+                        log.write(json.dumps(dict(stamp=metrics['pose_sample_unix_ns'],camera=anchor['camera'],rows=rows))+'\n')
+                    self.visibility_trace_signature=signature
+            except(OSError,ValueError,KeyError)as error:
+                if trace=='hitch' and str(error)!=getattr(self,'visibility_trace_error',None):
+                    print(json.dumps(dict(diagnostic='visibility_trace_error',error=str(error))),file=sys.stderr,flush=True)
+                    self.visibility_trace_error=str(error)
         metrics['pose_translate_ms']=(time.perf_counter()-translate_started)*1000
         return {**anchor,**metrics,'geometry_version':6 if any(item['uvs']for item in self.native_attributes.values())else 5,'scene_epoch':self.epoch,'stream_cells':cell_stats,
                 'scene_catalog':self.catalog,'instance_states':states,

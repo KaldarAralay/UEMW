@@ -34,13 +34,70 @@ bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FStri
     }
     Out=MoveTemp(Result);return true;
 }
+bool MWRebasePoseCache(const TArray<FMWBinding>& PreviousBindings,const TArray<FMWGeometryState>& Previous,const TArray<FMWBinding>& Current,TArray<FMWGeometryState>& Out,TBitArray<>& Matched) {
+    if(PreviousBindings.Num()!=Previous.Num() || Previous.Num()>16384 || Current.Num()>16384)return false;
+    TMap<FString,int32> Index;Index.Reserve(Previous.Num());
+    for(int32 I=0;I<Previous.Num();++I){if(Index.Contains(PreviousBindings[I].Id))return false;Index.Add(PreviousBindings[I].Id,I);}
+    TSet<FString> CurrentIds;for(const auto& B:Current){if(CurrentIds.Contains(B.Id))return false;CurrentIds.Add(B.Id);}
+    TArray<FMWGeometryState> Result;Result.SetNum(Current.Num());TBitArray<> Matches;Matches.Init(false,Current.Num());
+    for(int32 I=0;I<Current.Num();++I)if(const auto* J=Index.Find(Current[I].Id)) {
+        const auto& Old=PreviousBindings[*J];
+        if(Old.Asset==Current[I].Asset && Old.Cell==Current[I].Cell){Result[I]=Previous[*J];Matches[I]=true;}
+    }
+    Out=MoveTemp(Result);Matched=MoveTemp(Matches);return true;
+}
+
+bool MWBuildPoseRemap(const TArray<FMWBinding>& Previous,const TArray<FMWBinding>& Current,TArray<int32>& Out) {
+    if(!MWBuildRetainedRemap(Previous,Current,Out))return false;
+    for(int32 I=0;I<Out.Num();++I)if(Out[I]>=0 && Previous[Out[I]].Cell!=Current[I].Cell)Out[I]=INDEX_NONE;
+    return true;
+}
+
+bool MWMovePoseCache(TArray<FMWGeometryState>& Previous,const TArray<int32>& Indices,TArray<FMWGeometryState>& Out,TBitArray<>& Matched) {
+    if(&Previous==&Out || Previous.Num()>16384 || Indices.Num()>16384)return false;
+    TBitArray<> Seen;Seen.Init(false,Previous.Num());
+    for(int32 I:Indices){if(I<INDEX_NONE || I>=Previous.Num())return false;if(I>=0){if(Seen[I])return false;Seen[I]=true;}}
+    // The worker prepared identities only. Move the most recently accepted
+    // cache here, never a pose captured when preparation began.
+    Out.SetNum(Indices.Num());Matched.Init(false,Indices.Num());
+    for(int32 I=0;I<Indices.Num();++I)if(Indices[I]>=0){Out[I]=MoveTemp(Previous[Indices[I]]);Matched[I]=true;}else Out[I]=FMWGeometryState();
+    return true;
+}
+
+bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBinding>& Retained,TArray<int32>& Out,const TMap<FString,int32>* ParsedIndex) {
+    if(Incoming.Num()>16384 || Retained.Num()>16384)return false;
+    TMap<FString,int32> LocalIndex;
+    if(!ParsedIndex){LocalIndex.Reserve(Incoming.Num());for(int32 I=0;I<Incoming.Num();++I){if(LocalIndex.Contains(Incoming[I].Id))return false;LocalIndex.Add(Incoming[I].Id,I);}}
+    const auto& Index=ParsedIndex?*ParsedIndex:LocalIndex;if(Index.Num()!=Incoming.Num())return false;
+    TArray<int32> Result;Result.Init(INDEX_NONE,Retained.Num());TSet<FString> Seen;
+    for(int32 I=0;I<Retained.Num();++I) {
+        if(!ParsedIndex){if(Seen.Contains(Retained[I].Id))return false;Seen.Add(Retained[I].Id);}
+        if(const int32* J=Index.Find(Retained[I].Id)) {
+            if(*J<0 || *J>=Incoming.Num() || Incoming[*J].Id!=Retained[I].Id)return false;
+            if(Retained[I].Asset==Incoming[*J].Asset)Result[I]=*J;
+        }
+    }
+    Out=MoveTemp(Result);return true;
+}
+
+bool MWApplyRetainedRemap(const TArray<FMWGeometryState>& Incoming,const TArray<int32>& Indices,TArray<FMWGeometryState>& Out,int32& Missing) {
+    if(Incoming.Num()>16384 || Indices.Num()>16384)return false;
+    TBitArray<> Seen;Seen.Init(false,Incoming.Num());
+    for(int32 I:Indices){if(I<INDEX_NONE || I>=Incoming.Num())return false;if(I>=0){if(Seen[I])return false;Seen[I]=true;}}
+    int32 Pending=0;for(const auto& S:Incoming)Pending+=S.Visible?1:0;
+    // Reuse the destination's existing vertex/palette capacities. Every slot
+    // is overwritten from this incoming frame or explicitly hidden.
+    Out.SetNum(Indices.Num());
+    for(int32 I=0;I<Indices.Num();++I) {
+        if(Indices[I]>=0){Out[I]=Incoming[Indices[I]];Pending-=Out[I].Visible?1:0;}
+        else Out[I]=FMWGeometryState();
+    }
+    Missing=Pending;return true;
+}
+
 bool MWRemapRetainedGeometry(const TArray<FMWBinding>& Bindings,const TArray<FMWGeometryState>& Incoming,const TArray<FMWBinding>& Retained,TArray<FMWGeometryState>& Out,int32& Missing) {
-    if(Bindings.Num()!=Incoming.Num() || Bindings.Num()>16384 || Retained.Num()>16384)return false;
-    TMap<FString,int32> Index;int32 Pending=0;
-    for(int32 I=0;I<Bindings.Num();++I){if(Index.Contains(Bindings[I].Id))return false;Index.Add(Bindings[I].Id,I);Pending+=Incoming[I].Visible?1:0;}
-    TArray<FMWGeometryState> Result;Result.SetNum(Retained.Num());
-    for(int32 I=0;I<Retained.Num();++I)if(const int32* J=Index.Find(Retained[I].Id))if(Retained[I].Asset==Bindings[*J].Asset){Result[I]=Incoming[*J];Pending-=Incoming[*J].Visible?1:0;}
-    Out=MoveTemp(Result);Missing=Pending;return true;
+    TArray<int32> Indices;
+    return Bindings.Num()==Incoming.Num() && MWBuildRetainedRemap(Bindings,Retained,Indices) && MWApplyRetainedRemap(Incoming,Indices,Out,Missing);
 }
 TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder,FMWTextureUpgradePtr Upgrades,const FString& KnownTerrain,const FString& KnownTerrainPool) {
     auto Result=MakeShared<FMWCatalogData,ESPMode::ThreadSafe>();
@@ -283,6 +340,7 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         if(DecodedBytes>512*1024*1024)return nullptr;
         Result->Images.Add(Texture,MoveTemp(Images));
     }
+    Result->BindingAssets.Reserve(NewBindings.Num());for(const auto& B:NewBindings)Result->BindingAssets.Add(B.Id,B.Asset);
     Result->Bindings=MoveTemp(NewBindings);Result->WantedAssets=MoveTemp(WantedAssets);Result->WantedTextures=MoveTemp(WantedTextures);
     Result->TextureWorkMs=(FPlatformTime::Seconds()-TextureBegan)*1000;
     return Result;

@@ -89,7 +89,9 @@ class OwnershipTests(unittest.TestCase):
                 if p==0x70004:return b'NPC_'
                 if p==0x10000:
                     raw=bytearray(0x90);struct.pack_into('<I',raw,0x18,0x90000);return bytes(raw[:n])
-                if p in(0x80000,0x80018,0x800a8,0x10094):return bytes(n)
+                if p==0x80000:
+                    raw=bytearray(n);struct.pack_into('<I',raw,0x18,0x90000);return bytes(raw)
+                if p in(0x800a8,0x10094):return bytes(n)
                 raise AssertionError('Borrowed ancestry must not be read: '+hex(p))
         graph=SceneReader(Memory());graph.ancestry=lambda *args:['NiNode']
         scene=graph.collect(roots=[],aux_roots=[dict(layer='player',root='0x10000',owner_ref='0x60000')])

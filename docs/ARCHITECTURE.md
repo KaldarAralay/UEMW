@@ -35,7 +35,7 @@ The original view remains available. Normal keyboard/mouse input goes directly t
 
 ## State and assets
 
-World poses are complete snapshots in an immutable catalog's binding order. Static geometry uses shared meshes/instances; native bones drive GPU skinning. Mutable vertices and some effects retain bounded CPU paths. Original hide flags, switches, parent/actor ownership and model/skin identities gate all reuse. UE's rendering culling and shadow passes do not become gameplay visibility/collision decisions.
+World poses are complete snapshots in an immutable catalog's binding order. Static geometry uses shared meshes/instances; native bones drive GPU skinning. Mutable vertices and some effects retain bounded CPU paths. Original hide flags, switches, parent/actor ownership and model/skin identities gate all reuse. Cell roots are owned by freshly captured TES cell slots, so temporary reparenting above a still-owned root does not retire its children. UE's rendering culling and shadow passes do not become gameplay visibility/collision decisions.
 
 The first-person pass has its own original camera and sample timestamp. It updates independently of world conversion. A small foreground depth range and corrected CPU bounds preserve native projection without world clipping. Cached rebinding re-reads actual geometry/material/skin content; a recycled native address is insufficient. No UE animation clock, prediction or gameplay event system runs.
 

@@ -39,9 +39,12 @@ def wait_for(check,seconds,poll=.05):
     raise RuntimeError('Timed out waiting for '+check.__name__)
 
 
-def witness(ids,*,poll=.05,visual_profile=None,water_fog_mode=None,terrain_blend=None,water_reflections=None,background_visible=None,ambient_probe=None,water_atmosphere=None,water_planar=None,reflection_capture=None,effect_quality=None,interior_lighting=None,foliage_quality=None,celestial_quality=None,outdoor_lighting=None,surface_reflections=None,targeted_render_updates=None,presentation_sync=None,rain_interpolation=None,lighting_fidelity=None,stable_lighting=None,exterior_fidelity=None,exterior_fog=None,shadow_maps=None):
+def witness(ids,*,poll=.05,visual_profile=None,water_fog_mode=None,terrain_blend=None,water_reflections=None,background_visible=None,ambient_probe=None,water_atmosphere=None,water_planar=None,reflection_capture=None,effect_quality=None,interior_lighting=None,foliage_quality=None,celestial_quality=None,outdoor_lighting=None,surface_reflections=None,targeted_render_updates=None,presentation_sync=None,rain_interpolation=None,lighting_fidelity=None,stable_lighting=None,exterior_fidelity=None,exterior_fog=None,shadow_maps=None,record_seconds=None):
     token=str(uuid.uuid4());folder=ROOT/'local/bridge'
     request=dict(protocol='uemw.witness.request',version=1,request_id=token,unix_ns=time.time_ns(),ids=ids)
+    if record_seconds is not None:
+        if type(record_seconds)is not int or not 1<=record_seconds<=10:raise ValueError('Expected 1..10 diagnostic capture seconds')
+        request['record_seconds']=record_seconds
     if shadow_maps is not None:
         if type(shadow_maps)is not bool:raise ValueError('Invalid shadow-map diagnostic')
         request['shadow_maps']=shadow_maps

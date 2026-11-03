@@ -29,6 +29,10 @@ Useful starting points include `benchmark`, `profile_bridge`, `check_first_perso
 
 Default launch is passive two-window D3D11 with the original rendering enabled. `tools/start-session.ps1 -Overlay` is an experimental overlay; `-Editor`, `-DiagnosticScreenshots`, `-DiagnosticTrace`, `-PresentationStats` and crash capture are explicit development options. Alternate launchers are under `dev/launchers`. Normal launch records nothing. Measurements must distinguish actor ticks, applied state rate, GPU timestamps and actual displayed frames.
 
+Full-world and per-cell membership hashes are expensive and disabled during normal play. For a focused diagnostic run, set `UEMW_MEMBERSHIP_DIAGNOSTICS=1` before starting a new renderer (or pass the renderer argument `-UEMWDiagnosticMembership`). The small health/performance reports and independent fail-safe heartbeat remain enabled.
+
+For transient visibility diagnosis, `UEMW_VISIBILITY_DIAGNOSTICS=1` logs renderer scene/skin visibility transitions. `UEMW_VISIBILITY_TRACE=hitch` on a newly started bridge records source skin visibility/parent changes under ignored `logs/`. These are expensive opt-in diagnostics; disable them for performance comparisons. Scene-hide transitions remain logged normally. A diagnostic renderer also accepts `check_native_motion.witness(ids, record_seconds=4)` for a bounded image check; this is not a performance benchmark or an every-frame visibility guarantee.
+
 ## Optional local texture enhancement
 
 The normal build uses your original textures plus UEMW materials. It does not need PyTorch or downloaded model weights. The optional `tools/texture_upscale.py` can bake local enhanced textures from your own game; it requires a separately installed CUDA-capable PyTorch environment plus psutil. Use `--help` for modes and `--download-model` only when you want its hash-pinned Real-ESRGAN model. Close the project game/view before an offline GPU bake. Output, model weights and the enhancement index stay under ignored `local/`. The original-texture path remains available by setting `UEMW_TEXTURE_UPGRADES=0` before launch. See [third-party notices](../THIRD_PARTY_NOTICES.md).

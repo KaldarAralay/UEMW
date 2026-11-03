@@ -11,6 +11,10 @@
 struct FMWTextureImages {TArray<FImage> Color,Masked,Detail,Blend;};
 struct FMWCatalogData {
     TArray<FMWBinding> Bindings;
+    TMap<FString,FString> BindingAssets;
+    FString PoseSourceCatalog;
+    int32 PoseSourceCount=0;
+    TArray<int32> PoseRemap;
     TMap<FString,FMWMeshData> Meshes;
     TMap<FString,FString> AlphaModes;
     TMap<FString,FMWTextureImages> Images;
@@ -44,3 +48,10 @@ FMWCatalogPtr MWReadCatalog(const FString& Name,const FString& AssetsPath,const 
 // Validated binding order only; no mesh/PNG decoding or UObject work.
 bool MWReadCatalogBindings(const FString& Name,const FString& Digest,const FString& AssetsPath,TArray<FMWBinding>& Out);
 bool MWRemapRetainedGeometry(const TArray<FMWBinding>& IncomingBindings,const TArray<FMWGeometryState>& Incoming,const TArray<FMWBinding>& Retained,TArray<FMWGeometryState>& Out,int32& Missing);
+bool MWRebasePoseCache(const TArray<FMWBinding>& PreviousBindings,const TArray<FMWGeometryState>& Previous,const TArray<FMWBinding>& Current,TArray<FMWGeometryState>& Out,TBitArray<>& Matched);
+bool MWBuildPoseRemap(const TArray<FMWBinding>& Previous,const TArray<FMWBinding>& Current,TArray<int32>& Out);
+bool MWMovePoseCache(TArray<FMWGeometryState>& Previous,const TArray<int32>& Indices,TArray<FMWGeometryState>& Out,TBitArray<>& Matched);
+// Optional index belongs to the same parser-validated immutable incoming table;
+// the retained table is also validated by its catalog parser.
+bool MWBuildRetainedRemap(const TArray<FMWBinding>& Incoming,const TArray<FMWBinding>& Retained,TArray<int32>& Out,const TMap<FString,int32>* ParsedIndex=nullptr);
+bool MWApplyRetainedRemap(const TArray<FMWGeometryState>& Incoming,const TArray<int32>& Indices,TArray<FMWGeometryState>& Out,int32& Missing);

@@ -80,7 +80,7 @@ def loads(data,reader):
     if type(data)is not bytes or len(data)>MAX_PAYLOAD:raise ValueError('Invalid prepared scene payload')
     return PreparationUnpickler(io.BytesIO(data),reader).load()
 def fingerprint_values(g):
-    keys=('scope','signature','records','node_identities','native_switches','actor_owners','light_pointers','light_owners','native_attributes','material_values','view_pointers','water_pointers','water_visibility_roots','player_pointers','extra_generations','effect_signature','weapon_state','cell_definitions','shadow_caster_pointers','shadow_distance')
+    keys=('scope','signature','records','node_identities','native_switches','actor_owners','cell_root_owners','light_pointers','light_owners','native_attributes','material_values','view_pointers','water_pointers','water_visibility_roots','player_pointers','extra_generations','effect_signature','weapon_state','cell_definitions','shadow_caster_pointers','shadow_distance')
     state={k:getattr(g,k,None)for k in keys};state['flips']=g.material_flips.items
     state['native_light_states']=getattr(getattr(g,'pose_layout',None),'native_light_states',{})
     skin_keys={id(v):k for k,v in getattr(g,'skins',{}).items()}
@@ -134,7 +134,7 @@ def apply_layout_patch(g,patch):
         return
     records=[(p,identity,parents,g.skins[key]if key is not None else None,owner)for p,identity,parents,key,owner in rows]
     casters=patch.get('shadow_casters',getattr(g,'shadow_caster_pointers',set()));distance=patch.get('shadow_distance',getattr(g,'shadow_distance',0))
-    layout=PoseLayout(records,g.view_pointers,read_plan=patch['read_plan'],switches=patch['switches'],water_pointers=g.water_pointers,node_identities=patch['node_identities'],player_pointers=g.player_pointers,water_visibility_roots=g.water_visibility_roots,actor_owners=g.actor_owners,native_light_states=patch.get('native_light_states',{}),shadow_casters=casters,shadow_distance=distance,near_pass_camera=getattr(getattr(g,'pose_layout',None),'near_pass_camera',False))
+    layout=PoseLayout(records,g.view_pointers,read_plan=patch['read_plan'],switches=patch['switches'],water_pointers=g.water_pointers,node_identities=patch['node_identities'],player_pointers=g.player_pointers,water_visibility_roots=g.water_visibility_roots,actor_owners=g.actor_owners,native_light_states=patch.get('native_light_states',{}),shadow_casters=casters,shadow_distance=distance,near_pass_camera=getattr(getattr(g,'pose_layout',None),'near_pass_camera',False),cell_root_owners=getattr(g,'cell_root_owners',{}))
     # Commit only after the entire replacement layout has validated.
     g.records=records;g.pose_requests=patch['read_plan'];g.pose_layout=layout;g.node_identities=patch['node_identities'];g.continuity_views={}
     g.shadow_caster_pointers=casters;g.shadow_distance=distance
@@ -233,7 +233,7 @@ def auxiliary_patch(old,ready,roles):
             order.append((shape if shape.get('particles')else{k:shape[k]for k in keys if k in shape},row))
     fields=('cell','catalog','catalog_digest','last_refresh','last_world_refresh','scene_key','epoch','stream_cells','membership_hash','cell_definitions',
             'terrain_count','scope','cell_generations','generation_counter','extra_generations','effect_signature','weapon_state','material_flips','material_values',
-            'native_attributes','native_switches','light_pointers','light_owners','shadow_caster_pointers','shadow_distance','actor_owners','water_pointers',
+            'native_attributes','native_switches','light_pointers','light_owners','shadow_caster_pointers','shadow_distance','actor_owners','cell_root_owners','water_pointers',
             'water_visibility_roots','player_pointers','view_pointers','view_layout')
     return dict(order=order,state={k:getattr(ready,k)for k in fields},nodes={p:v for p,v in ready.node_identities.items()if old.node_identities.get(p)!=v},
                 plan=ready.pose_requests,layout={k:v for k,v in ready.pose_layout.__dict__.items()if k not in('records','read_plan')})

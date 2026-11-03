@@ -11,18 +11,58 @@
 void AMWLive::EnsureRenderSelection() {
     if(!RenderSelectionDirty && RenderSelectionCatalog==Catalog && RenderSelectionMeshes==MeshData.Num() && RenderSelectionInstances==InstanceAssets.Num())return;
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RenderSelection);
-    ViewAssets.Empty();FrameAssets.Empty();ValueAssets.Empty();ViewInstances.Empty();FrameInstances.Empty();ValueInstances.Empty();
+    ++RenderSelectionRebuilds;
+    ViewAssets.Empty();FrameAssets.Empty();ValueAssets.Empty();ViewInstances.Empty();FrameInstances.Empty();ValueInstances.Empty();AssetInstances.Empty();
     for(const auto& Pair:MeshData) {
         if(!TargetedRenderUpdates || Pair.Value.Background || Pair.Value.FirstPerson)ViewAssets.Add(Pair.Key);
         if(!TargetedRenderUpdates || !Pair.Value.TextureFrameGroup.IsEmpty())FrameAssets.Add(Pair.Key);
         if(!TargetedRenderUpdates || !Pair.Value.MaterialValueGroup.IsEmpty())ValueAssets.Add(Pair.Key);
     }
     for(const auto& Pair:InstanceAssets) {
+        AssetInstances.FindOrAdd(Pair.Value).Add(Pair.Key);
         if(ViewAssets.Contains(Pair.Value))ViewInstances.Add(Pair.Key,Pair.Value);
         if(FrameAssets.Contains(Pair.Value))FrameInstances.Add(Pair.Key,Pair.Value);
         if(ValueAssets.Contains(Pair.Value))ValueInstances.Add(Pair.Key,Pair.Value);
     }
     RenderSelectionCatalog=Catalog;RenderSelectionMeshes=MeshData.Num();RenderSelectionInstances=InstanceAssets.Num();RenderSelectionDirty=false;
+}
+
+void AMWLive::SetRenderAssetTraits(const FString& Asset,uint8 Traits) {
+    // Catalog commits change only the classifications of added/retired assets.
+    // Index their existing instances instead of scanning all world bindings.
+    auto Update=[&](uint8 Bit,TSet<FString>& Assets,TMap<FString,FString>& Instances) {
+        const bool Selected=(Traits&Bit)!=0;
+        if(Assets.Contains(Asset)==Selected)return;
+        if(Selected)Assets.Add(Asset);else Assets.Remove(Asset);
+        if(const auto* Ids=AssetInstances.Find(Asset))for(const auto& Id:*Ids){if(Selected)Instances.Add(Id,Asset);else Instances.Remove(Id);}
+    };
+    Update(1,ViewAssets,ViewInstances);Update(2,FrameAssets,FrameInstances);Update(4,ValueAssets,ValueInstances);
+}
+
+void AMWLive::SetInstanceAsset(const FString& Id,const FString& Asset) {
+    if(const auto* Previous=InstanceAssets.Find(Id))if(*Previous==Asset)return;
+    const bool Warm=!RenderSelectionDirty && RenderSelectionCatalog==Catalog && RenderSelectionMeshes==MeshData.Num() && RenderSelectionInstances==InstanceAssets.Num();
+    if(Warm)if(const auto* Previous=InstanceAssets.Find(Id))if(auto* Ids=AssetInstances.Find(*Previous)){Ids->Remove(Id);if(!Ids->Num())AssetInstances.Remove(*Previous);}
+    InstanceAssets.Add(Id,Asset);
+    if(!Warm){RenderSelectionDirty=true;return;}
+    AssetInstances.FindOrAdd(Asset).Add(Id);
+    // Instance churn does not change the catalog's asset classifications.
+    // Patch these small selections instead of walking the entire world twice
+    // in a frame as streamed resources are registered and then posed.
+    auto Update=[&](const TSet<FString>& Assets,TMap<FString,FString>& Instances) {
+        if(Assets.Contains(Asset))Instances.Add(Id,Asset);else Instances.Remove(Id);
+    };
+    Update(ViewAssets,ViewInstances);Update(FrameAssets,FrameInstances);Update(ValueAssets,ValueInstances);
+    RenderSelectionInstances=InstanceAssets.Num();
+}
+
+void AMWLive::RemoveInstanceAsset(const FString& Id) {
+    const bool Warm=!RenderSelectionDirty && RenderSelectionCatalog==Catalog && RenderSelectionMeshes==MeshData.Num() && RenderSelectionInstances==InstanceAssets.Num();
+    if(Warm)if(const auto* Previous=InstanceAssets.Find(Id))if(auto* Ids=AssetInstances.Find(*Previous)){Ids->Remove(Id);if(!Ids->Num())AssetInstances.Remove(*Previous);}
+    if(!InstanceAssets.Remove(Id))return;
+    if(!Warm){RenderSelectionDirty=true;return;}
+    ViewInstances.Remove(Id);FrameInstances.Remove(Id);ValueInstances.Remove(Id);
+    RenderSelectionInstances=InstanceAssets.Num();
 }
 
 void AMWLive::UpdateViewCorrection() {

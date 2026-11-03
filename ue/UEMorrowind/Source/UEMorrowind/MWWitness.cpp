@@ -166,7 +166,7 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("first_person_corrected_materials"),ViewCorrectedMaterials);
     Out->SetNumberField(TEXT("first_person_pose_unix_ns"),ViewPoseStamp*1e9);
     Out->SetNumberField(TEXT("first_person_lane_updates"),ViewLaneUpdates);Out->SetNumberField(TEXT("first_person_lane_unix_ns"),ViewLaneStamp*1e9);Out->SetNumberField(TEXT("first_person_lane_read_ms"),ViewLaneReadMs);
-    Out->SetNumberField(TEXT("native_lighting_cpu_ms"),LightingCpuMs);auto Parts=MakeShared<FJsonObject>();for(const auto& P:GeometryCpuMs)Parts->SetNumberField(P.Key,P.Value);Out->SetObjectField(TEXT("geometry_cpu_ms"),Parts);
+    Out->SetNumberField(TEXT("native_lighting_cpu_ms"),LightingCpuMs);Out->SetNumberField(TEXT("render_selection_rebuilds"),RenderSelectionRebuilds);auto Parts=MakeShared<FJsonObject>();for(const auto& P:GeometryCpuMs)Parts->SetNumberField(P.Key,P.Value);Out->SetObjectField(TEXT("geometry_cpu_ms"),Parts);
     Out->SetNumberField(TEXT("first_person_depth_scale"),MWFirstPersonDepthScale);
     const auto& VP=ViewPoseCamera.GetLocation();
     Out->SetArrayField(TEXT("first_person_pose_camera"),{MakeShared<FJsonValueNumber>(VP.Y),MakeShared<FJsonValueNumber>(VP.X),MakeShared<FJsonValueNumber>(VP.Z)});
@@ -345,6 +345,17 @@ void AMWLive::PublishStateWitness() {
         SetVisualReference(Profile==TEXT("reference"));
     }
     auto Witness=BuildStateWitness(Ids,Now);Witness->SetStringField(TEXT("request_id"),Token);
+    if(Request->HasField(TEXT("record_seconds"))) {
+        double Seconds=0;
+        if(!DiagnosticScreenshots || !Request->TryGetNumberField(TEXT("record_seconds"),Seconds) || Seconds<1 || Seconds>10 || Seconds!=FMath::TruncToDouble(Seconds))return;
+        if(RecordSeconds<=0 || Tick-CaptureStarted>=RecordSeconds) {
+            RecordSeconds=(int32)Seconds;CaptureStarted=Tick;LastRecordCapture=0;RecordFrame=0;
+            CaptureFolder=DataRoot/TEXT("local/recordings")/FGuid::NewGuid().ToString(EGuidFormats::Digits);
+            IFileManager::Get().MakeDirectory(*CaptureFolder,true);
+            FFileHelper::SaveStringToFile(TEXT("file,request_unix_ns,sequence,status\n"),*(CaptureFolder/TEXT("frames.csv")));
+        }
+        Witness->SetStringField(TEXT("capture_folder"),CaptureFolder);Witness->SetNumberField(TEXT("capture_seconds"),RecordSeconds);
+    }
     FString Body;FJsonSerializer::Serialize(Witness.ToSharedRef(),TJsonWriterFactory<TCHAR,TCondensedJsonPrintPolicy<TCHAR>>::Create(&Body));
     const FString Path=Folder/TEXT("witness.json");
     if(!FFileHelper::SaveStringToFile(Body,*(Path+TEXT(".tmp")),FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM))return;

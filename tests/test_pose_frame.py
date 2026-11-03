@@ -14,6 +14,30 @@ def header(identity=(0,0),flags=0,bound=(0,10,0,1),transform=None):
     return bytes(raw)
 
 class PoseFrameTests(unittest.TestCase):
+    def test_cell_slots_own_borrowed_render_roots_and_retirement_still_wins(self):
+        root=bytearray(header());struct.pack_into('<I',root,0x18,0x90000)
+        records=[(0x20000,(3,0),(0x10000,),None,None),(0x30000,(4,0),(0x10000,),None,None)]
+        raw={0x10000:bytes(root),0x20000:header((3,0)),0x30000:header((4,0)),0x60014:struct.pack('<I',0x10000)}
+        layout=PoseLayout(records,node_identities={0x10000:(0,0x80000)},cell_root_owners={0x10000:((0x60014,0x10000),)})
+        frame=PoseFrame(raw,layout,CAMERA)
+        np.testing.assert_array_equal(frame.visible,[True,True]);self.assertEqual(frame.invalid_count,0)
+        raw[0x30000]=header((4,0),flags=1)
+        np.testing.assert_array_equal(PoseFrame(raw,layout,CAMERA).visible,[True,False])
+        raw[0x60014]=struct.pack('<I',0x70000)
+        np.testing.assert_array_equal(PoseFrame(raw,layout,CAMERA).visible,[False,False])
+        raw[0x60014]=struct.pack('<I',0x10000);struct.pack_into('<I',root,0,99);raw[0x10000]=bytes(root)
+        np.testing.assert_array_equal(PoseFrame(raw,layout,CAMERA).visible,[False,False])
+        struct.pack_into('<I',root,0,0);struct.pack_into('<H',root,0x14,1);raw[0x10000]=bytes(root)
+        np.testing.assert_array_equal(PoseFrame(raw,layout,CAMERA).visible,[False,False])
+
+    def test_land_root_requires_both_the_cell_land_slot_and_land_root_slot(self):
+        records=[(0x20000,(3,0),(0x10000,),None,None)]
+        raw={0x10000:header(),0x20000:header((3,0)),0x60020:struct.pack('<I',0x70000),0x70010:struct.pack('<I',0x10000)}
+        layout=PoseLayout(records,node_identities={0x10000:(0,0x90000)},cell_root_owners={0x10000:((0x60020,0x70000),(0x70010,0x10000))})
+        self.assertTrue(PoseFrame(raw,layout,CAMERA).visible[0])
+        for address in (0x60020,0x70010):
+            old=raw.pop(address);self.assertFalse(PoseFrame(raw,layout,CAMERA).visible[0]);raw[address]=old
+
     def test_offscreen_casters_survive_camera_turns_but_native_hiding_wins(self):
         records=[(p,(3,0),(),None,None)for p in(0x20000,0x30000,0x40000)]
         raw={p:header((3,0),bound=(0,-400,0,10),flags=1 if p==0x30000 else 0)for p in(0x20000,0x30000,0x40000)}

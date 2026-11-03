@@ -34,4 +34,10 @@ Topology discovery uses `uemw.view.discovery` v1 in `view-refresh.json`, with PI
 
 The x64 read helper ABI is **1**. It accepts bounded uint32 x86 address ranges and copies into owned external buffers. It has no process-write API and is not loaded into Morrowind. Read plans may be reused; sampled bytes may not be relabeled with a newer timestamp. Node ownership, model identity and exact requested-byte fallbacks remain mandatory.
 
+Cell render roots use ownership checks against the live TES cell root slots in the same captured read. Land roots also require the cell's land pointer to match. Traversal stops at the owned root; a temporary parent above it is not an object-lifetime dependency. Root type, root-slot replacement, native hide flags, child identities, switches and actor-reference fences still apply. These are internal read-layout changes, not a wire-version change.
+
 Presentation, witness and stop controls are local, versioned and process/scene scoped. A stop request must match its recorded run token/owner; stale PID files cannot authorize stopping another process. Normal play does not generate input or recording requests. Developer input probes require the exact private game in the foreground.
+
+Presentation file reads/writes run in a bounded background task. Controller and renderer timestamps retain their original sample times; delayed I/O does not renew a lease. The existing 500 ms source/controller expiry rules remain in force. A disjoint side-by-side view retains its existing physical-window safety check.
+
+With `-UEMWDiagnosticScreenshots` only, a witness request may include integer `record_seconds` from 1 through 10 to trigger the existing backbuffer recorder after startup. Its response includes `capture_folder`. Requests are not queued or extended while a capture is active. PNG capture can stall rendering and skip requests; keep it separate from timing measurements.

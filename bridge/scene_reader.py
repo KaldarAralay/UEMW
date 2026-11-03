@@ -91,6 +91,9 @@ class SceneReader:
         if not cell:
             raise RuntimeError('No active cell')
         cell_name=self.r.string(self.r.u32(cell+0x10))
+        from node_ownership import cell_roots
+        own_cells=[(int(c['cell_ptr'],16),[int(p,16)for p in c['roots']])for c in cells]if cells is not None else [(cell,None)]
+        cell_root_owners=cell_roots(self.r,own_cells)if owned_scene or any(a['layer']=='player'and a.get('owner_ref')for a in aux_roots or())else{}
         if cells is None:
             if roots is None:roots=scene_roots(self.r,cell)
             pending=[(p,False,(0,0,0,2),0,(),index>=2,'interior:'+hex(cell)) for index,p in enumerate(roots) if p]
@@ -136,12 +139,12 @@ class SceneReader:
             return switches[node]
         initial=[]
         for ptr,hidden,props,depth,parents,terrain,layer in pending:
-            chain=[];gates=[];child=ptr;parent=actor_owners[ptr]['cell_root']if ptr in actor_owners else self.r.u32(ptr+0x18)
+            chain=[];gates=[];child=ptr;parent=0 if ptr in cell_root_owners else actor_owners[ptr]['cell_root']if ptr in actor_owners else self.r.u32(ptr+0x18)
             while parent:
                 if parent in chain or len(chain)>=96:raise SceneReadChanged('Original parent chain changed or cycled')
                 if remember_switch(parent):gates.append((parent,child))
                 native=self.r.read(parent,0x1c);node_identities[parent]=(struct.unpack_from('<I',native)[0],struct.unpack_from('<I',native,0x18)[0])
-                chain.append(parent);child=parent;parent=self.r.u32(parent+0x18)
+                chain.append(parent);child=parent;parent=0 if parent in cell_root_owners else self.r.u32(parent+0x18)
             initial.append((ptr,hidden,props,depth,tuple(chain),terrain,layer,tuple(gates)))
         pending=initial
         visited=set()
@@ -248,7 +251,7 @@ class SceneReader:
         return {'cell':cell_name,'cell_ptr':hex(cell),'roots':[hex(p) for p in roots],
                 'stream_cells':cells or [],
                 'nodes':len(visited),'counts':dict(counts),'shapes':shapes,'errors':errors,'lights':sorted(lights),'switches':switches,
-                'node_identities':node_identities,'actor_owners':actor_owners,'light_owners':{p:tuple(owners)for p,owners in light_owners.items()}}
+                'node_identities':node_identities,'actor_owners':actor_owners,'cell_root_owners':cell_root_owners,'light_owners':{p:tuple(owners)for p,owners in light_owners.items()}}
 
 
 def main():

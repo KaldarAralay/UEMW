@@ -10,6 +10,21 @@ from game_assets import Assets
 from scene_reader import SceneReader
 
 class ProcessTransferTests(unittest.TestCase):
+    def test_process_transfer_preserves_live_cell_slot_retirement_fences(self):
+        from pose_frame import PoseLayout,PoseFrame
+        from test_pose_frame import header,CAMERA
+        g=Geometry.__new__(Geometry);g.shapes=[]
+        g.records=[(0x20000,(3,0),(0x10000,),None,None)]
+        g.pose_requests=ReadPlan([(0x10000,0x74),(0x20000,0xac),(0x60014,4)])
+        g.cell_root_owners={0x10000:((0x60014,0x10000),)}
+        g.pose_layout=PoseLayout(g.records,read_plan=g.pose_requests,node_identities={0x10000:(0,0x70000)},cell_root_owners=g.cell_root_owners)
+        decoded=loads(dumps(g),None)
+        root=bytearray(header());struct.pack_into('<I',root,0x18,0x80000)
+        raw={0x10000:bytes(root),0x20000:header((3,0)),0x60014:struct.pack('<I',0x10000)}
+        self.assertTrue(PoseFrame(raw,decoded.pose_layout,CAMERA).visible[0])
+        raw[0x60014]=bytes(4)
+        self.assertFalse(PoseFrame(raw,decoded.pose_layout,CAMERA).visible[0])
+
     def test_auxiliary_delta_reuses_world_and_rebuilds_exact_visibility_without_retired_objects(self):
         import copy
         from preparation_process import auxiliary_patch,apply_auxiliary_patch

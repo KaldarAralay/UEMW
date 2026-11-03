@@ -69,6 +69,6 @@ Test-UEMW.cmd -Repository
 Test-UEMW.cmd -Renderer
 ```
 
-GitHub CI runs Windows owned-data tests without Morrowind/UE. Full UE builds/live tests require the separately installed licensed dependencies. Rendering hitches remain the next implementation task; setup cleanup does not claim to fix them.
+GitHub CI runs Windows owned-data tests without Morrowind/UE. Full UE builds/live tests require the separately installed licensed dependencies. See [rendering performance work](docs/PERFORMANCE.md) for the current hitch reductions, measurements and remaining limits.
 
 Original project code is [MIT licensed](LICENSE). Optional Real-ESRGAN adaptations retain their BSD-3-Clause notice; all third-party/game/engine licenses remain separate. UEMW is not affiliated with Bethesda, Valve or Epic.

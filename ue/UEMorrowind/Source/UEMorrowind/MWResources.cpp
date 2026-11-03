@@ -12,6 +12,10 @@
 
 void AMWLive::SetPrimitiveShown(UPrimitiveComponent* Component,bool Shown) {
     if(!Component)return;
+    if(DiagnosticVisibility && Component->IsA<UMWNativeSkinComponent>()) {
+        const bool WasShown=Component->GetVisibleFlag() && !NativeHiddenPrimitives.Contains(TWeakObjectPtr<UPrimitiveComponent>(Component));
+        if(WasShown!=Shown)UE_LOG(LogTemp,Display,TEXT("UEMW primitive visibility seq=%lld shown=%d component=%s catalog=%s"),Sequence,Shown,*Component->GetName(),*Catalog);
+    }
     // View filters alone do not retire a primitive from all shadow passes.
     // Remember eligibility and change the proxy only on a visibility transition.
     static const FName ShadowTag(TEXT("UEMWShadowCaster"));
@@ -61,14 +65,14 @@ void AMWLive::FlushRigidBatches() {
 
 void AMWLive::PrepareResourceIdentity(const FString& Id,const FString& Asset) {
     if(InstanceAssets.FindRef(Id)==Asset)return;
-    RenderSelectionDirty=true;
+    NativeResourceInvalidations.Add(Id);
     RainPoses.Remove(Id);
     RemoveRigid(Id);
     if(auto** Old=SkinnedComponents.Find(Id))(*Old)->DestroyComponent();
     if(auto** Old=GeometryComponents.Find(Id))(*Old)->DestroyComponent();
     SkinnedComponents.Remove(Id);GeometryComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);
     LastRigidTransforms.Remove(Id);UploadedBonePalettes.Remove(Id);UploadedVertexPoses.Remove(Id);
-    InstanceAssets.Add(Id,Asset);
+    SetInstanceAsset(Id,Asset);
 }
 
 void AMWLive::HideInstance(const FString& Id) {
@@ -127,7 +131,8 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         QueueGeometryResource(Kind,Id,Asset,Bound);
     };
     if(NewCatalog) {
-        for(const auto& B:GeometryBindings)ResourceBindings.Add(B.Id,B.Asset);
+        if(PreparedResourceCatalog==Catalog && PreparedResourceBindings.Num()==GeometryBindings.Num())ResourceBindings=MoveTemp(PreparedResourceBindings);
+        else for(const auto& B:GeometryBindings)ResourceBindings.Add(B.Id,B.Asset);
         const double Now=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds();
         if(Now>=ViewLaneStamp && Now-ViewLaneStamp<.15)for(const auto& Pair:ViewLaneAssets) {
             const auto* D=MeshData.Find(Pair.Value);
@@ -163,20 +168,23 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_AdvanceGeometryResources);
     if(ResourceCatalog!=Catalog){ResourceJobs.Empty();QueuedResources.Empty();ResourceJobIndex=0;return;}
     if(!ResourceError.IsEmpty() || ResourceJobIndex>=ResourceJobs.Num())return;
-    NativePoseValid=false; // resource construction/removal invalidates retained submission state
+    // A resource job invalidates only the instances it changes. Clearing the
+    // complete-world cache here made one streamed object revalidate thousands
+    // of unrelated primitives on the next fresh frame.
     const double Began=FPlatformTime::Seconds();
     ON_SCOPE_EXIT {if(PerfResourceMs.Num()<120)PerfResourceMs.Add((FPlatformTime::Seconds()-Began)*1000);};
     int32 Jobs=0;
     while(ResourceJobIndex<ResourceJobs.Num()) {
         const auto& Job=ResourceJobs[ResourceJobIndex];const auto* D=MeshData.Find(Job.Asset);
         auto* Material=GeometryMaterials.FindRef(Job.Asset);
+        if(!Job.Id.IsEmpty())NativeResourceInvalidations.Add(Job.Id);
         if(Job.Kind==4) {
             if(InstanceAssets.FindRef(Job.Id)==Job.Asset && ResourceBindings.FindRef(Job.Id)!=Job.Asset) {
                 RemoveRigid(Job.Id);
                 if(auto** Old=SkinnedComponents.Find(Job.Id))(*Old)->DestroyComponent();
                 if(auto** Old=GeometryComponents.Find(Job.Id))(*Old)->DestroyComponent();
                 SkinnedComponents.Remove(Job.Id);GeometryComponents.Remove(Job.Id);SkinMaterials.Remove(Job.Id);PaletteTextures.Remove(Job.Id);
-                InstanceAssets.Remove(Job.Id);InstanceCells.Remove(Job.Id);LastRigidTransforms.Remove(Job.Id);UploadedBonePalettes.Remove(Job.Id);UploadedVertexPoses.Remove(Job.Id);
+                RemoveInstanceAsset(Job.Id);InstanceCells.Remove(Job.Id);LastRigidTransforms.Remove(Job.Id);UploadedBonePalettes.Remove(Job.Id);UploadedVertexPoses.Remove(Job.Id);
             }
         }else if(!D || !Material){ResourceError=TEXT("Retired or missing resource dependency");return;}
         else if(Job.Kind==5) {
@@ -206,7 +214,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Job.Asset,Batch);
                 // A replacement batch cannot expose retained rows from an old
                 // sample. Only a subsequent fresh pose can make them visible.
-                for(const auto& Slot:RigidSlots)if(Slot.Value.Asset==Job.Asset){RigidVisible.Remove(Slot.Key);LastRigidTransforms.Remove(Slot.Key);RigidRows.FindOrAdd(Job.Asset).Add(Slot.Value.Id,FTransform(FQuat::Identity,FVector::ZeroVector,FVector::ZeroVector));}
+                for(const auto& Slot:RigidSlots)if(Slot.Value.Asset==Job.Asset){NativeResourceInvalidations.Add(Slot.Key);RigidVisible.Remove(Slot.Key);LastRigidTransforms.Remove(Slot.Key);RigidRows.FindOrAdd(Job.Asset).Add(Slot.Value.Id,FTransform(FQuat::Identity,FVector::ZeroVector,FVector::ZeroVector));}
                 DirtyRigidAssets.Add(Job.Asset);
             }
         }else if(Job.Kind==2) {
