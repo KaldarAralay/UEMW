@@ -5,6 +5,7 @@ The independent presentation controller compares these exact menus with the
 native UI geometry lane before allowing unified presentation.
 """
 import struct
+from live_probe import SceneReadChanged
 
 
 def loading_state(reader):
@@ -29,7 +30,10 @@ def loading_state(reader):
             flags=reader.read(cached[1]+0x75,2)
             if any(v>1 for v in flags):raise ValueError('Invalid native loading visibility')
             loading=bool(flags[0]or flags[1])
-        if reader.u32(0x7D1C28)!=root or reader.read(root+0x1c,12)!=raw:raise RuntimeError('Loading UI changed during inspection')
+        # A menu close/rebuild can replace this vector within one read. Drop
+        # that incoherent sample through the existing age-bounded retry path;
+        # it is not evidence that the original scene became unavailable.
+        if reader.u32(0x7D1C28)!=root or reader.read(root+0x1c,12)!=raw:raise SceneReadChanged('Loading UI changed during inspection')
     serial=getattr(reader,'_load_serial',0)
     if loading and not getattr(reader,'_was_loading',False):serial+=1
     reader._load_serial=serial;reader._was_loading=loading

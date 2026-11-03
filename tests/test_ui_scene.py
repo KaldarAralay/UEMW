@@ -26,6 +26,53 @@ class NativeUIProjectionTests(unittest.TestCase):
         n.value=2;r.begin();n.value=3;self.assertEqual(r.read(0x11003,2),b'\x02\x02')
         r.begin();self.assertEqual(r.read(0x11003,2),b'\x03\x03')
 
+    def test_mode_prefetch_reuses_only_addresses_and_retired_hints_do_not_poison_neighbours(self):
+        from ui_read import UIReader
+        class Native:
+            value=1;retired=set();reads=[]
+            def read(self,p,n):
+                self.reads.append((p,n))
+                if any(p<=a<p+n for a in self.retired):raise OSError('retired allocation')
+                return bytes([self.value])*n
+        n=Native();r=UIReader(n);r.begin('inventory');r.read(0x10000,4);r.read(0x11000,4)
+        r.begin('hud');r.read(0x20000,4);n.value=2;n.retired={0x10000};n.reads=[];r.begin('inventory')
+        self.assertEqual(r.read(0x11000,4),b'\x02'*4);self.assertNotIn((0x11000,4),n.reads)
+        with self.assertRaises(OSError):r.read(0x10000,4)
+        n.value=3;r.begin('hud');self.assertEqual(r.read(0x20000,4),b'\x03'*4)
+
+    def test_new_menu_page_is_owned_once_and_never_reused_in_a_new_sample(self):
+        from ui_read import UIReader
+        class Native:
+            value=1
+            def __init__(self):self.reads=[]
+            def read(self,p,n):self.reads.append((p,n));return bytes([self.value])*n
+        n=Native();r=UIReader(n);r.begin('new-menu')
+        for i in range(64):self.assertEqual(r.read(0x11000+i*4,4),b'\x01'*4)
+        self.assertEqual(n.reads,[(0x11000,4096)])
+        n.value=2;r.begin('new-menu');self.assertEqual(r.read(0x11000,4),b'\x02'*4)
+
+    def test_flat_ui_snapshot_owns_cross_page_bytes_and_ignores_failed_spans(self):
+        from ui_read import UIReader
+        class Bulk:
+            api=True
+            def __init__(self,native):self.native=native
+            def copy_flat(self,plan):
+                self.scratch=bytearray([self.native.value])*plan.total
+                valid=tuple(not any(p<=a<p+n for a in self.native.retired)for p,n,_ in plan.groups)
+                return self.scratch,valid
+        class Native:
+            value=1;retired=set()
+            def __init__(self):self._native_batch=Bulk(self)
+            def read(self,p,n):
+                if any(p<=a<p+n for a in self.retired):raise OSError('retired page')
+                return bytes([self.value])*n
+        n=Native();r=UIReader(n);r.begin('inventory');self.assertEqual(r.read(0x10ffc,8),b'\x01'*8)
+        n.value=2;r.begin('inventory');n._native_batch.scratch[:]=b'\x09'*len(n._native_batch.scratch);n.value=3
+        self.assertEqual(r.read(0x10ffc,8),b'\x02'*8);self.assertEqual(r.read(0x11000,4),b'\x02'*4)
+        n.value=4;n.retired={0x10000};r.begin('inventory')
+        self.assertEqual(r.read(0x11000,4),b'\x04'*4)
+        with self.assertRaises(OSError):r.read(0x10000,4)
+
     def test_geometry_reuse_requires_current_native_vertices_and_colour(self):
         class Reader:
             def read(self,p,n):return data[p]
@@ -33,11 +80,18 @@ class NativeUIProjectionTests(unittest.TestCase):
         c=UICapture.__new__(UICapture);c.r=Reader();c.geometry_cache={};h=bytearray(0x48);struct.pack_into('<I',h,0x1c,1);struct.pack_into('<I',h,0x28,2);struct.pack_into('<I',h,0x3c,3)
         s=dict(vertex_count=3,triangle_count=1,material='0x0',color_mode=0,transform=dict(rotation=np.eye(3).ravel(),scale=1,position=[0,0,0]))
         camera=dict(position=[0,0,0],forward=[0,1,0],right=[1,0,0],up=[0,0,1],frustum=[-1,1,1,-1,1,100])
-        args=(0x10000,b'node',bytes(h),s,camera,b'camera',640,480,(0,0,640,480));first=c.geometry(*args);self.assertIs(c.geometry(*args),first)
+        node=bytearray(0xa0);struct.pack_into('<13f',node,0x40,*np.eye(3).ravel(),0,0,0,1)
+        args=(0x10000,bytes(node),bytes(h),s,camera,b'camera',640,480,(0,0,640,480));first=c.geometry(*args);self.assertIs(c.geometry(*args),first)
         data[1]=struct.pack('<9f',-1,2,2,2,2,2,0,2,-2);changed=c.geometry(*args);self.assertIsNot(changed,first);self.assertNotEqual(first[0][0,0],changed[0][0,0])
         # Journal anchors move final glyphs after native layout. Cached Element
         # boxes are identity metadata, not a second clip on the resolved mesh.
         moved=c.geometry(*args[:-1],(0,0,1,1));self.assertIsNotNone(moved);np.testing.assert_array_equal(moved[0],changed[0])
+        # The graph still has its older transform. Current owned header bytes
+        # must move the cursor and cannot inherit a prior validation result.
+        struct.pack_into('<f',node,0x64,.5);current=(args[0],bytes(node),*args[2:]);translated=c.geometry(*current)
+        self.assertIsNot(translated,changed);self.assertNotEqual(translated[0][0,0],changed[0][0,0]);self.assertIs(c.geometry(*current),translated)
+        struct.pack_into('<f',node,0x64,float('nan'))
+        with self.assertRaisesRegex(ValueError,'transform'):c.geometry(args[0],bytes(node),*args[2:])
 
     def test_native_perspective_and_near_rejection(self):
         c=dict(position=[0,0,0],forward=[0,1,0],right=[1,0,0],up=[0,0,1],frustum=[-1,1,1,-1,1,100])
@@ -63,6 +117,19 @@ class NativeUIProjectionTests(unittest.TestCase):
         self.assertEqual(struct.unpack_from('<4f4B',body,72),(1,2,.25,.5,255,0,0,128))
         self.assertEqual(struct.unpack_from('<3H',body,len(body)-6),(0,1,2))
 
+    def test_wire_cache_requires_immutable_current_geometry_and_keeps_fresh_header(self):
+        v=np.array([[1,2,0,0,1,1,1,1],[3,2,1,0,1,1,1,1],[1,4,0,1,1,1,1,1]],dtype=float)
+        indices=np.array([[0,1,2]],dtype=np.uint16);v.flags.writeable=False;indices.flags.writeable=False
+        draw=dict(id=0x10000,texture=0xffffffff,vertices=v,indices=indices);s=dict(width=640,height=480,draws=[draw]);cache={};session='11112222-3333-4444-5555-666677778888'
+        a=encode(s,session,1,1700000000000000000,42,cache);owned=cache[draw['id']][3]
+        b=encode(s,session,2,1700000000000000001,42,cache)
+        self.assertIs(cache[draw['id']][3],owned);self.assertEqual(a[56:],b[56:]);self.assertEqual(HEADER.unpack_from(b)[4],2)
+        self.assertEqual(b,encode(s,session,2,1700000000000000001,42))
+        draw['texture']=0;changed=encode(s,session,3,1700000000000000002,42,cache);self.assertNotEqual(changed[56:],b[56:])
+        v.flags.writeable=True;v[0,0]=8
+        self.assertEqual(encode(s,session,4,1700000000000000003,42,cache),encode(s,session,4,1700000000000000003,42))
+        encode({**s,'draws':[]},session,5,1700000000000000004,42,cache);self.assertFalse(cache)
+
     def test_live_pixel_masks_and_revision_fence(self):
         class Reader:
             def __init__(self,changed=False,alpha=0xff000000):self.changed=changed;self.reads=0;self.alpha=alpha
@@ -78,6 +145,7 @@ class NativeUIProjectionTests(unittest.TestCase):
             c=UICapture.__new__(UICapture);c.r=Reader();c.scene=type('Scene',(),{'ancestry':lambda _,p:['NiSourceTexture']})();c.folder=Path(temp);c.files=OrderedDict();c.used=set()
             row=c.texture(0x10000,0);body=(c.folder/row['file']).read_bytes()
             self.assertEqual(body[12:],bytes([10,20,30,128]));self.assertEqual(row['sha256'],hashlib.sha256(body).hexdigest())
+            self.assertIs(c.texture(0x10000,0),row)
             c.r=Reader(alpha=0);row=c.texture(0x10000,0);self.assertEqual((c.folder/row['file']).read_bytes()[12:],bytes([10,20,30,255]))
             from live_probe import SceneReadChanged
             c.r=Reader(True)
@@ -109,6 +177,7 @@ class NativeUIPresentationTests(unittest.TestCase):
     def test_menu_transition_is_bounded_then_fallback_latches(self):
         t=Transition();self.assertTrue(t.hold('inventory',False,10));self.assertFalse(t.hold('inventory',False,10.151))
         self.assertFalse(t.hold('inventory',True,11));self.assertTrue(t.hold('dialog',False,12))
+        cold=Transition();self.assertTrue(cold.hold('first-menu',False,20,1.25));self.assertTrue(cold.hold('first-menu',False,20.8,1.25));self.assertFalse(cold.hold('first-menu',False,21.251,1.25))
         latch=OverlayLatch();latch.apply('a','overlay',True,'ue_native_ui')
         self.assertEqual(latch.apply('a','overlay',False,'ui_unavailable'),(False,'fallback_latched_restart_overlay'))
         self.assertFalse(latch.apply('a','overlay',True,'ue_native_ui')[0])

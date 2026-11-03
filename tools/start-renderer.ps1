@@ -1,5 +1,6 @@
-param([string]$EngineRoot,[switch]$Editor,[switch]$TwoWindows=$true,[ValidateRange(128,8192)][int]$Width=1920,[ValidateRange(96,8192)][int]$Height=1080,[ValidateRange(15,60)][int]$MaxFPS=60,[switch]$DiagnosticScreenshots,[switch]$DiagnosticTrace,[switch]$PresentationStats,[switch]$DisableRHIThread=$true,[ValidateRange(0,600)][int]$RecordSeconds=0,[ValidateSet('d3d11','d3d12','vulkan')][string]$RHI='d3d11',[ValidateSet('immediate','mailbox','fifo','auto')][string]$VulkanPresentMode='auto')
+param([string]$EngineRoot,[switch]$Editor,[switch]$TwoWindows=$true,[ValidateRange(128,8192)][int]$Width=1920,[ValidateRange(96,8192)][int]$Height=1080,[ValidateRange(15,60)][int]$MaxFPS=60,[switch]$DiagnosticScreenshots,[switch]$DiagnosticTrace,[switch]$PresentationStats,[switch]$DisableRHIThread,[ValidateRange(0,600)][int]$RecordSeconds=0,[ValidateSet('d3d11','d3d12','vulkan')][string]$RHI='d3d12',[ValidateSet('immediate','mailbox','fifo','auto')][string]$VulkanPresentMode='auto')
 $ErrorActionPreference='Stop'
+if(!$PSBoundParameters.ContainsKey('DisableRHIThread')){$DisableRHIThread=$RHI -ne 'd3d12'}
 . (Join-Path $PSScriptRoot 'environment.ps1')
 Initialize-UEMWEnvironment
 if($Editor){$EngineRoot=Resolve-UEMWEngineRoot -EngineRoot $EngineRoot}
@@ -22,11 +23,10 @@ if($RHI -eq 'vulkan' -and $VulkanPresentMode -ne 'auto'){
 }
 if($DiagnosticScreenshots){$ArgsList+='-UEMWDiagnosticScreenshots'}
 if($PresentationStats){$ArgsList+='-UEMWPresentationStats'}
-if($DiagnosticTrace){$ArgsList+=@('-trace=cpu,frame,gpu,bookmark','-statnamedevents','-tracefiletrunc',"-tracefile=`"$(Join-Path $ProjectRoot 'logs\client-performance.utrace')`"")}
-# UE5.2's separate RHI thread reproduced multi-second resource-flush waits on
-# this machine. Keep the render thread, but submit graphics work there. This
-# is local to this client; it changes no driver or installed-engine settings.
-if($DisableRHIThread){$ArgsList+='-norhithread'}
+if($DiagnosticTrace){$ArgsList+=@('-trace=cpu,frame,gpu,bookmark','-tracefiletrunc',"-tracefile=`"$(Join-Path $ProjectRoot 'logs\client-performance.utrace')`"")}
+# D3D12 uses the validated separate submission thread. D3D11/Vulkan retain
+# their bounded legacy path. This changes no driver or engine installation.
+if($DisableRHIThread){$ArgsList+='-norhithread'}else{$ArgsList+='-rhithread'}
 if($RecordSeconds){$ArgsList+="-UEMWRecordSeconds=$RecordSeconds"}
 # Keep shader warmup from taking keyboard focus. The managed controller shows
 # the passive window without activation once it is ready.

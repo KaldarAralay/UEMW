@@ -1,5 +1,7 @@
 # Rendering goals
 
+Follow-up goal (active): responsive native UI and consistent frame pacing. Measure capture/publication/decode/upload/actual Canvas submission/render-thread timing separately from heartbeat observation. Target warm native UI response p95 <=100 ms, warm gameplay frame intervals p95 <=20 ms and no recurring >33 ms spikes, preserving visual quality, original authority, input ownership and fail-safe behavior. The current build meets the bounded checkpoint CPU/UI targets and has live regression evidence, but broader render-thread/GPU/display pacing remains open: DXGI observations still include 33 ms intervals and a different post-NPC view exceeds the CPU target. See PERFORMANCE.md for current results and limits.
+
 The user authorized this ordered sequence on 2026-11-02, including automatic progression after each completed goal. Only one Codex goal is active at a time; the remaining goals are queued here. A goal is complete only after implementation, meaningful verification and a reproducible packaged build. Partial improvements and unsupported cases must remain explicit.
 
 Morrowind remains authoritative for gameplay, collision, scripts, animation events/timing, inventory and saves. No OpenMW substitution, UE gameplay simulation, invented motion or video-feed scene rendering. Preserve the Steam installation and existing saves; use the private disposable checkpoint for live tests. Keep normal startup free of recordings and heavy diagnostics. Refresh the source-only package/audit at completed build milestones.

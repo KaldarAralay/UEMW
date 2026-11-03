@@ -1,9 +1,10 @@
-param([ValidateRange(128,8192)][int]$Width=1920,[ValidateRange(96,8192)][int]$Height=1080,[ValidateRange(15,60)][int]$MaxFPS=60,[ValidateRange(1,60)][int]$StateHz=60,[switch]$CaptureCrashes,[switch]$Editor,[switch]$TwoWindows=$true,[switch]$Overlay,[switch]$DiagnosticScreenshots,[switch]$DiagnosticTrace,[switch]$PresentationStats,[string]$EngineRoot,[ValidateSet('d3d11','d3d12','vulkan')][string]$RHI='d3d11',[switch]$CheckOnly)
+param([ValidateRange(128,8192)][int]$Width=1920,[ValidateRange(96,8192)][int]$Height=1080,[ValidateRange(15,60)][int]$MaxFPS=60,[ValidateRange(1,60)][int]$StateHz=60,[switch]$CaptureCrashes,[switch]$Editor,[switch]$TwoWindows=$true,[switch]$Overlay,[switch]$DiagnosticScreenshots,[switch]$DiagnosticTrace,[switch]$PresentationStats,[string]$EngineRoot,[ValidateSet('d3d11','d3d12','vulkan')][string]$RHI='d3d12',[switch]$CheckOnly)
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'environment.ps1')
 Initialize-UEMWEnvironment
 if($Editor){$EngineRoot=Resolve-UEMWEngineRoot -EngineRoot $EngineRoot}
 if($Overlay){$TwoWindows=$false}
+$DisableRHIThread=$RHI -ne 'd3d12';$ExpectedThreadFlag=if($DisableRHIThread){'norhithread'}else{'rhithread'}
 $ProjectRoot=Split-Path -Parent $PSScriptRoot
 if(!(Test-Path -LiteralPath (Join-Path $ProjectRoot 'local\venv\Scripts\python.exe'))){throw 'Project Python environment is missing. Run Setup-UEMW.cmd first. No game was started.'}
 . (Join-Path $PSScriptRoot 'client-path.ps1')
@@ -87,14 +88,14 @@ Write-Output "Native bridge connection verified: $ReaderProcessId"
 $UProject=Join-Path $ProjectRoot 'ue\UEMorrowind\UEMorrowind.uproject'
 $Renderers=@(Get-CimInstance Win32_Process -Filter "Name='UnrealEditor.exe' OR Name='UEMorrowind.exe'" | Where-Object {$_.ExecutablePath -ieq $RendererExe -and $_.CommandLine -match '(?i)(?:^|\s)-UEMWManaged(?:\s|$)' -and (!$Editor -or $_.CommandLine -like "*$UProject*")})
 if($Renderers.Count -gt 1){throw 'Multiple project renderers exist; launch refused.'}
-if($Renderers.Count -and ($Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-UEMWMaxFPS=$MaxFPS(?:\s|$)" -or $Renderers[0].CommandLine -notmatch '(?i)(?:^|\s)-norhithread(?:\s|$)' -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-ResX=$Width(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-ResY=$Height(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-$RHI(?:\s|$)" -or [bool]($Renderers[0].CommandLine -match '(?i)(?:^|\s)-UEMWSeparate(?:\s|$)') -ne [bool]$TwoWindows)){
+if($Renderers.Count -and ($Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-UEMWMaxFPS=$MaxFPS(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-$ExpectedThreadFlag(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-ResX=$Width(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-ResY=$Height(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-$RHI(?:\s|$)" -or [bool]($Renderers[0].CommandLine -match '(?i)(?:^|\s)-UEMWSeparate(?:\s|$)') -ne [bool]$TwoWindows)){
     # Retain this verified bridge when explicitly changing client settings.
     & (Join-Path $PSScriptRoot 'stop-renderer-guard.ps1')
     Stop-Process -Id $Renderers[0].ProcessId -ErrorAction Stop
     $Renderers=@()
     Write-Output "Restarting this project renderer with managed presentation and $RHI."
 }
-if(!$Renderers.Count){& (Join-Path $PSScriptRoot 'start-renderer.ps1') -EngineRoot $EngineRoot -Editor:$Editor -TwoWindows:$TwoWindows -RHI $RHI -Width $Width -Height $Height -MaxFPS $MaxFPS -DiagnosticScreenshots:$DiagnosticScreenshots -DiagnosticTrace:$DiagnosticTrace -PresentationStats:$PresentationStats}
+if(!$Renderers.Count){& (Join-Path $PSScriptRoot 'start-renderer.ps1') -EngineRoot $EngineRoot -Editor:$Editor -TwoWindows:$TwoWindows -RHI $RHI -DisableRHIThread:$DisableRHIThread -Width $Width -Height $Height -MaxFPS $MaxFPS -DiagnosticScreenshots:$DiagnosticScreenshots -DiagnosticTrace:$DiagnosticTrace -PresentationStats:$PresentationStats}
 else{
     Set-Content -LiteralPath (Join-Path $ProjectRoot 'local\bridge\renderer.pid') $Renderers[0].ProcessId
     if(!$Editor){

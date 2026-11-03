@@ -4,6 +4,7 @@
 #include "MWCatalog.h"
 #include "MWMesh.h"
 #include "MWLines.h"
+#include "MWMutableMesh.h"
 #include "MWSkin.h"
 #include "Components/InstancedStaticMeshComponent.h"
 #include "ProceduralMeshComponent.h"
@@ -26,10 +27,10 @@ void AMWLive::SetPrimitiveShown(UPrimitiveComponent* Component,bool Shown) {
     }
     if(auto* PC=GetWorld()->GetFirstPlayerController()) {
         const TWeakObjectPtr<UPrimitiveComponent> Key(Component);
-        if(Shown) {if(NativeHiddenPrimitives.Remove(Key))PC->HiddenPrimitiveComponents.Remove(Key);}
-        else if(!NativeHiddenPrimitives.Contains(Key)){PC->HiddenPrimitiveComponents.AddUnique(Key);NativeHiddenPrimitives.Add(Key);}
-        if(!Component->GetVisibleFlag())Component->SetVisibility(true); // normalize an earlier no-controller fallback
-    }else Component->SetVisibility(Shown);
+        if(Shown) {if(NativeHiddenPrimitives.Remove(Key)){PC->HiddenPrimitiveComponents.Remove(Key);if(WaterReflectionMembershipCache)WaterReflectionMemberChanges.Add(Key);}}
+        else if(!NativeHiddenPrimitives.Contains(Key)){PC->HiddenPrimitiveComponents.AddUnique(Key);NativeHiddenPrimitives.Add(Key);if(WaterReflectionMembershipCache)WaterReflectionMemberChanges.Add(Key);}
+        if(!Component->GetVisibleFlag()){Component->SetVisibility(true);if(WaterReflectionMembershipCache)WaterReflectionMemberChanges.Add(Key);} // normalize an earlier no-controller fallback
+    }else {if(WaterReflectionMembershipCache && Component->GetVisibleFlag()!=Shown)WaterReflectionMemberChanges.Add(TWeakObjectPtr<UPrimitiveComponent>(Component));Component->SetVisibility(Shown);}
 }
 
 bool AMWLive::InstanceSubmitted(const FString& Id) const {
@@ -39,6 +40,7 @@ bool AMWLive::InstanceSubmitted(const FString& Id) const {
 }
 
 void AMWLive::ClearPrimitiveFilters() {
+    WaterReflectionMembershipDirty=true;
     if(auto* PC=GetWorld()->GetFirstPlayerController())for(const auto& Key:NativeHiddenPrimitives)PC->HiddenPrimitiveComponents.Remove(Key);
     NativeHiddenPrimitives.Empty();
 }
@@ -54,11 +56,28 @@ void AMWLive::FlushRigidBatches() {
         // Retired equipment can leave a stale draw in the D3D11 instance proxy.
         // Filter empty batches immediately; rebuild only when membership changes.
         SetPrimitiveShown(Batch,Ids.Num()>0);
+        const auto* Data=MeshData.Find(Asset);const auto* ComponentSlot=RigidComponentSlots.Find(Asset);
+        const bool ComponentPose=RigidComponentTransforms && Ids.Num()==1 && Data &&
+            !Data->Background && !Data->Sky && !Data->FirstPerson && !Data->Rain && !Data->Water &&
+            Transforms[0].GetScale3D().GetAbsMin()>1e-6;
+        if(ComponentPose) {
+            // A single identity instance composed with its component's native
+            // world matrix has the same pose. Moving the component updates UE's
+            // primitive transform without rebuilding unchanged instance buffers.
+            Batch->SetWorldTransform(Transforms[0]);++RigidComponentPoseUpdates;
+            if(PreviousCount==1 && ComponentSlot && *ComponentSlot==Ids[0])continue;
+            const TArray<FTransform> Identity={FTransform::Identity};
+            if(!Batch->UpdateInstances(Ids,Identity,Identity,0,{})){ResourceError=TEXT("Native single-instance submission failed");continue;}
+            ++PerfRigidSubmissions;++RigidBufferUpdates;RigidComponentSlots.Add(Asset,Ids[0]);
+            if(MembershipChanged){Batch->MarkRenderStateDirty();++PerfRigidProxyCreations;}
+            continue;
+        }
+        if(ComponentSlot){Batch->SetWorldTransform(FTransform::Identity);RigidComponentSlots.Remove(Asset);}
         if(Batch->GetInstanceCount() || Ids.Num()) {
             // UE 5.2's ID-based path flushes instance data and marks instance
             // updates, rather than destroying/recreating the scene proxy.
             if(!Batch->UpdateInstances(Ids,Transforms,Transforms,0,{})){ResourceError=TEXT("Native rigid instance submission failed");continue;}
-            ++PerfRigidSubmissions;
+            ++PerfRigidSubmissions;++RigidBufferUpdates;
             if(MembershipChanged){Batch->MarkRenderStateDirty();++PerfRigidProxyCreations;}
         }
     }
@@ -70,8 +89,8 @@ void AMWLive::PrepareResourceIdentity(const FString& Id,const FString& Asset) {
     NativeResourceInvalidations.Add(Id);
     RainPoses.Remove(Id);
     RemoveRigid(Id);
-    if(auto** Old=SkinnedComponents.Find(Id))(*Old)->DestroyComponent();
-    if(auto** Old=GeometryComponents.Find(Id))(*Old)->DestroyComponent();
+    if(auto** Old=SkinnedComponents.Find(Id))ReleaseGeometryPrimitive((*Old));
+    if(auto** Old=GeometryComponents.Find(Id))ReleaseGeometryPrimitive((*Old));
     SkinnedComponents.Remove(Id);GeometryComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);
     LastRigidTransforms.Remove(Id);UploadedBonePalettes.Remove(Id);UploadedVertexPoses.Remove(Id);
     SetInstanceAsset(Id,Asset);
@@ -90,27 +109,36 @@ bool AMWLive::PrepareRigidBatch(const FString& Asset) {
     auto* Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);Batch->SetStaticMesh(Mesh);Batch->SetMaterial(0,Material);
     MWNativeDrawLayer(Batch,*D);
     Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);Batch->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Batch->SetRenderCustomDepth(D->Water);Batch->SetCustomDepthStencilValue(1);
-    Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);
+    Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);TrackWaterReflectionMember(Batch,Asset);
     // Capacity has no pose authority. Only the next fresh native packet can
     // put an instance into this initially empty batch.
-    for(const auto& Slot:RigidSlots)if(Slot.Value.Asset==Asset){NativeResourceInvalidations.Add(Slot.Key);RigidVisible.Remove(Slot.Key);LastRigidTransforms.Remove(Slot.Key);RigidRows.FindOrAdd(Asset).Add(Slot.Value.Id,FTransform(FQuat::Identity,FVector::ZeroVector,FVector::ZeroVector));}
+    const double ScanBegan=FPlatformTime::Seconds();
+    ON_SCOPE_EXIT {if(PerfRigidMembershipScanMs.Num()<120)PerfRigidMembershipScanMs.Add((FPlatformTime::Seconds()-ScanBegan)*1000);};
+    const auto* ExistingRows=RigidRows.Find(Asset);
+    if(CatalogHandoffPlans && (!ExistingRows || ExistingRows->Num()==0))++EmptyRigidScansSkipped;
+    else for(const auto& Slot:RigidSlots)if(Slot.Value.Asset==Asset){NativeResourceInvalidations.Add(Slot.Key);RigidVisible.Remove(Slot.Key);LastRigidTransforms.Remove(Slot.Key);RigidRows.FindOrAdd(Asset).Add(Slot.Value.Id,FTransform(FQuat::Identity,FVector::ZeroVector,FVector::ZeroVector));}
     DirtyRigidAssets.Add(Asset);return true;
 }
 
 void AMWLive::RetargetCompatibleResources(const TArray<FMWBinding>& Bindings) {
     for(const auto& B:Bindings) {
-        const FString Previous=InstanceAssets.FindRef(B.Id);if(Previous.IsEmpty() || Previous==B.Asset || InstanceCells.FindRef(B.Id)!=B.Cell)continue;
-        const auto* Old=MeshData.Find(Previous);const auto* Next=MeshData.Find(B.Asset);auto* Material=GeometryMaterials.FindRef(B.Asset);
+        const auto* Previous=InstanceAssets.Find(B.Id);if(!Previous || *Previous==B.Asset)continue;
+        const auto* InstanceCell=InstanceCells.Find(B.Id);if(InstanceCell?*InstanceCell!=B.Cell:!B.Cell.IsEmpty())continue;
+        const auto* Old=MeshData.Find(*Previous);const auto* Next=MeshData.Find(B.Asset);auto* Material=GeometryMaterials.FindRef(B.Asset);
         if(!Old || !Next || !Material || Old->Lines!=Next->Lines || Next->FirstPerson || !Old->Continuity.IsValid() || !Next->Continuity.IsValid() || *Old->Continuity!=*Next->Continuity)continue;
         if(auto* Component=SkinnedComponents.FindRef(B.Id)) {
             auto* Skin=SkinMaterials.FindRef(B.Id);auto* Palette=PaletteTextures.FindRef(B.Id);
             if(!Skin || !Palette || !Next->SkinBones)continue;
             // Keep the same component, sparse geometry and live palette.
             // Updating uniforms does not hide/recreate the native actor.
-            Skin->CopyInterpParameters(Material);Skin->SetTextureParameterValue(TEXT("BonePalette"),Palette);
+            // Exact continuity excludes only captured light membership and
+            // sunlight eligibility. All other definition values are equal;
+            // copying every material parameter needlessly rebuilt resources
+            // and rebound identical skin weights during catalog handoff.
+            ApplyNativeLightSet(Skin,*Next);
         }else if(auto* Mutable=GeometryComponents.FindRef(B.Id))Mutable->SetMaterial(0,Material);
         else if(const auto* Slot=RigidSlots.Find(B.Id)) {
-            if(Slot->Asset!=Previous || !RigidBatches.Contains(B.Asset) || !SharedMeshes.Contains(B.Asset))continue;
+            if(Slot->Asset!=*Previous || !RigidBatches.Contains(B.Asset) || !SharedMeshes.Contains(B.Asset))continue;
             // The following fresh pose moves this slot between ready batches.
         }else continue;
         NativeResourceInvalidations.Add(B.Id);SetInstanceAsset(B.Id,B.Asset);++PerfResourceRetargets;
@@ -120,7 +148,7 @@ void AMWLive::RetargetCompatibleResources(const TArray<FMWBinding>& Bindings) {
 bool AMWLive::GeometryResourceReady(const FMWBinding& B,const FMWGeometryState& S) const {
     if(!GeometryMaterials.Contains(B.Asset))return false;
     const auto* Definition=MeshData.Find(B.Asset);if(!Definition)return false;
-    const bool Same=InstanceAssets.FindRef(B.Id)==B.Asset;
+    const auto* ExistingAsset=InstanceAssets.Find(B.Id);const bool Same=ExistingAsset && *ExistingAsset==B.Asset;
     if(S.Palette.Num())return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && PaletteTextures.Contains(B.Id);
     double M[13];for(int32 J=0;J<13;++J)M[J]=S.Transform[J];
     if(!Definition->Lines && Definition->FirstPerson && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && !SkinnedComponents[B.Id]->UseNativeBounds && SkinMaterials.Contains(B.Id);
@@ -174,13 +202,14 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
             const auto* D=MeshData.Find(Pair.Value);
             if(D && D->FirstPerson && ViewCachedAssets.Contains(Pair.Value))ResourceBindings.Add(Pair.Key,Pair.Value);
         }
-        for(const auto& Pair:InstanceAssets)if(ResourceBindings.FindRef(Pair.Key)!=Pair.Value){if(ResourceBindings.Contains(Pair.Key) && InstanceSubmitted(Pair.Key))++PerfResourceRebindHides;HideInstance(Pair.Key);Queue(4,Pair.Key,Pair.Value,FVector4f(0,0,0,1));}
+        for(const auto& Pair:InstanceAssets){const auto* Desired=ResourceBindings.Find(Pair.Key);if(!Desired || *Desired!=Pair.Value){if(Desired && InstanceSubmitted(Pair.Key))++PerfResourceRebindHides;HideInstance(Pair.Key);Queue(4,Pair.Key,Pair.Value,FVector4f(0,0,0,1));}}
     }
     for(int32 i=0;i<States.Num();++i) {
         const auto& S=States[i];if(!S.Visible)continue;
         if(Unchanged && (*Unchanged)[i]){++Ready;continue;}
-        const auto& B=GeometryBindings[i];const bool SameAsset=InstanceAssets.FindRef(B.Id)==B.Asset;
+        const auto& B=GeometryBindings[i];
         if(GeometryResourceReady(B,S)){++Ready;continue;}
+        const auto* ExistingAsset=InstanceAssets.Find(B.Id);const bool SameAsset=ExistingAsset && *ExistingAsset==B.Asset;
         ++PendingGeometryInstances;HideInstance(B.Id);
         // CPU definitions are committed before texture/material construction.
         // Let other ready bindings advance; queue dependencies only when their
@@ -217,8 +246,8 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
         if(Job.Kind==4) {
             if(InstanceAssets.FindRef(Job.Id)==Job.Asset && ResourceBindings.FindRef(Job.Id)!=Job.Asset) {
                 RemoveRigid(Job.Id);
-                if(auto** Old=SkinnedComponents.Find(Job.Id))(*Old)->DestroyComponent();
-                if(auto** Old=GeometryComponents.Find(Job.Id))(*Old)->DestroyComponent();
+                if(auto** Old=SkinnedComponents.Find(Job.Id))ReleaseGeometryPrimitive((*Old));
+                if(auto** Old=GeometryComponents.Find(Job.Id))ReleaseGeometryPrimitive((*Old));
                 SkinnedComponents.Remove(Job.Id);GeometryComponents.Remove(Job.Id);SkinMaterials.Remove(Job.Id);PaletteTextures.Remove(Job.Id);
                 RemoveInstanceAsset(Job.Id);InstanceCells.Remove(Job.Id);LastRigidTransforms.Remove(Job.Id);UploadedBonePalettes.Remove(Job.Id);UploadedVertexPoses.Remove(Job.Id);
             }
@@ -232,7 +261,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 auto* C=NewObject<UMWNativeSkinComponent>(this);C->UseNativeBounds=false;C->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(C,*D);C->SetAbsolute(true,true,true);C->SetStaticMesh(Mesh);C->SetMaterial(0,MID);
                 C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetSimulatePhysics(false);C->SetCastShadow(false);
-                C->RegisterComponent();SetPrimitiveShown(C,false);SkinnedComponents.Add(Job.Id,C);SkinMaterials.Add(Job.Id,MID);
+                C->RegisterComponent();SetPrimitiveShown(C,false);SkinnedComponents.Add(Job.Id,C);SkinMaterials.Add(Job.Id,MID);TrackWaterReflectionMember(C,Job.Asset);
             }
         }
         else if(Job.Kind==0) {
@@ -255,17 +284,17 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);Component->SetStaticMesh(Mesh);Component->SetMaterial(0,Skin);
                 Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
                 Component->SetNativeBounds(Job.Bound);Component->RegisterComponent();
-                PaletteTextures.Add(Job.Id,Palette);SkinMaterials.Add(Job.Id,Skin);SkinnedComponents.Add(Job.Id,Component);
+                PaletteTextures.Add(Job.Id,Palette);SkinMaterials.Add(Job.Id,Skin);SkinnedComponents.Add(Job.Id,Component);TrackWaterReflectionMember(Component,Job.Asset);
             }
         }else if(Job.Kind==3) {
             PrepareResourceIdentity(Job.Id,Job.Asset);
             auto* Component=GeometryComponents.FindRef(Job.Id);
             if(!Component) {
-                Component=D->Lines?NewObject<UMWNativeLineComponent>(this):NewObject<UProceduralMeshComponent>(this);Component->SetMobility(EComponentMobility::Movable);
+                Component=D->Lines?static_cast<UProceduralMeshComponent*>(NewObject<UMWNativeLineComponent>(this)):NewObject<UMWMutableMeshComponent>(this);Component->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(Component,*D);
                 Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
                 Component->bUseAsyncCooking=false;Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);
-                GeometryComponents.Add(Job.Id,Component);
+                GeometryComponents.Add(Job.Id,Component);TrackWaterReflectionMember(Component,Job.Asset);
             }
             if(Component->GetNumSections()==0) {
                 SetPrimitiveShown(Component,false);

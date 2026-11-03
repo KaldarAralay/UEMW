@@ -6,6 +6,12 @@ def row(t,frame,refresh=None,hr=0,sync=None):
     return [t,hr,frame,refresh,refresh if sync is None else sync,t,0,frame+2,4]
 
 class PresentationStatsTests(unittest.TestCase):
+    def test_queried_device_latency_is_optional_and_cannot_invent_present_counts(self):
+        old=row(1000,60);new=row(1017,61)+[1];r=summarize([old,new])
+        self.assertEqual(r['samples'],2);self.assertEqual(r['maximum_frame_latency_values'],[1]);self.assertEqual(r['observed_display_changes'],1)
+        self.assertEqual(summarize([old,row(1017,61)+[0]])['maximum_frame_latency_values'],[])
+        for value in(-1,17,1.5,True,float('nan')):
+            self.assertEqual(summarize([old,row(1017,61)+[value]])['samples'],1)
     def test_actual_display_counter_is_separate_from_present_calls(self):
         r=summarize([row(1000,60),row(1000+1000/60,61),row(1000+2000/60,61,61,sync=62),row(1050,62,63)])
         self.assertTrue(r['supported']);self.assertEqual(r['repeated_display_observations'],1)

@@ -12,6 +12,15 @@ from frame_transport import FrameStore
 
 
 class MotionProofTests(unittest.TestCase):
+    def test_uncapped_renderer_diagnostic_requires_explicit_vsync(self):
+        with patch.object(probe,'atomic_json')as publish,patch.object(probe,'wait_for',return_value={})as response:
+            for value,sync in((0,None),(0,False),(True,True),(-1,True),(61,True),(float('nan'),True),(14,True)):
+                with self.subTest(value=value,sync=sync),self.assertRaises(ValueError):probe.witness([],presentation_sync=sync,presentation_frame_limit=value)
+            publish.assert_not_called();response.assert_not_called()
+            probe.witness([],presentation_sync=True,presentation_latency=3,presentation_frame_limit=0)
+            request=publish.call_args.args[1];self.assertTrue(request['presentation_sync']);self.assertEqual(request['presentation_frame_limit'],0);self.assertEqual(request['presentation_latency'],3)
+            probe.witness([],presentation_sync=False,presentation_frame_limit=60)
+            self.assertEqual(publish.call_args.args[1]['presentation_frame_limit'],60)
     def test_falling_without_horizontal_travel_cannot_count_as_walking(self):
         self.assertEqual(probe.planar_motion([[0,0,100],[0,0,-1000]]),0)
         self.assertEqual(probe.planar_motion([[0,0,100],[30,40,-1000]]),50)

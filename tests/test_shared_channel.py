@@ -26,6 +26,38 @@ def die_writer(pipe,stop):
         w.publish(p,encode(p,True));pipe.send(w.d);stop.wait(10)
 
 class SharedChannelTests(unittest.TestCase):
+    def ui_packet(self,*,sequence=7):
+        p=packet();return dict(protocol='uemw.ui',version=1,status='live',pid=p['pid'],session=p['session'],sequence=sequence,sample_unix_ns=p['sample_unix_ns'],frame_ref=dict(file='ui-frames/'+uuid.UUID(p['session']).hex+'-'+str(sequence)+'.uui'))
+    def test_ui_owned_roundtrip_and_unchanged_descriptor_tracks_new_commits(self):
+        p=self.ui_packet();original=dict(p);body=b'UUI1'+bytes(range(52))
+        with tempfile.TemporaryDirectory(dir=TEMP)as tmp,Writer(p['pid'],p['session'])as w,Reader(w.d)as r:
+            path=Path(tmp)/'ui.json';descriptor=json.dumps(w.d);path.write_text(descriptor)
+            try:
+                first,_=w.publish_ui(p,body);got,owned=r.read(body=True);self.assertEqual(got,first);self.assertEqual(owned,body);self.assertEqual(first['version'],2);self.assertEqual(first['frame_ref']['file'],p['frame_ref']['file']);self.assertEqual(p,original)
+                self.assertEqual(read_json(path),first)
+                p['sequence']+=1;p['frame_ref']['file']='ui-frames/'+uuid.UUID(p['session']).hex+'-'+str(p['sequence'])+'.uui';second,_=w.publish_ui(p,body+b'next')
+                self.assertEqual(read_json(path),second);self.assertEqual(path.read_text(),descriptor);self.assertEqual(owned,body);self.assertFalse((Path(tmp)/'ui-frames').exists())
+                unavailable={k:v for k,v in p.items()if k!='frame_ref'};unavailable.update(status='unavailable',error='owned source stopped')
+                w.publish_ui(unavailable);got,empty=r.read(body=True);self.assertEqual(got['version'],1);self.assertEqual(got['status'],'unavailable');self.assertEqual(empty,b'')
+            finally:
+                channel=_channels.pop(str(path),None)
+                if channel:channel.close()
+    def test_ui_transport_rejects_wrong_source_version_paths_and_sizes(self):
+        p=self.ui_packet();body=b'UUI1'+bytes(52)
+        with Writer(p['pid'],p['session'])as w:
+            for edit in(dict(pid=p['pid']+1),dict(protocol='uemw.live'),dict(version=2),dict(version=True),dict(sequence=True),dict(frame_ref=dict(file='../other.uui'))):
+                with self.subTest(edit=edit),self.assertRaises(ValueError):w.publish_ui({**p,**edit},body)
+            for invalid in(b'',bytes(2*1024*1024+1)):
+                with self.subTest(size=len(invalid)),self.assertRaises(ValueError):w.publish_ui(p,invalid)
+            with self.assertRaises(ValueError):w.publish(p,body)
+    def test_ui_nonce_and_cooperative_retirement_fail_closed(self):
+        p=self.ui_packet();body=b'UUI1'+bytes(52)
+        with Writer(p['pid'],p['session'])as w,Reader(w.d)as r:
+            m,_=w.publish_ui(p,body);m['frame_ref']['channel_nonce']=str(uuid.uuid4());text=json.dumps(m,separators=(',',':')).encode();base=w.view+HEADER.size
+            C.memmove(base+SLOT.size,text,len(text));C.memmove(base+24,hashlib.md5(text).digest(),16)
+            with self.assertRaisesRegex(ValueError,'reference'):r.read(body=True)
+            w.publish_ui(p,body);r.read(body=True);w.close()
+            with self.assertRaises(ValueError):r.read(body=True)
     def test_complete_roundtrip_owned_copy_history_and_no_frame_files(self):
         p=packet()
         with tempfile.TemporaryDirectory(dir=TEMP)as tmp,Writer(p['pid'],p['session'])as w:

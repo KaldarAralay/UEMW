@@ -70,11 +70,12 @@ EMWChannelRead FMWChannelReader::Read(const FString& Path,FString& Text,TArray<u
 #endif
 }
 bool FMWChannelReader::Matches(const TSharedPtr<FJsonObject>& J) const {
-    FGuid S,N;FString SessionText;double Pid=0,Version=0;
+    FGuid S,N;FString SessionText,Protocol;double Pid=0,Version=0;
     if(!J.IsValid() || !J->TryGetStringField(TEXT("session"),SessionText) || !FGuid::Parse(SessionText,S) || S!=Session || !Integer(J,TEXT("pid"),Pid) || Pid!=NativePid || !J->TryGetNumberField(TEXT("version"),Version))return false;
     if(Version==1)return BodyBytes==0; // Inline unavailable/preparing/menu status.
     const TSharedPtr<FJsonObject>* Ref=nullptr;FString Storage,NonceText,Digest;double Commit=0;
-    return Version==5 && J->TryGetObjectField(TEXT("frame_ref"),Ref) && Ref->IsValid() && (*Ref)->TryGetStringField(TEXT("storage"),Storage) && Storage==TEXT("shared-v1") &&
+    const bool Supported=Version==5 || (Version==2 && J->TryGetStringField(TEXT("protocol"),Protocol) && Protocol==TEXT("uemw.ui"));
+    return Supported && J->TryGetObjectField(TEXT("frame_ref"),Ref) && Ref->IsValid() && (*Ref)->TryGetStringField(TEXT("storage"),Storage) && Storage==TEXT("shared-v1") &&
         (*Ref)->TryGetStringField(TEXT("channel_nonce"),NonceText) && FGuid::Parse(NonceText,N) && N==Nonce && Integer(*Ref,TEXT("commit_generation"),Commit,9007199254740991.) && Commit==Generation &&
         (*Ref)->TryGetStringField(TEXT("md5"),Digest) && Digest.Equals(BodyDigest,ESearchCase::IgnoreCase);
 }

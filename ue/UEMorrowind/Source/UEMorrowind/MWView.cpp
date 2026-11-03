@@ -42,6 +42,7 @@ void AMWLive::SetRenderAssetTraits(const FString& Asset,uint8 Traits) {
 
 void AMWLive::SetInstanceAsset(const FString& Id,const FString& Asset) {
     if(const auto* Previous=InstanceAssets.Find(Id))if(*Previous==Asset)return;
+    TrackWaterReflectionMember(GeometryComponents.FindRef(Id),Asset);TrackWaterReflectionMember(SkinnedComponents.FindRef(Id),Asset);
     const bool Warm=!RenderSelectionDirty && RenderSelectionCatalog==Catalog && RenderSelectionMeshes==MeshData.Num() && RenderSelectionInstances==InstanceAssets.Num();
     if(Warm)if(const auto* Previous=InstanceAssets.Find(Id))if(auto* Ids=AssetInstances.Find(*Previous)){Ids->Remove(Id);if(!Ids->Num())AssetInstances.Remove(*Previous);}
     InstanceAssets.Add(Id,Asset);
@@ -61,6 +62,7 @@ void AMWLive::RemoveInstanceAsset(const FString& Id) {
     const bool Warm=!RenderSelectionDirty && RenderSelectionCatalog==Catalog && RenderSelectionMeshes==MeshData.Num() && RenderSelectionInstances==InstanceAssets.Num();
     if(Warm)if(const auto* Previous=InstanceAssets.Find(Id))if(auto* Ids=AssetInstances.Find(*Previous)){Ids->Remove(Id);if(!Ids->Num())AssetInstances.Remove(*Previous);}
     if(!InstanceAssets.Remove(Id))return;
+    UntrackWaterReflectionMember(GeometryComponents.FindRef(Id));UntrackWaterReflectionMember(SkinnedComponents.FindRef(Id));
     if(!Warm){RenderSelectionDirty=true;return;}
     ViewInstances.Remove(Id);FrameInstances.Remove(Id);ValueInstances.Remove(Id);
     RenderSelectionInstances=InstanceAssets.Num();

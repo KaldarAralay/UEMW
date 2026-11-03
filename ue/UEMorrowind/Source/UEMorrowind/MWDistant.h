@@ -23,7 +23,7 @@ struct FMWDistantView {
     TFuture<FMWDistantPtr> Future;
     double NextRead=0,NextApply=0;
     FString OwnerEpoch;
-    FString NativeCatalog,GateKey;
+    FString NativeCatalog,GateKey,WorkKey;
     TSet<FIntPoint> NativeCells;
     ~FMWDistantView(){if(Future.IsValid())Future.Wait();}
     void Update(AMWLive& Owner);

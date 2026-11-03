@@ -11,3 +11,4 @@ struct FMWPresentationSamples {
     uint32 Overflow=0;
 };
 void MWPollPresentation(const FViewportRHIRef& Viewport,const TSharedRef<FMWPresentationSamples,ESPMode::ThreadSafe>& Samples);
+bool MWUseDisplayPacing(int32 RequestedFPS,int32 RefreshHz);

@@ -250,7 +250,10 @@ def run(args):
                 mirrored=error is None and ui_ready(render,source,ui,now)
                 loading=load_transition.active('MenuLoading'in ui.get('active_menus',[]),source_live and render_live,now)
                 menu_change=render.get('ui_menus')!=ui.get('active_menus')
-                holding=transition.hold((generation,source.get('session'),tuple(ui.get('active_menus',[]))),mirrored,now,.75 if menu_change else .15) if latch.shown and source_live and render_live and error is None and not loading else False
+                # First-use native menu images can finish just beyond 750 ms.
+                # Bound this resource transition at 1.25 s; actual UI frames
+                # still expire at 500 ms, and source/renderer faults never hold.
+                holding=transition.hold((generation,source.get('session'),tuple(ui.get('active_menus',[]))),mirrored,now,1.25 if menu_change else .15) if latch.shown and source_live and render_live and error is None and not loading else False
                 visible, reason = decide(mode, game_foreground=valid_game and foreground == game,
                     minimized=not valid_game or bool(U.IsIconic(game)), ui_known=error is None,
                     native_ui=ui.get('native_ui', True), source_live=source_live, renderer_live=render_live,

@@ -1,10 +1,14 @@
 #include "MWLive.h"
+#include "DynamicRHI.h"
+#include "RenderingThread.h"
+#include "HAL/PlatformOutputDevices.h"
 #include "MWCamera.h"
 #include "MWTextureUpgrade.h"
 #include "MWNativeSky.h"
 #include "Components/DirectionalLightComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "MWFrame.h"
+#include "MWTextureStages.h"
 #include "MWSkin.h"
 #include "Camera/CameraComponent.h"
 #include "Engine/Texture2D.h"
@@ -50,8 +54,19 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
         (!PC || !PC->HiddenActors.Contains(this)) && AcceptedSnapshotStamp>0 && Now>=AcceptedSnapshotStamp && Now-AcceptedSnapshotStamp<=.5;
     Out->SetStringField(TEXT("protocol"),TEXT("uemw.witness"));Out->SetNumberField(TEXT("version"),1);
     Out->SetStringField(TEXT("scope"),TEXT("CPU state submitted to renderer; no GPU readback or gameplay evaluation"));
+    Out->SetStringField(TEXT("renderer_log_file"),FPaths::ConvertRelativePathToFull(FPlatformOutputDevices::GetAbsoluteLogFilename()));
     Out->SetBoolField(TEXT("live"),Live);Out->SetStringField(TEXT("status"),Status);
+    Out->SetStringField(TEXT("renderer_rhi"),GDynamicRHI?GDynamicRHI->GetName():TEXT("None"));Out->SetBoolField(TEXT("renderer_rhi_thread_running"),IsRunningRHIInSeparateThread());
     Out->SetBoolField(TEXT("targeted_render_updates"),TargetedRenderUpdates);
+    Out->SetBoolField(TEXT("catalog_handoff_plans"),CatalogHandoffPlans);
+    bool ClassificationMatches=BindingTraitsCatalog==Catalog && BindingTraits.Num()==GeometryBindings.Num();TArray<FString> ReferenceSuns;
+    for(int32 I=0;I<GeometryBindings.Num();++I){const auto& B=GeometryBindings[I];const auto* D=MeshData.Find(B.Asset);if(!D){ClassificationMatches=false;continue;}const uint8 Expected=(D->FirstPerson?1:0)|(D->Rain?2:0)|(!D->MaterialValueGroup.IsEmpty() || !D->TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(*D)?4:0);if(!BindingTraits.IsValidIndex(I) || BindingTraits[I]!=Expected)ClassificationMatches=false;if(D->CelestialKind==4)ReferenceSuns.Add(B.Id);}
+    Out->SetBoolField(TEXT("catalog_classification_matches"),ClassificationMatches && ReferenceSuns==CelestialSunIds);
+    Out->SetNumberField(TEXT("catalog_plan_commits"),(double)CatalogPlanCommits);Out->SetNumberField(TEXT("catalog_reference_commits"),(double)CatalogReferenceCommits);Out->SetNumberField(TEXT("empty_rigid_scans_skipped"),(double)EmptyRigidScansSkipped);
+    Out->SetBoolField(TEXT("rigid_component_transforms"),RigidComponentTransforms);
+    Out->SetNumberField(TEXT("rigid_component_batches"),RigidComponentSlots.Num());
+    Out->SetNumberField(TEXT("rigid_component_pose_updates"),(double)RigidComponentPoseUpdates);
+    Out->SetNumberField(TEXT("rigid_buffer_updates"),(double)RigidBufferUpdates);
     Out->SetBoolField(TEXT("rain_interpolation"),RainInterpolationEnabled);
     Out->SetNumberField(TEXT("rain_pose_histories"),RainPoses.Num());
     Out->SetNumberField(TEXT("rain_native_camera_stamp"),LastCameraStamp);
@@ -60,8 +75,10 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("material_value_selection_assets"),ValueAssets.Num());
     if(const auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("r.VSync")))Out->SetNumberField(TEXT("present_vsync"),C->GetInt());
     if(const auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("RHI.MaximumFrameLatency")))Out->SetNumberField(TEXT("present_maximum_frame_latency"),C->GetInt());
+    if(const auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))Out->SetNumberField(TEXT("present_frame_limit"),C->GetFloat());
+    Out->SetNumberField(TEXT("present_display_hz"),DisplayRefreshHz);Out->SetBoolField(TEXT("present_auto_pacing"),DisplayPacingActive && !PresentationDiagnosticOverride);Out->SetBoolField(TEXT("present_auto_pacing_overridden"),PresentationDiagnosticOverride);
     Out->SetBoolField(TEXT("native_menu_open"),NativeMenuOpen);
-    Out->SetBoolField(TEXT("native_ui_ready"),UIReady && Now>=UIStamp && Now-UIStamp<=.25);
+    Out->SetBoolField(TEXT("native_ui_ready"),UIReady && Now>=UIStamp && Now-UIStamp<=.5);
     Out->SetStringField(TEXT("native_ui_status"),UIStatus);Out->SetNumberField(TEXT("native_ui_draws"),UIDraws);Out->SetNumberField(TEXT("native_ui_sequence"),UISequence);Out->SetNumberField(TEXT("native_ui_sample_unix_ns"),UIStamp*1e9);
     Out->SetNumberField(TEXT("native_ui_textures"),UITextures.Num());
     Out->SetNumberField(TEXT("native_ui_original_regions"),UIRegions.Num());
@@ -73,6 +90,10 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     TArray<TSharedPtr<FJsonValue>> DistantRows;
     if(DistantGeometry) {
         const auto& V=*DistantGeometry;
+        Out->SetBoolField(TEXT("distant_partial_geometry"),V.GeometryPartial);
+        Out->SetBoolField(TEXT("distant_catalog_staging"),V.CatalogStaging());
+        Out->SetNumberField(TEXT("distant_resource_jobs_pending"),V.ResourceJobs.Num()-V.ResourceJobIndex);
+        Out->SetStringField(TEXT("distant_resource_error"),V.ResourceError);
         const bool Shown=Live && V.SceneShown && Now>=DistantNativeStamp && Now-DistantNativeStamp<=.5;
         for(const auto& Id:Ids)if(Id.StartsWith(TEXT("distant:"))) {
             auto Row=MakeShared<FJsonObject>();Row->SetStringField(TEXT("id"),Id);Row->SetStringField(TEXT("scope"),TEXT("Installed static/LAND derivative with separately sampled native overrides; not a native motion frame"));Row->SetBoolField(TEXT("submitted_visible"),Shown && V.InstanceSubmitted(Id));
@@ -148,6 +169,12 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetBoolField(TEXT("water_planar_active"),WaterReflectionActive);
     Out->SetNumberField(TEXT("water_reflection_capture_requests"),(double)WaterReflectionRequests);
     Out->SetNumberField(TEXT("water_reflection_components"),WaterReflectionComponents);
+    Out->SetBoolField(TEXT("water_reflection_membership_cache"),WaterReflectionMembershipCache);
+    Out->SetNumberField(TEXT("water_reflection_membership_rebuilds"),(double)WaterReflectionMembershipRebuilds);
+    Out->SetNumberField(TEXT("water_reflection_membership_reuses"),(double)WaterReflectionMembershipReuses);
+    Out->SetNumberField(TEXT("water_reflection_membership_patches"),(double)WaterReflectionMembershipPatches);
+    Out->SetNumberField(TEXT("water_reflection_membership_updates"),(double)WaterReflectionMembershipUpdates);
+    Out->SetNumberField(TEXT("water_reflection_membership_total_ms"),WaterReflectionMembershipTotalMs);
     Out->SetNumberField(TEXT("water_reflection_age_ms"),LastWaterReflection>0?FMath::Max(0.,FPlatformTime::Seconds()-LastWaterReflection)*1000:0);
     Out->SetNumberField(TEXT("water_reflection_cap_hz"),MWWaterReflectionHz);
     Out->SetNumberField(TEXT("water_reflection_completed"),(double)WaterReflectionCompleted);
@@ -317,8 +344,22 @@ void AMWLive::PublishStateWitness() {
     }
     if(Request->HasField(TEXT("presentation_sync"))) {
         bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("presentation_sync"),Enabled))return;
+        PresentationDiagnosticOverride=true;if(!Enabled)PresentationDiagnosticUncapped=false;
+        if(!Enabled)if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))if(C->GetFloat()<=0)C->Set(60.f,ECVF_SetByCode);
         if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("r.VSync")))C->Set(Enabled?1:0,ECVF_SetByCode);
         if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("RHI.MaximumFrameLatency")))C->Set(Enabled?1:3,ECVF_SetByCode);
+    }
+    if(Request->HasField(TEXT("presentation_latency"))) {
+        double Frames=0;if(!DiagnosticScreenshots || !Request->TryGetNumberField(TEXT("presentation_latency"),Frames) || !FMath::IsFinite(Frames) || Frames<1 || Frames>3 || Frames!=FMath::FloorToDouble(Frames))return;
+        PresentationDiagnosticOverride=true;
+        if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("RHI.MaximumFrameLatency")))C->Set(int32(Frames),ECVF_SetByCode);
+    }
+    if(Request->HasField(TEXT("presentation_frame_limit"))) {
+        double Limit=0;if(!DiagnosticScreenshots || !Request->TryGetNumberField(TEXT("presentation_frame_limit"),Limit) || !FMath::IsFinite(Limit) || Limit<0 || Limit>60 || Limit!=FMath::FloorToDouble(Limit))return;
+        const auto* Sync=IConsoleManager::Get().FindConsoleVariable(TEXT("r.VSync"));
+        if((Limit==0 && (!Sync || Sync->GetInt()!=1)) || (Limit>0 && Limit<15))return;
+        PresentationDiagnosticOverride=true;PresentationDiagnosticUncapped=Limit==0;
+        if(auto* C=IConsoleManager::Get().FindConsoleVariable(TEXT("t.MaxFPS")))C->Set(float(Limit),ECVF_SetByCode);
     }
     if(Request->HasField(TEXT("water_fog_mode"))) {
         double Mode=0;if(!DiagnosticScreenshots || !Request->TryGetNumberField(TEXT("water_fog_mode"),Mode) || Mode<0 || Mode>2 || Mode!=FMath::FloorToDouble(Mode))return;

@@ -12,14 +12,16 @@ from measure_session import stats
 def summarize(rows, overflow=0):
     valid=[]
     for row in rows:
-        if len(row)!=9 or any(not isinstance(v,(int,float)) or not math.isfinite(v) for v in row):
+        if len(row)not in(9,10) or any(type(v)not in(int,float) or not math.isfinite(v) for v in row):
             continue
+        if len(row)==10 and(row[9]!=int(row[9])or not 0<=row[9]<=16):continue
         valid.append(row)
     result=dict(scope='Own DXGI swapchain statistics; no ETW, pixel capture or input-to-photon timing. Display changes are a polling lower bound; ID gaps are ambiguous.',
                 samples=len(valid),overflow=overflow,supported=False,display_change_hz_lower_bound=None,
                 submitted_present_hz=None,consecutive_display_interval_ms=stats([]),counter_resets=0,
                 repeated_display_observations=0,skipped_present_ids=0,success_samples=0,
-                statistics_hresult=sorted({int(r[1]) for r in valid}),swap_effects=sorted({int(r[8])for r in valid}))
+                statistics_hresult=sorted({int(r[1]) for r in valid}),swap_effects=sorted({int(r[8])for r in valid}),
+                maximum_frame_latency_values=sorted({int(r[9])for r in valid if len(r)==10 and r[9]>0}))
     if len(valid)<2:return result
     elapsed=(valid[-1][0]-valid[0][0])/1000
     if elapsed<=0:return result

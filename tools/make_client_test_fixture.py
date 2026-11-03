@@ -217,3 +217,28 @@ ui_fixture('identity',lambda b:struct.pack_into('<I',b,40,43))
 ui_fixture('path',manifest_mutation=lambda j:j['frame_ref'].update(file='../other.uui'))
 ui_fixture('region',manifest_mutation=lambda j:j['native_regions'][0].update(rect=[-1,0,100,100]))
 ui_fixture('region-menu',manifest_mutation=lambda j:j['ui'].update(active_menus=['MenuDialog']))
+
+
+# Owned immutable classification fixture, with reordered/repeated bindings.
+plan_meshes={}
+for name in ('plain','view','rain','value','flip','stage','sun','surface-sun','all'):
+    value=copy.deepcopy(mesh);value.pop('texture_animation',None)
+    value['shading']=dict(lit=True,fog=True,sky=False,emissive=[0,0,0])
+    if name in('view','all'):value['shading']['first_person']=True
+    if name in('rain','all'):value['shading']['rain']=True
+    if name in('value','all'):value['material_state']='native:owned-material'
+    if name in('flip','all'):value['texture_animation']=copy.deepcopy(mesh['texture_animation'])
+    if name=='stage':value['texture_stages']=copy.deepcopy(staged['meshes']['rigid']['texture_stages'])
+    if name in('sun','surface-sun'):
+        value['source_texture']='Textures\\tx_sun_owned.dds'
+        if name=='sun':value['shading'].update(background=True,sky=True,lit=False,fog=False)
+    plan_meshes[name]=value
+plan_order=('sun','all','plain','stage','rain','sun','surface-sun','view','flip','value')
+plan_catalog=dict(format='uemw.assets',version=1,cells=[],meshes=plan_meshes,bindings=[dict(id=f'owned-plan-{i}',asset=name)for i,name in enumerate(plan_order)])
+(folder/'catalog-binding-plans.json').write_text(json.dumps(plan_catalog,separators=(',',':')),encoding='utf-8')
+for flag in ('first_person','rain','background','sky'):
+    invalid=copy.deepcopy(plan_catalog);invalid['meshes']['plain']['shading'][flag]='invalid'
+    (folder/f'catalog-plan-bad-{flag.replace("_","-")}.json').write_text(json.dumps(invalid,separators=(',',':')),encoding='utf-8')
+
+mutation=copy.deepcopy(plan_catalog);mutation['meshes']['plain']['shading']['first_person']=True
+(folder/'catalog-plan-mutation.json').write_text(json.dumps(mutation,separators=(',',':')),encoding='utf-8')

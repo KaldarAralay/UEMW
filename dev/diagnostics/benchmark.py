@@ -14,6 +14,7 @@ from input_backend import U
 from live_probe import ROOT
 from measure_session import manifest,stats
 from presentation_stats import summarize as presentation_summary
+from ui_timing import perf_windows,runtime_log
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--seconds',type=float,default=18)
@@ -34,7 +35,7 @@ def main():
             time.sleep(.05)
         else:raise RuntimeError('Expected original gameplay did not become ready for measurement')
     time.sleep(args.warmup)
-    path=ROOT/'logs/ue-runtime.log';offset=path.stat().st_size
+    renderer_pid=int((ROOT/'local/bridge/renderer.pid').read_text(encoding='utf-8-sig'));path=runtime_log(ROOT,renderer_pid);offset=path.stat().st_size
     with path.open('rb')as log:boot=log.read(150000).decode(errors='replace')
     backend='Vulkan'if 'LogVulkanRHI:'in boot else'D3D12'if 'LogD3D12RHI:'in boot else'D3D11'if 'LogD3D11RHI:'in boot else'unknown'
     game_pid=int((ROOT/'local/bridge/game.pid').read_text());foreground=[]
@@ -58,12 +59,13 @@ def main():
         except (OSError,ValueError,KeyError,TypeError):pass
         time.sleep(.01)
     elapsed=time.perf_counter()-start
+    if runtime_log(ROOT,renderer_pid)!=path:raise RuntimeError('Renderer log changed during measurement')
     with path.open('rb') as f:f.seek(offset);tail=f.read().decode('utf-8',errors='replace')
-    windows=[json.loads(v) for v in re.findall(r'UEMW perf (\{[^\n]+\})',tail)]
+    windows=perf_windows(tail)
     duration=sum(w['seconds'] for w in windows)
     ages=[a for w in windows for a in w['age_ms']]
     result={'scope':f'Stationary supported exterior; {args.width}x{args.height}; original rendering enabled; no recording. Small-manifest observer at 100 Hz. Ages end at game-thread apply, excluding GPU/scanout.',
-      'expected_grid':args.grid,'renderer_backend':backend,'native_foreground_samples':len(foreground),'native_foreground_count':sum(foreground),
+      'renderer_pid':renderer_pid,'renderer_log_file':str(path.relative_to(ROOT)),'expected_grid':args.grid,'renderer_backend':backend,'native_foreground_samples':len(foreground),'native_foreground_count':sum(foreground),
       'start_unix_ns':start_ns,'end_unix_ns':time.time_ns(),'observer_seconds':elapsed,
       'source_observed_unique':len(source),'source_unique_hz':len(source)/elapsed,
       'source_unique_engine_frame_hz':len({s['frame_ms']for s in source})/elapsed,
@@ -116,7 +118,11 @@ def main():
       'ue_worker_decode_ms':stats([a for w in windows for a in w.get('decode_ms',[])]),
       'ue_worker_phases_ms':{name:stats([a for w in windows for a in w.get(name,[])]) for name in
           ('manifest_read_ms','channel_read_ms','manifest_json_ms','body_read_ms','body_hash_ms','body_decode_ms','decode_other_ms')},
+      'ue_native_geometry_cpu_ms':{name:stats([v for w in windows for v in w.get('native_geometry_cpu_ms',{}).get(name,[])])for name in('total','catalog_materials','compare_resources','submit_changed','reconcile_cache','rigid_flush')},
+      'ue_native_geometry_cpu_scope':'Main-owner CPU phase samples per accepted or rejected apply attempt, excluding GPU/display. Phases are nested within total and are not individual frame timelines.',
       'ue_catalog_stage_ms':stats([a for w in windows for a in w.get('stage_ms',[])]),
+      'ue_catalog_bind_ms':stats([a for w in windows for a in w.get('catalog_bind_ms',[])]),
+      'ue_rigid_membership_scan_ms':stats([a for w in windows for a in w.get('rigid_membership_scan_ms',[])]),
       'ue_resource_stage_ms':stats([a for w in windows for a in w.get('resource_stage_ms',[])]),
       'ue_resource_jobs_pending_max':max((w.get('resource_jobs_pending',0)for w in windows),default=0),
       'ue_resource_jobs_pending_final':windows[-1].get('resource_jobs_pending',0)if windows else None,

@@ -6,6 +6,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
@@ -65,6 +66,7 @@ FMWDistantPtr MWReadDistant(const FString& Root,FMWDistantPtr Previous) {
     Out->Valid=true;return Out;
 }
 void FMWDistantView::Update(AMWLive& O) {
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UpdateDistantScenery);
     const double Now=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds(),Tick=FPlatformTime::Seconds();FIntPoint Center;
     auto Hide=[&](const TCHAR* Why){O.DistantStatus=Why;O.DistantVisible=0;if(O.DistantGeometry)O.DistantGeometry->HideScene();};
     if(!O.DistantEnabled || !O.SceneShown || !O.SourcePid || !O.Status.StartsWith(TEXT("LIVE /")) || O.NativeMenuOpen || !MWDistantCell(O.ActiveCellKey,Center) || Now-O.SourcePacketStamp>.5){Hide(TEXT("inactive original exterior"));return;}
@@ -78,7 +80,7 @@ void FMWDistantView::Update(AMWLive& O) {
         V->FinishSpawning(FTransform::Identity);O.DistantGeometry=V;
     }
     auto& V=*O.DistantGeometry;
-    if(OwnerEpoch!=O.SceneEpoch){V.HideScene();V.ResetScene();V.SceneEpoch=O.SceneEpoch;OwnerEpoch=O.SceneEpoch;NativeCatalog.Empty();GateKey.Empty();}
+    if(OwnerEpoch!=O.SceneEpoch){V.HideScene();V.ResetScene();V.SceneEpoch=O.SceneEpoch;OwnerEpoch=O.SceneEpoch;NativeCatalog.Empty();GateKey.Empty();WorkKey.Empty();NextApply=0;}
     V.Session=O.Session;V.ActiveCellKey=O.ActiveCellKey;
     if(V.ExteriorFogEnabled!=O.ExteriorFogEnabled)V.SetExteriorFog(O.ExteriorFogEnabled);
     if(V.ExteriorFidelityEnabled!=O.ExteriorFidelityEnabled)V.SetExteriorFidelity(O.ExteriorFidelityEnabled);
@@ -91,15 +93,29 @@ void FMWDistantView::Update(AMWLive& O) {
     // This is conservative and avoids thousands of component lookups per tick.
     TArray<FString> Cells;for(const auto& G:NativeCells)Cells.Add(FString::Printf(TEXT("%d,%d"),G.X,G.Y));for(const auto& G:State->Excluded)Cells.Add(FString::Printf(TEXT("%d,%d"),G.X,G.Y));Cells.Sort();
     FString Key=State->Catalog+State->Poses+O.ActiveCellKey;for(const auto& C:Cells)Key+=TEXT("|")+C;
+    // Resource creation keeps its per-tick budget. Revalidating all 4096
+    // unchanged static bindings on every incomplete tick was substantially
+    // more expensive than the resource work itself. Changed source poses,
+    // residency or epochs bypass this retry cadence immediately.
+    const FString BeforeCatalog=V.Catalog;
+    if(V.CatalogStaging() && V.RequestedCatalog==State->Catalog)V.LoadCatalog(State->Catalog);
+    V.AdvanceGeometryResources(.001,8);V.FlushRigidBatches();
+    if(!V.ResourceError.IsEmpty()){Hide(*V.ResourceError);return;}
+    if(V.Catalog!=BeforeCatalog)NextApply=0; // promotion must receive a pose in this same tick
     if(Key==GateKey && !V.GeometryPartial && V.ResourceJobIndex>=V.ResourceJobs.Num() && !V.CatalogStaging()) {
         V.ShowScene();O.DistantVisible=V.VisibleInstances.Num();O.DistantNativeStamp=State->NativeStamp;O.DistantStatus=TEXT("installed terrain/statics / native fog");return;
     }
+    if(Key==WorkKey && Tick<NextApply) {
+        O.DistantVisible=V.SceneShown?V.VisibleInstances.Num():0;O.DistantNativeStamp=State->NativeStamp;
+        O.DistantStatus=TEXT("preparing bounded distant resources");return;
+    }
+    WorkKey=Key;NextApply=Tick+.1;
     auto States=State->States;int32 Eligible=0;
     for(int32 I=0;I<States.Num();++I){States[I].Visible&=MWDistantEligible(*State,State->Bindings[I].Cell,Center,NativeCells);Eligible+=States[I].Visible?1:0;}
     auto Packet=MakeShared<FJsonObject>();Packet->SetStringField(TEXT("scene_epoch"),O.SceneEpoch);Packet->SetStringField(TEXT("scene_catalog"),State->Catalog);Packet->SetStringField(TEXT("scene_catalog_md5"),State->Digest);Packet->SetNumberField(TEXT("geometry_version"),5);Packet->SetNumberField(TEXT("sample_unix_ns"),State->NativeStamp*1e9);
     V.SourceBindingSnapshot=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>(State->Bindings);V.SourceBindingCatalog=State->Catalog;
     const bool Applied=V.UpdateGeometry(Packet,&States,nullptr,nullptr,&State->Bindings);
-    V.AdvanceGeometryResources(.001,8);V.FlushRigidBatches();
+    V.FlushRigidBatches();
     if(Applied){V.ShowScene();GateKey=Key;}else V.HideScene();
     O.DistantVisible=Applied?V.VisibleInstances.Num():0;O.DistantBindings=States.Num();O.DistantNativeStamp=State->NativeStamp;
     O.DistantStatus=V.ResourceError.IsEmpty()?(Applied?TEXT("installed terrain/statics / native fog"):TEXT("preparing bounded distant resources")):V.ResourceError;

@@ -5,12 +5,42 @@ from pathlib import Path
 import unittest
 from unittest.mock import patch
 from game_assets import Assets
-from live_probe import Reader
+from live_probe import Reader,SceneReadChanged
 from supported_scenes import supported
 from test_scene_lifecycle import Memory
 from native_ui import loading_state
 
 class GeneralTests(unittest.TestCase):
+    def test_loading_menu_replacement_drops_the_read_without_advancing_its_generation(self):
+        class UI:
+            changed=False;replace=True;_load_serial=7;_was_loading=False
+            def u32(self,p):
+                if p==0x7d1c28:return 0x11000 if self.changed else 0x10000
+                return {0x30008:0x40000}[p]
+            def string(self,p,n):return 'MenuLoading'
+            def read(self,p,n):
+                if p in(0x1001c,0x1101c):return struct.pack('<3I',0x20000,0x20004,0x20008)
+                if p==0x20000:return struct.pack('<I',0x30000)
+                if p==0x30075:
+                    if self.replace:self.changed=True
+                    return b'\1\1'
+                raise AssertionError((p,n))
+        ui=UI()
+        with self.assertRaisesRegex(SceneReadChanged,'Loading UI changed'):loading_state(ui)
+        self.assertEqual(ui._load_serial,7);self.assertFalse(ui._was_loading)
+        ui.replace=False;self.assertEqual(loading_state(ui),(True,8))
+
+    def test_malformed_loading_visibility_remains_a_fault_not_a_transient_read(self):
+        class UI:
+            def u32(self,p):return {0x7d1c28:0x10000,0x30008:0x40000}[p]
+            def string(self,p,n):return 'MenuLoading'
+            def read(self,p,n):
+                if p==0x1001c:return struct.pack('<3I',0x20000,0x20004,0x20008)
+                if p==0x20000:return struct.pack('<I',0x30000)
+                if p==0x30075:return b'\2\0'
+                raise AssertionError((p,n))
+        with self.assertRaisesRegex(ValueError,'Invalid native loading visibility'):loading_state(UI())
+
     def test_loading_visibility_advances_generation_even_with_reused_scene_addresses(self):
         class UI:
             flags=b'\0\0'

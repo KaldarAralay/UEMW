@@ -57,8 +57,8 @@ def move(reader,dx,dy):
     event=Input()
     event.type=0
     event.mouse=Mouse(dx,dy,0,0x1,0,0)
-    enqueue(event)
-    return {'pid':reader.pid,'kind':'relative_mouse','dx':dx,'dy':dy,'transitions_enqueued':1}
+    dispatched=time.time_ns();enqueue(event);enqueued=time.time_ns()
+    return {'pid':reader.pid,'kind':'relative_mouse','dx':dx,'dy':dy,'transitions_enqueued':1,'input_dispatch_unix_ns':dispatched,'input_enqueued_unix_ns':enqueued}
 
 def point(reader,x,y):
     """Position the original menu cursor, whose coordinates differ from the OS cursor."""
@@ -101,7 +101,7 @@ def pulse(reader,kind,code=0,duration=.12):
         up.mouse.dwFlags=0x4 if kind=='left' else 0x10
     else:
         raise ValueError('Unsupported input kind')
-    enqueue(down)
+    dispatched=time.time_ns();enqueue(down);enqueued=time.time_ns()
     try:
         deadline=time.perf_counter()+duration
         while time.perf_counter()<deadline:
@@ -114,7 +114,7 @@ def pulse(reader,kind,code=0,duration=.12):
         # DirectInput must poll a released frame before the next test pulse.
         # Back-to-back key events can otherwise look like one held key.
         time.sleep(.03)
-    return {'pid':reader.pid,'kind':kind,'scan':code,'duration_ms':duration*1000,'transitions_enqueued':2}
+    return {'pid':reader.pid,'kind':kind,'scan':code,'duration_ms':duration*1000,'transitions_enqueued':2,'input_dispatch_unix_ns':dispatched,'input_enqueued_unix_ns':enqueued}
 
 def type_ascii(reader,text):
     if not 0<len(text)<=256 or any(not 32<=ord(c)<127 for c in text):

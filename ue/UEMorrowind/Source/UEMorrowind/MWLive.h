@@ -105,7 +105,10 @@ public:
     FString RenderSelectionCatalog;
     int32 RenderSelectionMeshes=-1,RenderSelectionInstances=-1;
     bool RenderSelectionDirty=true;
+    bool CatalogHandoffPlans=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_CATALOG_HANDOFF_PLANS"))!=TEXT("0");
+    uint64 CatalogPlanCommits=0,CatalogReferenceCommits=0,EmptyRigidScansSkipped=0;
     bool TargetedRenderUpdates=true; // full-scan diagnostic is opt-in only
+    bool RigidComponentTransforms=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_RIGID_COMPONENT_TRANSFORMS"))!=TEXT("0");
     bool RainInterpolationEnabled=true;
     TMap<FString,FMWRainPose> RainPoses;
     void UpdateRainInterpolation();
@@ -115,6 +118,12 @@ public:
     void SetRenderAssetTraits(const FString& Asset,uint8 Traits);
     int32 RenderSelectionRebuilds=0;
     bool CanReflectPrimitive(UPrimitiveComponent* Component,const FString& Asset) const;
+    void RefreshWaterReflectionMembership();
+    void BuildWaterReflectionMembership(TArray<TWeakObjectPtr<UPrimitiveComponent>>& Members,int32& Transparent) const;
+    void TrackWaterReflectionMember(UPrimitiveComponent* Component,const FString& Asset);
+    void UpdateWaterReflectionDefinition(const FString& Asset,const FMWMeshData& Next);
+    void UntrackWaterReflectionMember(UPrimitiveComponent* Component);
+    void ReleaseGeometryPrimitive(UPrimitiveComponent* Component);
     UPROPERTY() UCameraComponent* Camera;
     UPROPERTY() TMap<FString,UStaticMeshComponent*> Markers;
     UPROPERTY() TMap<FString,UProceduralMeshComponent*> GeometryComponents;
@@ -144,6 +153,14 @@ public:
     double NextWaterReflection=0;
     int32 WaterReflectionTransparentComponents=0;
     int32 WaterReflectionComponents=0;
+    bool WaterReflectionMembershipCache=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_REFLECTION_MEMBERSHIP_CACHE"))!=TEXT("0");
+    bool WaterReflectionMembershipDirty=true;
+    TMap<TWeakObjectPtr<UPrimitiveComponent>,FString> WaterReflectionMemberAssets;
+    TMap<TWeakObjectPtr<UPrimitiveComponent>,int32> WaterReflectionMemberIndices;
+    TSet<TWeakObjectPtr<UPrimitiveComponent>> WaterReflectionMemberChanges,WaterReflectionTransparentMembers;
+    uint64 WaterReflectionMembershipRebuilds=0,WaterReflectionMembershipReuses=0;
+    uint64 WaterReflectionMembershipPatches=0,WaterReflectionMembershipUpdates=0;
+    double WaterReflectionMembershipTotalMs=0;
     FString WaterReflectionEpoch;
     FLinearColor NativeReflectionSky=FLinearColor::Black;
     UPROPERTY() UDirectionalLightComponent* NativeSun=nullptr;
@@ -248,6 +265,7 @@ private:
     friend class FMWRainInterpolationTest;
     friend class FMWTopologyTest;
     friend class FMWRenderSelectionTest;
+    friend class FMWReflectionMembershipTest;
     friend class FMWOutdoorMaterialTest;
     friend class FMWLightingTest;
     friend class FMWTerrainBlendTest;
@@ -257,6 +275,8 @@ private:
     friend class FMWVertexAttributeTest;
     friend class FMWResourceProgressTest;
     friend class FMWRigidReuseTest;
+    friend class FMWRigidComponentTransformTest;
+    friend class FMWCatalogHandoffPlanTest;
     friend class FMWStreamingTest;
     friend class FMWMaterialContinuityTest;
     friend class FMWNativeTextureStagesTest;
@@ -278,6 +298,8 @@ private:
     TMap<FString,FMWRigidSlot> RigidSlots;
     TMap<FString,TMap<int32,FTransform>> RigidRows;
     TSet<FString> DirtyRigidAssets;
+    TMap<FString,int32> RigidComponentSlots;
+    uint64 RigidComponentPoseUpdates=0,RigidBufferUpdates=0;
     int32 NextRigidId=0,PerfRigidSubmissions=0,PerfRigidProxyCreations=0;
     TSet<TWeakObjectPtr<UPrimitiveComponent>> NativeHiddenPrimitives;
     TSet<FString> RigidVisible;
@@ -378,6 +400,8 @@ private:
     bool InstanceSubmitted(const FString& Id) const;
     double LightingCpuMs=0;
     TMap<FString,double> GeometryCpuMs;
+    TMap<FString,TArray<double>> PerfGeometryCpuMs;
+    TArray<double> PerfCatalogBindMs,PerfRigidMembershipScanMs;
     bool ApplyNativeCamera(const FVector& Position,const FVector& Forward,const FVector& Up,double Fov,double Stamp);
     void RecordPoseApplication(double Stamp,double ApplyStarted);
     FString AcceptedSnapshotText;
@@ -393,11 +417,17 @@ private:
     TSharedPtr<FMWBackgroundView,ESPMode::ThreadSafe> BackgroundView;
     bool Overlay=false;
     bool ManagedPresentation=false;
+    bool DisplayPacingEnabled=true,PresentationDiagnosticOverride=false,PresentationDiagnosticUncapped=false;
+    bool DisplayPacingActive=false;
+    int32 RequestedFrameLimit=60,DisplayRefreshHz=0;
+    double NextDisplayPacingCheck=0;
+    void* DisplayPacingMonitor=nullptr;
     double LastPresentationState=0;
     int32 PresentationAlpha=-1;
     void* VisualWindow=nullptr;
     void* OriginalWindow=nullptr;
     void ConfigurePresentation();
+    void UpdateDisplayPacing();
     void UpdatePresentation(const TSharedPtr<FJsonObject>& Packet);
     void PublishPresentationState();
     void PublishStateWitness();

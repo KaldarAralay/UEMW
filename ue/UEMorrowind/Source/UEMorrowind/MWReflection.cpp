@@ -44,6 +44,7 @@ void AMWLive::SetWaterReflectionActive(bool Active) {
 }
 
 void AMWLive::InvalidateWaterReflection() {
+    WaterReflectionMembershipDirty=true;
     SetWaterReflectionActive(false);LastWaterReflection=0;NextWaterReflection=0;WaterReflectionEpoch.Empty();
     // Keep an in-flight target alive until its render command completes, but
     // never promote its old-scene image when a new source arrives.
@@ -57,6 +58,92 @@ bool AMWLive::CanReflectPrimitive(UPrimitiveComponent* Component,const FString& 
     // World transparency/emissive effects are real captured geometry too.
     // Camera-relative rain and foreground arms do not belong to this view.
     return true;
+}
+
+void AMWLive::UpdateWaterReflectionDefinition(const FString& Asset,const FMWMeshData& Next) {
+    // Captured light sets/material values do not affect reflection membership.
+    // Real inclusion/blend classification changes still force reconciliation.
+    if(const auto* Old=MeshData.Find(Asset))if(Old->Water!=Next.Water || Old->FirstPerson!=Next.FirstPerson || Old->Rain!=Next.Rain ||
+        Old->Transparent!=Next.Transparent || Old->NativeParticle!=Next.NativeParticle)WaterReflectionMembershipDirty=true;
+}
+
+void AMWLive::TrackWaterReflectionMember(UPrimitiveComponent* Component,const FString& Asset) {
+    if(!Component || !WaterReflectionMembershipCache)return;
+    const TWeakObjectPtr<UPrimitiveComponent> Key(Component);const auto* Previous=WaterReflectionMemberAssets.Find(Key);
+    if(Previous && *Previous==Asset)return;
+    WaterReflectionMemberAssets.Add(Key,Asset);WaterReflectionMemberChanges.Add(Key);
+}
+
+void AMWLive::UntrackWaterReflectionMember(UPrimitiveComponent* Component) {
+    if(!Component || !WaterReflectionMembershipCache)return;const TWeakObjectPtr<UPrimitiveComponent> Key(Component);
+    if(WaterReflectionMemberAssets.Remove(Key))WaterReflectionMemberChanges.Add(Key);
+}
+
+void AMWLive::ReleaseGeometryPrimitive(UPrimitiveComponent* Component) {
+    if(!Component)return;UntrackWaterReflectionMember(Component);Component->DestroyComponent();
+}
+
+void AMWLive::BuildWaterReflectionMembership(TArray<TWeakObjectPtr<UPrimitiveComponent>>& Members,int32& Transparent) const {
+    Members.Reset();Transparent=0;
+    auto Add=[&](UPrimitiveComponent* Component,const FString& Asset) {
+        if(CanReflectPrimitive(Component,Asset)) {
+            Members.Add(Component);if(const auto* D=MeshData.Find(Asset))Transparent+=D->Transparent || D->NativeParticle;
+        }
+    };
+    for(const auto& Pair:RigidBatches)Add(Pair.Value,Pair.Key);
+    for(const auto& Pair:GeometryComponents)Add(Pair.Value,InstanceAssets.FindRef(Pair.Key));
+    for(const auto& Pair:SkinnedComponents)Add(Pair.Value,InstanceAssets.FindRef(Pair.Key));
+}
+
+void AMWLive::RefreshWaterReflectionMembership() {
+    if(!WaterReflectionCapture)return;
+    if(!WaterReflectionMembershipCache) {
+        // Keep the diagnostic baseline's original full scan, without building
+        // the new reverse maps on every capture and inflating its cost.
+        const double Began=FPlatformTime::Seconds();
+        BuildWaterReflectionMembership(WaterReflectionCapture->ShowOnlyComponents,WaterReflectionTransparentComponents);
+        WaterReflectionMembershipDirty=true;++WaterReflectionMembershipRebuilds;
+        WaterReflectionMembershipTotalMs+=(FPlatformTime::Seconds()-Began)*1000;return;
+    }
+    // Creation/retirement paths maintain the reverse bindings. A count mismatch
+    // is a safety fallback for an untracked resource path, never a pose cache.
+    const bool Rebuild=WaterReflectionMembershipDirty ||
+        WaterReflectionMemberAssets.Num()!=RigidBatches.Num()+GeometryComponents.Num()+SkinnedComponents.Num();
+    if(!Rebuild && !WaterReflectionMemberChanges.Num()) {
+        ++WaterReflectionMembershipReuses;return;
+    }
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ReflectionMembership);
+    const double Began=FPlatformTime::Seconds();
+    auto& Members=WaterReflectionCapture->ShowOnlyComponents;
+    if(Rebuild) {
+        Members.Reset();WaterReflectionMemberAssets.Empty();WaterReflectionMemberIndices.Empty();WaterReflectionTransparentMembers.Empty();
+        auto Add=[&](UPrimitiveComponent* Component,const FString& Asset) {
+            TrackWaterReflectionMember(Component,Asset);
+            if(CanReflectPrimitive(Component,Asset)) {
+                const TWeakObjectPtr<UPrimitiveComponent> Key(Component);WaterReflectionMemberIndices.Add(Key,Members.Add(Component));
+                if(const auto* D=MeshData.Find(Asset))if(D->Transparent || D->NativeParticle)WaterReflectionTransparentMembers.Add(Key);
+            }
+        };
+        for(const auto& Pair:RigidBatches)Add(Pair.Value,Pair.Key);
+        for(const auto& Pair:GeometryComponents)Add(Pair.Value,InstanceAssets.FindRef(Pair.Key));
+        for(const auto& Pair:SkinnedComponents)Add(Pair.Value,InstanceAssets.FindRef(Pair.Key));
+        ++WaterReflectionMembershipRebuilds;
+    }else {
+        for(const auto& Key:WaterReflectionMemberChanges) {
+            auto* Component=Key.Get();const auto* Asset=WaterReflectionMemberAssets.Find(Key);
+            const bool Eligible=Asset && CanReflectPrimitive(Component,*Asset);
+            const auto* Existing=WaterReflectionMemberIndices.Find(Key);
+            if(Existing && !Eligible) {
+                const int32 Index=*Existing;Members.RemoveAtSwap(Index,1,false);WaterReflectionMemberIndices.Remove(Key);
+                if(Members.IsValidIndex(Index))WaterReflectionMemberIndices.FindChecked(Members[Index])=Index;
+            }else if(!Existing && Eligible)WaterReflectionMemberIndices.Add(Key,Members.Add(Component));
+            const auto* D=Eligible?MeshData.Find(*Asset):nullptr;
+            if(D && (D->Transparent || D->NativeParticle))WaterReflectionTransparentMembers.Add(Key);else WaterReflectionTransparentMembers.Remove(Key);
+        }
+        ++WaterReflectionMembershipPatches;WaterReflectionMembershipUpdates+=WaterReflectionMemberChanges.Num();
+    }
+    WaterReflectionTransparentComponents=WaterReflectionTransparentMembers.Num();WaterReflectionMemberChanges.Empty();WaterReflectionMembershipDirty=false;
+    WaterReflectionMembershipTotalMs+=(FPlatformTime::Seconds()-Began)*1000;
 }
 
 void AMWLive::UpdateWaterReflection() {
@@ -109,17 +196,7 @@ void AMWLive::UpdateWaterReflection() {
         C->RegisterComponent();
     }
     auto* C=WaterReflectionCapture;
-    C->ShowOnlyComponents.Reset();WaterReflectionTransparentComponents=0;
-    auto Add=[&](UPrimitiveComponent* Component,const FString& Asset) {
-        // Native view filtering keeps component Visible=true to avoid proxy
-        // rebuilds. The capture must honor that same hidden set explicitly.
-        if(CanReflectPrimitive(Component,Asset)) {
-            C->ShowOnlyComponents.Add(Component);if(const auto* D=MeshData.Find(Asset))WaterReflectionTransparentComponents+=D->Transparent || D->NativeParticle;
-        }
-    };
-    for(const auto& Pair:RigidBatches)Add(Pair.Value,Pair.Key);
-    for(const auto& Pair:GeometryComponents)Add(Pair.Value,InstanceAssets.FindRef(Pair.Key));
-    for(const auto& Pair:SkinnedComponents)Add(Pair.Value,InstanceAssets.FindRef(Pair.Key));
+    RefreshWaterReflectionMembership();
     if(C->ShowOnlyComponents.Num()==0){InvalidateWaterReflection();return;}
     const auto Pose=MWWaterMirrorCamera(Camera->GetComponentTransform(),NativeReflectionHeight);
     C->SetWorldTransform(Pose);C->ClipPlaneBase=FVector(0,0,NativeReflectionHeight+.25);

@@ -9,8 +9,19 @@
 // Only plain arrays/images cross the worker boundary. UObjects are created on
 // the game thread in bounded batches, then the catalog commits as one binding set.
 struct FMWTextureImages {TArray<FImage> Color,Masked,Detail,Blend;};
+struct FMWCatalogRetirement {TArray<FString> Keys[9];};
 struct FMWCatalogData {
     TArray<FMWBinding> Bindings;
+    // Prepared by the decoder, retained independently of newer source frames.
+    TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> BindingSnapshot;
+    TArray<uint8> BindingTraits;
+    TArray<FString> CelestialSunIds;
+    // Retired CPU-only storage is released by the catalog cleanup worker.
+    // These never hold UObjects or poses that may be submitted again.
+    TArray<FMWBinding> RetiredBindings;
+    TArray<FMWMeshData> RetiredMeshes;
+    TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> RetiredBindingSnapshot;
+    FMWCatalogRetirement Retirement;
     TMap<FString,FString> BindingAssets;
     TMap<FString,FString> ResourceAliases;
     FString PoseSourceCatalog;
@@ -45,7 +56,7 @@ struct FMWCatalogLoader {
     bool DefinitionsCommitted=false,BindingsCommitted=false;
     ~FMWCatalogLoader(){Cancelled=true;if(Future.IsValid())Future.Wait();}
 };
-FMWCatalogPtr MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder=FString(),FMWTextureUpgradePtr Upgrades=nullptr,const FString& KnownTerrain=FString(),const FString& KnownTerrainPool=FString());
+FMWCatalogPtr MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder=FString(),FMWTextureUpgradePtr Upgrades=nullptr,const FString& KnownTerrain=FString(),const FString& KnownTerrainPool=FString(),const TMap<FString,uint8>* KnownClassification=nullptr);
 // Validated binding order only; no mesh/PNG decoding or UObject work.
 struct FMWContinuityEntry {TSharedPtr<FJsonObject> Definition;FMWResourceIdentity Identity;};
 // Owned by one parser thread. Exact JSON value comparison fences cached

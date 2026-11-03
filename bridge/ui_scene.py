@@ -3,7 +3,7 @@
 Layout, glyph quads, wrapping, colours, cursor and UI state belong to Morrowind.
 Only projection/clipping and transport are performed here. No UI actions.
 """
-import hashlib,json,math,struct
+import hashlib,json,math,struct,time,os
 from collections import OrderedDict
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +16,8 @@ from game_assets import Assets,normalized
 from asset_files import publish
 from native_topology import triangle_indices
 from ui_read import UIReader
+from ui_layout import LayoutCache
+from ui_fence import UIFence
 
 MAX_DRAWS=2048
 MAX_VERTICES=65536
@@ -30,7 +32,7 @@ def node_identity(pointer,header):
     UI transforms/bounds are owned values in this sample; a moving cursor must
     not invalidate all other UI. Refcounts are not object identities either.
     """
-    return((pointer,header[:4]),(pointer+8,header[8:0x18]),(pointer+0x84,header[0x84:0x90]))
+    return((pointer,header[:4]),(pointer+8,header[8:0x1c]),(pointer+0x84,header[0x84:0x90]))
 
 
 def project(points,camera,width,height):
@@ -70,11 +72,12 @@ def clip_triangles(vertices,indices,rect):
     return np.asarray(output).reshape(-1,columns),np.asarray(triangles,dtype=np.uint16).reshape(-1,3)
 
 
-def element_clips(reader,root,width,height):
+def element_clips(reader,root,width,height,observed=None):
     """Observe layout identity/owners; native mesh buffers already carry clips."""
     pending=[(root,'',0)];seen=set();result={};identities=[];owners={}
     while pending:
         p,owner,depth=pending.pop()
+        if observed is not None:observed.add(p)
         if p in seen or len(seen)>=8192:raise SceneReadChanged('Native UI element list cycled/exceeded budget')
         seen.add(p);raw=reader.read(p,0x15c)
         if raw[0x75]>1 or raw[0x76]>1:raise SceneReadChanged('Native UI visibility changed')
@@ -95,16 +98,25 @@ def element_clips(reader,root,width,height):
 class UICapture:
     def __init__(self,reader,folder=None):
         self.native=reader;self.r=UIReader(reader);self.scene=SceneReader(self.r);self.assets=Assets(reader);self.folder=Path(folder or ROOT/'local/ui-assets');self.folder.mkdir(parents=True,exist_ok=True)
-        self.files=OrderedDict();self.used=set();self.geometry_cache={}
+        self.files=OrderedDict();self.pixel_cache=OrderedDict();self.used=set();self.geometry_cache={};self.layout_cache=LayoutCache('layout');self.graph_cache=LayoutCache('graph');self.structure_cache_enabled=os.environ.get('UEMW_UI_CAPTURE_LEGACY')!='1'
 
     def close(self):self.assets.close()
 
     def geometry(self,p,node,h,shape,projection,projection_key,width,height,clip):
         r=self.r;count=shape['vertex_count'];uv_pointer=struct.unpack_from('<I',h,0x28)[0];color_pointer=struct.unpack_from('<I',h,0x24)[0];material=int(shape['material'],16)
         points_raw=r.read(struct.unpack_from('<I',h,0x1c)[0],count*12);uv_raw=r.read(uv_pointer,count*8)if uv_pointer else b'';colors_raw=r.read(color_pointer,count*4)if color_pointer and shape['color_mode']!=0 else b'';material_raw=r.read(material+0x28,0x2c)if material else b'';indices_raw=triangle_indices(r,shape,h)
-        key=(node,h,points_raw,uv_raw,colors_raw,material_raw,indices_raw,shape['color_mode'],projection_key,width,height,clip)
+        # Only values consumed by projection/colour affect its cached result.
+        # Native renderer refcounts, dirty flags and bounds are not geometry.
+        # Structure/storage/visibility retain their independent source fences.
+        key=(node[0x40:0x74],points_raw,uv_raw,colors_raw,material_raw,indices_raw,shape['color_mode'],projection_key,width,height)
+        if not getattr(self,'structure_cache_enabled',True):key=(node,h,*key[1:])
         cached=self.geometry_cache.get(p)
-        if cached and cached[0]==key:return cached[1]
+        if cached and cached[0]==key:self.geometry_hits=getattr(self,'geometry_hits',0)+1;return cached[1]
+        # The exact current TRS bytes participate in the key above. Only an
+        # exact previously validated geometry hit can skip decoding them.
+        # Never use the structural graph's older sampled transform here.
+        values=struct.unpack_from('<13f',node,0x40)
+        if not all(math.isfinite(v)and abs(v)<1e8 for v in values):raise ValueError('Invalid native UI transform')
         points=np.frombuffer(points_raw,dtype='<f4').reshape(count,3);uv=np.frombuffer(uv_raw,dtype='<f4').reshape(count,2)if uv_raw else np.zeros((count,2));tint=np.ones(4)
         if material_raw:tint[:3]=struct.unpack_from('<3f',material_raw);tint[3]=struct.unpack_from('<f',material_raw,0x28)[0]
         colors=np.frombuffer(colors_raw,dtype=np.uint8).reshape(count,4)[:,[2,1,0,3]].astype(float)/255 if colors_raw else np.ones((count,4))
@@ -114,13 +126,15 @@ class UICapture:
             if not np.isfinite(uv).all()or not np.isfinite(colors).all():raise ValueError('Invalid native UI attributes')
             indices=np.frombuffer(indices_raw,dtype='<u2').reshape(-1,3)
             if indices.size and indices.max()>=count:raise SceneReadChanged('Native UI indices escaped vertex buffer')
-            t=shape['transform'];world_points=points@np.asarray(t['rotation']).reshape(3,3).T*t['scale']+t['position'];xy,depth=project(world_points,projection,width,height)
+            world_points=points@np.asarray(values[:9]).reshape(3,3).T*values[12]+values[9:12];xy,depth=project(world_points,projection,width,height)
             attributes=np.empty((count,8));attributes[:,:2]=xy;attributes[:,2:4]=uv;attributes[:,4:]=colors
             # The game has already clipped/generated its UI vertex buffers.
             # Journal NIF anchors then move children without updating cached
             # Element clip boxes. Applying those boxes again loses real text.
             vertices,indices=clip_triangles(attributes,indices,(0,0,width,height))
-            if len(indices):result=(vertices,indices,float(((world_points-projection['position'])@np.asarray(projection['forward'])).mean()))
+            if len(indices):
+                vertices.flags.writeable=False;indices.flags.writeable=False
+                result=(vertices,indices,float(((world_points-projection['position'])@np.asarray(projection['forward'])).mean()))
         if len(self.geometry_cache)>2048:self.geometry_cache.clear()
         self.geometry_cache[p]=(key,result);return result
 
@@ -148,6 +162,11 @@ class UICapture:
             content=r.read(pointer,width*height*stride)
             if r.read(pixels,0x48)!=raw or r.read(texture,0x3c)!=header:raise SceneReadChanged('Native UI texture changed during capture')
             if hasattr(self,'texture_fences'):self.texture_fences.extend(((pixels,raw),(texture,header)))
+            if not hasattr(self,'pixel_cache'):self.pixel_cache=OrderedDict()
+            pixel_key=(width,height,stride,tuple(masks),content)
+            previous=self.pixel_cache.get(texture)
+            if previous and previous[0]==pixel_key:
+                self.pixel_cache.move_to_end(texture);self.used.add(previous[1]['file']);return previous[1]
             rgba=np.frombuffer(content,dtype=np.uint8).reshape(height,width,stride)
             if masks in(reverse,bgr):rgba=rgba[:,:,[2,1,0,3]if stride==4 else[2,1,0]]
             if stride==3:rgba=np.concatenate((rgba,np.full((height,width,1),255,dtype=np.uint8)),axis=2)
@@ -171,33 +190,46 @@ class UICapture:
                 image=image.convert('RGBA');body=struct.pack('<4sII',b'UTX1',image.width,image.height)+image.tobytes();width,height=image.size
         digest=hashlib.sha256(body).hexdigest();filename=digest+'.utx';publish(self.folder/filename,body);self.used.add(filename)
         row=dict(file=filename,sha256=digest,md5=hashlib.md5(body).hexdigest(),width=width,height=height,bytes=len(body))
-        if not pixels:
+        if pixels:
+            self.pixel_cache[texture]=(pixel_key,row);self.pixel_cache.move_to_end(texture)
+            while len(self.pixel_cache)>128 or sum(len(k[-1])for k,_ in self.pixel_cache.values())>64*1024*1024:self.pixel_cache.popitem(last=False)
+        else:
             self.files[name]=row
             while len(self.files)>128:self.files.popitem(last=False)
         return row
 
     def sample(self):
-        r=self.r;r.check_alive();r.begin();self.texture_fences=[];world=r.u32(0x7c67dc);camera=r.u32(world+0x18c);raw=r.read(camera,0x148);root=struct.unpack_from('<I',raw,0x128)[0];width,height=struct.unpack('<2I',r.read(world+0x78,8));ui=inspect_ui(r)
+        began=time.perf_counter();r=self.r;r.check_alive();before=inspect_ui(self.native);mode=(before['root'],tuple(before['active_menus']));r.begin(mode);snapshot_end=time.perf_counter();self.texture_fences=[];self.geometry_hits=0;world=r.u32(0x7c67dc);camera=r.u32(world+0x18c);raw=r.read(camera,0x148);root=struct.unpack_from('<I',raw,0x128)[0];width,height=struct.unpack('<2I',r.read(world+0x78,8));ui=inspect_ui(r)
+        if ui!=before:raise SceneReadChanged('Native UI mode changed during snapshot')
         if not 320<=width<=8192 or not 200<=height<=8192 or not root:raise SceneReadChanged('Native UI viewport/root unavailable')
         projection=dict(position=struct.unpack_from('<3f',raw,0x64),forward=struct.unpack_from('<3f',raw,0xdc),up=struct.unpack_from('<3f',raw,0xe8),right=struct.unpack_from('<3f',raw,0xf4),frustum=struct.unpack_from('<6f',raw,0x100))
         if struct.unpack_from('<4f',raw,0x118)!=(0.,1.,1.,0.):raise ValueError('Unsupported native UI viewport port')
-        clips,identities,owners=element_clips(r,int(ui['root'],16),width,height)
-        graph=self.scene.collect(roots=[root],prune_hidden=True);draws=[];textures=[];texture_indices={};native_textures={};native_regions=[];texture_bytes=0;vertices_total=0;indices_total=0;self.used=set();node_fences=[]
+        def layout(reader):
+            seen=set();value=element_clips(reader,int(ui['root'],16),width,height,observed=seen);return value,seen,set()
+        clips,identities,owners=self.layout_cache.read(r,(mode,width,height),layout)if self.structure_cache_enabled else element_clips(r,int(ui['root'],16),width,height);layout_end=time.perf_counter()
+        def graph_read(reader):
+            previous=self.scene.r;self.scene.r=reader
+            try:value=self.scene.collect(roots=[root],prune_hidden=True)
+            finally:self.scene.r=previous
+            return value,set(value['node_identities']),{int(s['model'],16)for s in value['shapes']}
+        graph=self.graph_cache.read(r,(world,camera,root,mode),graph_read)if self.structure_cache_enabled else self.scene.collect(roots=[root],prune_hidden=True);graph_end=time.perf_counter();draws=[];textures=[];texture_indices={};native_textures={};native_regions=[];texture_bytes=0;vertices_total=0;indices_total=0;self.used=set();node_fences=[]
         if graph['errors']:raise SceneReadChanged('Native UI graph is incomplete: '+graph['errors'][0]['error'])
+        viewport_clip=(0,0,width,height)
         for order,shape in enumerate(reversed(graph['shapes'])):
             if not shape['visible']:continue
             if shape['type']!='NiTriShape'or shape['skin']!='0x0':raise ValueError('Unsupported native UI geometry: '+shape['type'])
             p=int(shape['id'],16);node=r.read(p,0xa0);model=int(shape['model'],16);h=r.read(model,0x48);count=shape['vertex_count'];triangles=shape['triangle_count']
+            # Geometry validates/projects these freshly copied TRS bytes on a
+            # cache miss; an exact hit already validated those same bytes.
             if struct.unpack_from('<H',h,8)[0]!=count or struct.unpack_from('<H',h,0x34)[0]!=triangles:raise SceneReadChanged('Native UI geometry count changed')
-            clip=next((clips[parent]for parent in reversed((*shape['parents'],p))if parent in clips),(0,0,width,height))
-            geometry=self.geometry(p,node,h,shape,projection,raw[0x40:0x128],width,height,clip)
+            geometry=self.geometry(p,node,h,shape,projection,raw[0x64:0x70]+raw[0xdc:0x118],width,height,viewport_clip)
             if geometry is None:continue
             vertices,indices,depth=geometry
             texture_index=0xffffffff;prop=int(shape['texture_property'],16)
             if prop:
                 storage=r.u32(prop+0x20);texmap=r.u32(storage)if storage else 0;texture=r.u32(texmap+4)if texmap else 0
                 if texture:
-                    if 'NiRenderedTexture'in self.scene.ancestry(texture):
+                    if texture not in native_textures and 'NiRenderedTexture'in self.scene.ancestry(texture):
                         owner=next((owners[parent]for parent in reversed((*shape['parents'],p))if owners.get(parent)),'')
                         target=next((label for offset,label in((0x1a8,'MenuInventory'),(0x22c,'MenuMap'))if r.u32(world+offset+0x2c)==texture),None)
                         if target and owner==target and target in ui['active_menus']:
@@ -219,7 +251,7 @@ class UICapture:
         # Original painter/depth order. Source camera depth wins; original
         # child order breaks ties. No menus/glyphs are laid out by this code.
         draws.sort(key=lambda d:(-round(d['depth'],3),d['order']))
-        actual=self.native
+        geometry_end=time.perf_counter();actual=self.native
         camera_after=actual.read(camera,0x148)
         if actual.u32(0x7c67dc)!=world or actual.u32(world+0x18c)!=camera or camera_after[:4]!=raw[:4]or camera_after[8:]!=raw[8:]or inspect_ui(actual)!=ui:raise SceneReadChanged('Native UI camera/menu changed during capture')
         # Keep every identity/layout fence in one owned external read batch.
@@ -230,12 +262,24 @@ class UICapture:
         for p,node,model,h in node_fences:fences.extend((*node_identity(p,node),(p+0x94,node[0x94:0xa0]),(model,h[:4]),(model+8,h[8:])))
         for p,children,flags,node,clip in identities:
             fences.extend(((p+0x1c,children),(p+0x75,flags[5:7]),(p+0x88,node),(p+0x128,clip)))
-        requests={}
-        for pointer,expected in fences:requests[pointer]=max(requests.get(pointer,0),len(expected))
-        copied=actual.read_many(requests.items())
-        for pointer,expected in fences:
-            if copied[pointer][:len(expected)]!=expected:raise SceneReadChanged('Native UI visibility/model/layout changed during capture')
-        return dict(width=width,height=height,draws=draws,textures=textures,native_regions=native_regions,ui=ui,camera=projection,root=hex(root),vertices=vertices_total,indices=indices_total,texture_bytes=texture_bytes)
+        fences=tuple(fences)
+        if not hasattr(self,'identity_fences'):self.identity_fences=OrderedDict()
+        compiled=self.identity_fences.get(mode)
+        if compiled is None or (compiled.fences!=fences and not compiled.update_expected(fences)):
+            compiled=UIFence(fences);self.identity_fences[mode]=compiled
+        self.identity_fences.move_to_end(mode)
+        while len(self.identity_fences)>8 or sum(row.expected.nbytes for row in self.identity_fences.values())>16*1024*1024:self.identity_fences.popitem(last=False)
+        copied=actual.capture_many(compiled.plan)
+        if not compiled.matches(copied):
+            for _,_,model,h in node_fences:
+                after=copied[model+8][:len(h)-8]
+                if after!=h[8:]:
+                    changed=next(i+8 for i,(a,b)in enumerate(zip(after,h[8:]))if a!=b)
+                    raise SceneReadChanged(f'Native UI model field changed +{changed:#x}')
+            raise SceneReadChanged('Native UI visibility/model/layout changed during capture')
+        parts=dict(snapshot_ms=(snapshot_end-began)*1000,layout_ms=(layout_end-snapshot_end)*1000,graph_ms=(graph_end-layout_end)*1000,geometry_ms=(geometry_end-graph_end)*1000,fence_ms=(time.perf_counter()-geometry_end)*1000,layout_reused=self.layout_cache.reused,graph_reused=self.graph_cache.reused,geometry_reused=self.geometry_hits)
+        self.menu_probe=(world,ui['menu'])
+        return dict(width=width,height=height,draws=draws,textures=textures,native_regions=native_regions,ui=ui,camera=projection,root=hex(root),vertices=vertices_total,indices=indices_total,texture_bytes=texture_bytes,capture_parts=parts)
 
 
 HEADER=struct.Struct('<4sHH16sQdIIII')
@@ -243,12 +287,22 @@ DRAW=struct.Struct('<4I')
 VERTEX=np.dtype([('values','<f4',(4,)),('colour','u1',(4,))])
 
 
-def encode(sample,session,sequence,stamp,pid):
+def encode(sample,session,sequence,stamp,pid,cache=None):
     from live_binary import guid
     data=[HEADER.pack(b'UUI1',1,0,guid(session),sequence,stamp,pid,sample['width'],sample['height'],len(sample['draws']))]
     for d in sample['draws']:
-        v=d['vertices'];packed=np.empty(len(v),dtype=VERTEX);packed['values']=v[:,:4];packed['colour']=np.rint(v[:,4:].clip(0,1)*255).astype(np.uint8)
-        data.extend((DRAW.pack(d['id'],d['texture'],len(v),d['indices'].size),packed.tobytes(),d['indices'].astype('<u2').tobytes()))
+        v=d['vertices'];indices=d['indices'];previous=cache.get(d['id'])if cache is not None else None
+        if previous is not None and previous[0]is v and previous[1]is indices and previous[2]==d['texture']and not v.flags.writeable and not indices.flags.writeable:
+            data.append(previous[3]);continue
+        packed=np.empty(len(v),dtype=VERTEX);packed['values']=v[:,:4];packed['colour']=np.rint(v[:,4:].clip(0,1)*255).astype(np.uint8)
+        encoded=DRAW.pack(d['id'],d['texture'],len(v),indices.size)+packed.tobytes()+indices.astype('<u2').tobytes();data.append(encoded)
+        # Reuse only immutable geometry whose identity already came through
+        # this capture's exact projection/material/buffer cache checks.
+        if cache is not None and not v.flags.writeable and not indices.flags.writeable:cache[d['id']]=(v,indices,d['texture'],encoded)
+    if cache is not None:
+        current={d['id']for d in sample['draws']}
+        for key in list(cache):
+            if key not in current:del cache[key]
     body=b''.join(data)
     if len(body)>2*1024*1024:raise ValueError('Native UI body exceeds 2 MiB')
     return body

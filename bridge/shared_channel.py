@@ -80,7 +80,7 @@ class Channel:
         if hashlib.md5(text).digest()!=jhash or(body and hashlib.md5(payload).digest()!=bhash):raise ValueError('Shared slot digest mismatch')
         packet=json.loads(text)
         if not isinstance(packet,dict)or packet.get('session')!=self.d['session']or packet.get('pid')!=self.d['pid']:raise ValueError('Shared snapshot source mismatch')
-        if packet.get('version')==5:
+        if packet.get('version')==5 or(packet.get('protocol')=='uemw.ui'and packet.get('version')==2):
             ref=packet.get('frame_ref',{})
             if ref.get('storage')!='shared-v1'or ref.get('channel_nonce')!=self.d['nonce']or ref.get('commit_generation')!=wanted or ref.get('bytes')!=nb or ref.get('md5')!=bhash.hex():raise ValueError('Shared frame reference mismatch')
         elif nb:raise ValueError('Unexpected body on inline shared status')
@@ -117,17 +117,30 @@ class Writer(Channel):
             C.memmove(self.view,HEADER.pack(b'UMSC',1,HEADER.size,SLOTS,STRIDE,pid,os.getpid(),guid(session),guid(nonce),0,0,0),HEADER.size)
         except BaseException:self.close();raise
     def publish(self,packet,body=b''):
+        return self._publish(packet,body,ui=False)
+    def publish_ui(self,packet,body=b''):
+        """UI/v2 metadata and owned UUI1 bytes in the unchanged channel/v1 ABI."""
+        if type(packet.get('version'))is not int or packet['version']!=1 or(packet.get('status')=='live')!=bool(body)or len(body)>2*1024*1024:raise ValueError('Invalid shared UI publication')
+        return self._publish(packet,body,ui=True)
+    def _publish(self,packet,body,*,ui):
         if not self.view:raise OSError('Shared channel closed')
-        if packet.get('protocol')!='uemw.live'or packet.get('session')!=self.d['session']or packet.get('pid')!=self.d['pid']:raise ValueError('Wrong source for shared publisher')
+        if packet.get('protocol')!=('uemw.ui'if ui else 'uemw.live')or packet.get('session')!=self.d['session']or packet.get('pid')!=self.d['pid']:raise ValueError('Wrong source for shared publisher')
         if len(body)>MAX_BODY:raise ValueError('Shared body exceeds limit')
         generation=self.generation+1
         if generation>9007199254740991:raise ValueError('Shared commit counter exhausted')
         value=dict(packet)
         digest=hashlib.md5(body).digest()
         if body:
-            from frame_transport import filename
-            value={k:v for k,v in packet.items()if k not in('instances','instance_states','objects','environment','material_frames','material_values')}
-            value.update(version=5,state_metadata_version=1,object_count=packet.get('object_count',len(packet.get('objects',[]))),frame_ref=dict(file='frames/'+filename(packet,True),bytes=len(body),md5=digest.hex(),storage='shared-v1',channel_nonce=self.d['nonce'],commit_generation=generation))
+            if ui:
+                sequence=packet.get('sequence')
+                if type(sequence)is not int or not 0<=sequence<=9007199254740991:raise ValueError('Invalid shared UI sequence')
+                name='ui-frames/'+uuid.UUID(self.d['session']).hex+'-'+str(sequence)+'.uui'
+                if packet.get('frame_ref',{}).get('file')!=name:raise ValueError('Shared UI file identity mismatch')
+                value.update(version=2,frame_ref=dict(file=name,bytes=len(body),md5=digest.hex(),storage='shared-v1',channel_nonce=self.d['nonce'],commit_generation=generation))
+            else:
+                from frame_transport import filename
+                value={k:v for k,v in packet.items()if k not in('instances','instance_states','objects','environment','material_frames','material_values')}
+                value.update(version=5,state_metadata_version=1,object_count=packet.get('object_count',len(packet.get('objects',[]))),frame_ref=dict(file='frames/'+filename(packet,True),bytes=len(body),md5=digest.hex(),storage='shared-v1',channel_nonce=self.d['nonce'],commit_generation=generation))
         text=json.dumps(value,separators=(',',':'),allow_nan=False).encode()
         if not 0<len(text)<=MAX_JSON:raise ValueError('Shared manifest exceeds limit')
         self.lock()

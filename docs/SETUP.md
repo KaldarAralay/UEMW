@@ -6,7 +6,7 @@ UEMW builds its UE frontend from source and prepares a private copy of your inst
 
 | Prerequisite | Supported configuration |
 |---|---|
-| OS | 64-bit Windows 10/11 on x64, with a D3D11-capable GPU/driver |
+| OS | 64-bit Windows 10/11 on x64; D3D12/SM5 GPU/driver for default launch, or D3D11 with the explicit `-RHI d3d11` launcher fallback |
 | Game | User-owned Steam Morrowind GOTY, app 22320, including Tribunal and Bloodmoon |
 | Executable | Unmodified Steam 1.6.1820, SHA256 `eac72e1b3524ee0012d080d3c2e2e00e401464e41ee54f9afd6aaaadf2c221f5` |
 | Unreal | **UE 5.2.1**, installed through Epic Games Launcher, with editor/C++ and built-in ProceduralMeshComponent/Paper2D content |

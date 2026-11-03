@@ -36,9 +36,9 @@ def observe(r,label,capture=False,seconds=.7):
     return result
 
 
-def run(r,capture=False):
+def run(r,capture=False,report_path=None):
     require_foreground(r);report=dict(passed=False,recording=False,save_writes=False,checks=[])
-    path=ROOT/'logs/ui09-core-acceptance.json'
+    path=Path(report_path)if report_path is not None else ROOT/'logs/ui09-core-acceptance.json'
     try:
         ui=inspect_ui(r)
         if ui['native_ui']and 'MenuInventory'not in ui['active_menus']:raise RuntimeError('Begin in gameplay or native inventory')

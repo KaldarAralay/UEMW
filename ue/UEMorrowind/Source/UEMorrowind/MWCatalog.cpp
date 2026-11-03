@@ -205,7 +205,7 @@ bool MWRemapRetainedGeometry(const TArray<FMWBinding>& Bindings,const TArray<FMW
     TArray<int32> Indices;
     return Bindings.Num()==Incoming.Num() && MWBuildRetainedRemap(Bindings,Retained,Indices) && MWApplyRetainedRemap(Incoming,Indices,Out,Missing);
 }
-TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder,FMWTextureUpgradePtr Upgrades,const FString& KnownTerrain,const FString& KnownTerrainPool) {
+TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name,const FString& AssetsPath,const TSet<FString>& KnownMeshes,const TSet<FString>& KnownTextures,const FThreadSafeBool& Cancelled,const FString& UpgradeFolder,FMWTextureUpgradePtr Upgrades,const FString& KnownTerrain,const FString& KnownTerrainPool,const TMap<FString,uint8>* KnownClassification) {
     auto Result=MakeShared<FMWCatalogData,ESPMode::ThreadSafe>();
     Result->UpgradeIndex=Upgrades.IsValid()?Upgrades:MWReadTextureUpgradeIndex(UpgradeFolder);
     if(!Name.StartsWith(TEXT("catalog-")) || !Name.EndsWith(TEXT(".json")) || Name.Len()>64 || Name.Contains(TEXT("/")) || Name.Contains(TEXT("\\"))) return nullptr;
@@ -280,6 +280,7 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         }
     }
     TMap<FString,TArray<FString>> AnimationGroups;
+    TMap<FString,uint8> BindingTraits;TSet<FString> SunAssets;
     for(const auto& Definition:(*Definitions)->Values) {
         WantedAssets.Add(Definition.Key);
         const TSharedPtr<FJsonObject>* Item=nullptr;FString File,TextureName,AlphaMode=TEXT("opaque");
@@ -340,11 +341,12 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
             Terrain=true;TerrainTiles.Add({FIntPoint((int32)X,(int32)Y),TextureName,SourceTexture});
         }
         const TSharedPtr<FJsonObject>* SurfaceShading=nullptr;
-        bool SolidLit=true,Excluded=false,Particle=false,FirstPerson=false;
+        bool SolidLit=true,Excluded=false,Particle=false,FirstPerson=false,Rain=false,Background=false,Sky=false;
         if((*Item)->TryGetObjectField(TEXT("shading"),SurfaceShading)) {
             (*SurfaceShading)->TryGetBoolField(TEXT("lit"),SolidLit);
             if((*SurfaceShading)->HasField(TEXT("native_particle")) && !(*SurfaceShading)->TryGetBoolField(TEXT("native_particle"),Particle))return nullptr;
-            (*SurfaceShading)->TryGetBoolField(TEXT("first_person"),FirstPerson);
+            for(auto Flag:{TPair<const TCHAR*,bool*>(TEXT("first_person"),&FirstPerson),TPair<const TCHAR*,bool*>(TEXT("rain"),&Rain),TPair<const TCHAR*,bool*>(TEXT("background"),&Background),TPair<const TCHAR*,bool*>(TEXT("sky"),&Sky)})
+                if((*SurfaceShading)->HasField(Flag.Key) && (!(*SurfaceShading)->HasTypedField<EJson::Boolean>(Flag.Key) || !(*SurfaceShading)->TryGetBoolField(Flag.Key,*Flag.Value)))return nullptr;
             for(const TCHAR* Flag:{TEXT("sky"),TEXT("background"),TEXT("water")}){bool V=false;(*SurfaceShading)->TryGetBoolField(Flag,V);Excluded|=V;}
         }
         // Named static vegetation is a deliberate cutout rendering interpretation.
@@ -361,6 +363,14 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
             if(FilterBlend){Result->WantedBlendTextures.Add(TextureName);for(const auto& Frame:FrameTextures)Result->WantedBlendTextures.Add(Frame);}
         }
         Result->AlphaModes.Add(Definition.Key,AlphaMode);
+        // Catalog classification depends only on validated immutable definition
+        // fields, including those whose CPU mesh is already resident.
+        BindingTraits.Add(Definition.Key,(FirstPerson?1:0)|(Rain?2:0)|(!ValueGroup.IsEmpty() || !FrameGroup.IsEmpty() || MWHasAnimatedStages(StageRecipe)?4:0));
+        if(MWCelestialKind(SourceTexture,Background,Sky)==4)SunAssets.Add(Definition.Key);
+        if(KnownClassification && KnownMeshes.Contains(Definition.Key)) {
+            const auto* Previous=KnownClassification->Find(Definition.Key);const uint8 Current=BindingTraits[Definition.Key]|(SunAssets.Contains(Definition.Key)?8:0);
+            if(!Previous || *Previous!=Current)return nullptr; // an immutable resident asset cannot silently change classification
+        }
         if(KnownMeshes.Contains(Definition.Key))continue;
         if(Cancelled)return nullptr;
         TArray<uint8> Bytes;
@@ -503,8 +513,10 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         if(DecodedBytes>512*1024*1024)return nullptr;
         Result->Images.Add(Texture,MoveTemp(Images));
     }
-    Result->BindingAssets.Reserve(NewBindings.Num());for(const auto& B:NewBindings)Result->BindingAssets.Add(B.Id,B.Asset);
+    Result->BindingAssets.Reserve(NewBindings.Num());Result->BindingTraits.Reserve(NewBindings.Num());
+    for(const auto& B:NewBindings){const auto* Traits=BindingTraits.Find(B.Asset);if(!Traits)return nullptr;Result->BindingAssets.Add(B.Id,B.Asset);Result->BindingTraits.Add(*Traits);if(SunAssets.Contains(B.Asset))Result->CelestialSunIds.Add(B.Id);}
     Result->Bindings=MoveTemp(NewBindings);Result->WantedAssets=MoveTemp(WantedAssets);Result->WantedTextures=MoveTemp(WantedTextures);
+    Result->BindingSnapshot=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>(Result->Bindings);
     Result->TextureWorkMs=(FPlatformTime::Seconds()-TextureBegan)*1000;
     return Result;
 }
