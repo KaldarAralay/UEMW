@@ -8,6 +8,9 @@
 #include "Misc/FileHelper.h"
 #include "Misc/SecureHash.h"
 
+FMWTerrainData::FMWTerrainData()=default;
+FMWTerrainData::~FMWTerrainData()=default;
+
 FString MWTerrainSignature(const TArray<FMWTerrainTile>& Tiles) {
     TArray<FString> Rows;for(const auto& T:Tiles)Rows.Add(FString::Printf(TEXT("%d,%d:%s:%s"),T.Tile.X,T.Tile.Y,*T.Texture,*T.SourceName));
     Rows.Sort();FString Text;for(const auto& R:Rows)Text+=R+TEXT("\n");return FMD5::HashAnsiString(*Text);
@@ -53,6 +56,7 @@ FMWTerrainPtr MWBuildTerrain(const TArray<FMWTerrainTile>& Tiles,const FString& 
     return Out;
 }
 UTexture2DArray* MWCreateTerrainArray(const TArray<FImage>& Mips) {
+    const double Began=FPlatformTime::Seconds();
     if(!Mips.Num() || Mips[0].NumSlices<1 || Mips[0].NumSlices>64)return nullptr;
     int32 W=Mips[0].SizeX,H=Mips[0].SizeY,N=Mips[0].NumSlices;
     for(const auto& M:Mips){if(M.SizeX!=W || M.SizeY!=H || M.NumSlices!=N || M.Format!=ERawImageFormat::BGRA8 || M.RawData.Num()!=(int64)W*H*N*4)return nullptr;W=FMath::Max(1,W/2);H=FMath::Max(1,H/2);}
@@ -61,5 +65,45 @@ UTexture2DArray* MWCreateTerrainArray(const TArray<FImage>& Mips) {
     Texture->NeverStream=true;Texture->SRGB=Mips[0].GammaSpace==EGammaSpace::sRGB;Texture->Filter=TF_Default;Texture->AddressX=Texture->AddressY=TA_Wrap;Texture->AddressZ=TA_Clamp;
     auto* Platform=Texture->GetPlatformData();
     for(int32 I=0;I<Mips.Num();++I){FTexture2DMipMap* M;if(I==0)M=&Platform->Mips[0];else{M=new FTexture2DMipMap;Platform->Mips.Add(M);}M->SizeX=Mips[I].SizeX;M->SizeY=Mips[I].SizeY;M->SizeZ=N;M->BulkData.Lock(LOCK_READ_WRITE);void* P=M->BulkData.Realloc(Mips[I].RawData.Num());FMemory::Memcpy(P,Mips[I].RawData.GetData(),Mips[I].RawData.Num());M->BulkData.Unlock();}
-    Texture->UpdateResource();return Texture;
+    Texture->UpdateResource();
+    UE_LOG(LogTemp,Display,TEXT("UEMW terrain array prepared=0 layers=%d mips=%d create_ms=%.3f"),N,Mips.Num(),(FPlatformTime::Seconds()-Began)*1000);
+    return Texture;
+}
+
+TUniquePtr<FTexturePlatformData> MWPrepareTerrainArray(const TArray<FImage>& Mips,const FThreadSafeBool& Cancelled) {
+    if(Cancelled || !Mips.Num() || Mips[0].SizeX<1 || Mips[0].SizeX>512 || Mips[0].SizeY<1 || Mips[0].SizeY>512 || Mips[0].NumSlices<1 || Mips[0].NumSlices>64)return nullptr;
+    int32 W=Mips[0].SizeX,H=Mips[0].SizeY;const int32 N=Mips[0].NumSlices;
+    for(const auto& M:Mips){if(M.SizeX!=W || M.SizeY!=H || M.NumSlices!=N || M.Format!=ERawImageFormat::BGRA8 || M.GammaSpace!=Mips[0].GammaSpace || M.RawData.Num()!=int64(W)*H*N*4)return nullptr;W=FMath::Max(1,W/2);H=FMath::Max(1,H/2);}
+    if(Mips.Last().SizeX!=1 || Mips.Last().SizeY!=1)return nullptr;
+    auto Out=MakeUnique<FTexturePlatformData>();Out->SizeX=Mips[0].SizeX;Out->SizeY=Mips[0].SizeY;Out->SetNumSlices(N);Out->PixelFormat=PF_B8G8R8A8;
+    for(const auto& Image:Mips) {
+        if(Cancelled)return nullptr;
+        auto* Mip=new FTexture2DMipMap;Out->Mips.Add(Mip);Mip->SizeX=Image.SizeX;Mip->SizeY=Image.SizeY;Mip->SizeZ=N;
+        Mip->BulkData.Lock(LOCK_READ_WRITE);void* P=Mip->BulkData.Realloc(Image.RawData.Num());FMemory::Memcpy(P,Image.RawData.GetData(),Image.RawData.Num());Mip->BulkData.Unlock();
+        // The standard UE array resource consumes GetCopy(...,true). Transfer
+        // the allocation instead of copying every mip/slice on the game thread.
+        // These NeverStream transient textures are initialized only once.
+        Mip->BulkData.SetBulkDataFlags(BULKDATA_SingleUse);
+    }
+    if(Cancelled)return nullptr;return Out;
+}
+
+bool MWPrepareTerrainPools(FMWTerrainData& Data,const FThreadSafeBool& Cancelled) {
+    if(Cancelled)return false;
+    if(!Data.Color.Num() && !Data.Detail.Num())return true;
+    auto Color=MWPrepareTerrainArray(Data.Color,Cancelled),Detail=MWPrepareTerrainArray(Data.Detail,Cancelled);
+    if(!Color || !Detail || Cancelled)return false;
+    Data.PreparedColor=MoveTemp(Color);Data.PreparedDetail=MoveTemp(Detail);
+    // Dispose decoded images on their worker, not during promotion.
+    Data.Color.Empty();Data.Detail.Empty();return true;
+}
+
+UTexture2DArray* MWCreatePreparedTerrainArray(TUniquePtr<FTexturePlatformData>& Data,bool SRGB) {
+    if(!Data)return nullptr;const double Began=FPlatformTime::Seconds();
+    const int32 N=Data->GetNumSlices(),Mips=Data->Mips.Num();
+    auto* Texture=NewObject<UTexture2DArray>(GetTransientPackage(),NAME_None,RF_Transient);if(!Texture)return nullptr;
+    Texture->SetPlatformData(Data.Release());Texture->NeverStream=true;Texture->SRGB=SRGB;Texture->Filter=TF_Default;Texture->AddressX=Texture->AddressY=TA_Wrap;Texture->AddressZ=TA_Clamp;
+    Texture->UpdateResource();
+    UE_LOG(LogTemp,Display,TEXT("UEMW terrain array prepared=1 layers=%d mips=%d create_ms=%.3f"),N,Mips,(FPlatformTime::Seconds()-Began)*1000);
+    return Texture;
 }

@@ -129,6 +129,14 @@ void AMWLive::RetargetCompatibleResources(const TArray<FMWBinding>& Bindings) {
         if(auto* Component=SkinnedComponents.FindRef(B.Id)) {
             auto* Skin=SkinMaterials.FindRef(B.Id);auto* Palette=PaletteTextures.FindRef(B.Id);
             if(!Skin || !Palette || !Next->SkinBones)continue;
+            // An alias-preparation pass can run before the previous catalog's
+            // pending resource jobs create this actor mesh. Recover directly
+            // from its now-ready component at the final handoff. Exact native
+            // continuity and cell ownership above still fence this reuse.
+            if(!SharedMeshes.Contains(B.Asset)) {
+                UStaticMesh* Mesh=Component->GetStaticMesh();if(!Mesh)continue;
+                SharedMeshes.Add(B.Asset,Mesh);++PerfSharedMeshAliases;
+            }
             // Keep the same component, sparse geometry and live palette.
             // Updating uniforms does not hide/recreate the native actor.
             // Exact continuity excludes only captured light membership and
@@ -145,6 +153,33 @@ void AMWLive::RetargetCompatibleResources(const TArray<FMWBinding>& Bindings) {
     }
 }
 
+bool AMWLive::UseRigidResource(const FMWBinding& B,const FMWMeshData& D,const double* M) const {
+    // Native animated rigid nodes can alternate between decomposable and
+    // sheared affine matrices. Once a CPU section exists, keep using it for
+    // that exact asset instead of hiding it behind another resource queue.
+    if(D.Lines || D.Transparent || !MWCanInstance(M))return false;
+    if(D.FirstPerson || !GeometryComponents.Contains(B.Id))return true;
+    const auto* Current=InstanceAssets.Find(B.Id);
+    return !Current || *Current!=B.Asset;
+}
+
+bool AMWLive::PrepareMutableResource(const FString& Id,const FString& Asset) {
+    const auto* D=MeshData.Find(Asset);auto* Material=GeometryMaterials.FindRef(Asset);if(!D || !Material)return false;
+    PrepareResourceIdentity(Id,Asset);auto* C=GeometryComponents.FindRef(Id);
+    if(!C) {
+        C=D->Lines?static_cast<UProceduralMeshComponent*>(NewObject<UMWNativeLineComponent>(this)):NewObject<UMWMutableMeshComponent>(this);C->SetMobility(EComponentMobility::Movable);MWNativeDrawLayer(C,*D);
+        C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetSimulatePhysics(false);C->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);C->SetRenderCustomDepth(D->Water);C->SetCustomDepthStencilValue(1);C->bUseAsyncCooking=false;C->SetAbsolute(true,true,true);C->SetWorldTransform(FTransform::Identity);
+        GeometryComponents.Add(Id,C);TrackWaterReflectionMember(C,Asset);
+    }
+    if(C->GetNumSections()==0) {
+        SetPrimitiveShown(C,false);TArray<FVector> Empty;Empty.Init(FVector::ZeroVector,D->Vertices.Num());TArray<FVector> Normals;Normals.Init(FVector::UpVector,D->Vertices.Num());TArray<FProcMeshTangent> Tangents;C->SetMaterial(0,Material);
+        if(D->Lines){if(!CastChecked<UMWNativeLineComponent>(C)->SetNativeSection(Empty,D->Triangles,D->UVs,D->StageUV1,D->StageUV2,D->Colors))return false;}
+        else C->CreateMeshSection_LinearColor(0,Empty,D->Triangles,Normals,D->UVs,D->Colors,Tangents,false);
+        if(!C->IsRegistered())C->RegisterComponent();LastRigidTransforms.Remove(Id);UploadedVertexPoses.Remove(Id);NativeResourceInvalidations.Add(Id);
+    }
+    return true;
+}
+
 bool AMWLive::GeometryResourceReady(const FMWBinding& B,const FMWGeometryState& S) const {
     if(!GeometryMaterials.Contains(B.Asset))return false;
     const auto* Definition=MeshData.Find(B.Asset);if(!Definition)return false;
@@ -152,7 +187,7 @@ bool AMWLive::GeometryResourceReady(const FMWBinding& B,const FMWGeometryState& 
     if(S.Palette.Num())return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && PaletteTextures.Contains(B.Id);
     double M[13];for(int32 J=0;J<13;++J)M[J]=S.Transform[J];
     if(!Definition->Lines && Definition->FirstPerson && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && !SkinnedComponents[B.Id]->UseNativeBounds && SkinMaterials.Contains(B.Id);
-    if(!Definition->Lines && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return SharedMeshes.Contains(B.Asset) && RigidBatches.Contains(B.Asset);
+    if(S.Points.Num()==0 && UseRigidResource(B,*Definition,M))return SharedMeshes.Contains(B.Asset) && RigidBatches.Contains(B.Asset);
     auto* C=GeometryComponents.FindRef(B.Id);return Same && C && C->GetNumSections()>0;
 }
 
@@ -209,14 +244,26 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         if(Unchanged && (*Unchanged)[i]){++Ready;continue;}
         const auto& B=GeometryBindings[i];
         if(GeometryResourceReady(B,S)){++Ready;continue;}
+        // A currently displayed rigid node may acquire real native shear.
+        // Prepare its CPU capacity in this same apply, before hiding the rigid
+        // representation. Only the current packet fills/displays the section.
+        // This one-time allocation is limited to an already drawable same-asset
+        // node, never unrelated cold objects or a remembered old pose.
         const auto* ExistingAsset=InstanceAssets.Find(B.Id);const bool SameAsset=ExistingAsset && *ExistingAsset==B.Asset;
+        if(SameAsset && !S.Palette.Num() && !S.Points.Num() && RigidVisible.Contains(B.Id) && !GeometryComponents.Contains(B.Id)) {
+            const auto* Definition=MeshData.Find(B.Asset);double Affine[13];for(int32 J=0;J<13;++J)Affine[J]=S.Transform[J];
+            if(Definition && !Definition->FirstPerson && !Definition->Lines && !Definition->Transparent && !MWCanInstance(Affine)) {
+                if(!PrepareMutableResource(B.Id,B.Asset)){ResourceError=TEXT("Native affine handoff allocation failed");return false;}
+                if(GeometryResourceReady(B,S)){++Ready;continue;}
+            }
+        }
         ++PendingGeometryInstances;HideInstance(B.Id);
         // CPU definitions are committed before texture/material construction.
         // Let other ready bindings advance; queue dependencies only when their
         // material is ready, rather than blocking the resource queue on it.
         if(!GeometryMaterials.Contains(B.Asset))continue;
         double M[13];for(int32 j=0;j<13;++j)M[j]=S.Transform[j];
-        const bool Skin=S.Palette.Num()>0,Rigid=!Skin && !MeshData[B.Asset].Lines && !MeshData[B.Asset].Transparent && S.Points.Num()==0 && MWCanInstance(M);
+        const bool Skin=S.Palette.Num()>0,Rigid=!Skin && S.Points.Num()==0 && UseRigidResource(B,MeshData[B.Asset],M);
         if((Skin || Rigid) && !SharedMeshes.Contains(B.Asset))Queue(0,TEXT(""),B.Asset,S.Bound);
         if(Rigid && MeshData[B.Asset].FirstPerson) {if(!SameAsset || !SkinnedComponents.Contains(B.Id))Queue(5,B.Id,B.Asset,S.Bound);}
         else if(Rigid) {if(!RigidBatches.Contains(B.Asset))Queue(1,TEXT(""),B.Asset,S.Bound);}
@@ -287,27 +334,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 PaletteTextures.Add(Job.Id,Palette);SkinMaterials.Add(Job.Id,Skin);SkinnedComponents.Add(Job.Id,Component);TrackWaterReflectionMember(Component,Job.Asset);
             }
         }else if(Job.Kind==3) {
-            PrepareResourceIdentity(Job.Id,Job.Asset);
-            auto* Component=GeometryComponents.FindRef(Job.Id);
-            if(!Component) {
-                Component=D->Lines?static_cast<UProceduralMeshComponent*>(NewObject<UMWNativeLineComponent>(this)):NewObject<UMWMutableMeshComponent>(this);Component->SetMobility(EComponentMobility::Movable);
-                MWNativeDrawLayer(Component,*D);
-                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
-                Component->bUseAsyncCooking=false;Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);
-                GeometryComponents.Add(Job.Id,Component);TrackWaterReflectionMember(Component,Job.Asset);
-            }
-            if(Component->GetNumSections()==0) {
-                SetPrimitiveShown(Component,false);
-                // Allocate capacity while the view is excluded. No source pose
-                // is committed here; only the next fresh frame may display it.
-                TArray<FVector> EmptyVertices;EmptyVertices.Init(FVector::ZeroVector,D->Vertices.Num());
-                TArray<FVector> Normals;Normals.Init(FVector::UpVector,D->Vertices.Num());TArray<FProcMeshTangent> Tangents;
-                Component->SetMaterial(0,Material);
-                if(D->Lines){if(!CastChecked<UMWNativeLineComponent>(Component)->SetNativeSection(EmptyVertices,D->Triangles,D->UVs,D->StageUV1,D->StageUV2,D->Colors)){ResourceError=TEXT("Invalid native line capacity");return;}}
-                else Component->CreateMeshSection_LinearColor(0,EmptyVertices,D->Triangles,Normals,D->UVs,D->Colors,Tangents,false);
-                if(!Component->IsRegistered())Component->RegisterComponent();
-                LastRigidTransforms.Remove(Job.Id);UploadedVertexPoses.Remove(Job.Id);
-            }
+            if(!PrepareMutableResource(Job.Id,Job.Asset)){ResourceError=TEXT("Invalid native mutable capacity");return;}
         }else {ResourceError=TEXT("Unknown native resource job");return;}
         QueuedResources.Remove(Job.Key);++ResourceJobIndex;++PerfResourceBuilds;++Jobs;
         if(Jobs>=FMath::Clamp(MaxJobs,1,256) || FPlatformTime::Seconds()-Began>=FMath::Max(0.,Budget))break;

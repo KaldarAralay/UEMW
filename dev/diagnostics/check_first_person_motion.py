@@ -100,7 +100,10 @@ def run(reader,seconds=12,screenshots=False,draw_cycles=4):
             try:
                 while mover.is_alive():
                     w=witness(new_ids,poll=.01)
-                    if len(w['instances'])!=expected_count or not all(s['submitted_visible']for s in w['instances']):raise RuntimeError('Weapon disappeared during post-draw walking/catalog reconciliation')
+                    if len(w['instances'])!=expected_count or not all(s['submitted_visible']for s in w['instances']):
+                        report['failure_witness']=w
+                        report['failure_camera']=quick_json(ROOT/'local/bridge/camera.json',256*1024)
+                        raise RuntimeError('Weapon disappeared during post-draw walking/catalog reconciliation')
                     report['draws'][-1]['post_draw'].append(dict(stamp=w['first_person_pose_unix_ns'],sections=len(w['instances']),catalog=w['render_catalog']))
                     time.sleep(.02)
             finally:mover.join()

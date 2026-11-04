@@ -338,6 +338,8 @@ private:
     bool NativePoseReuseEnabled=true; // headless comparisons can exercise the original full-walk path
     int32 PerfNativeStateReused=0,PerfNativeStateChanged=0;
     bool GeometryResourceReady(const FMWBinding& Binding,const FMWGeometryState& State) const;
+    bool UseRigidResource(const FMWBinding& Binding,const FMWMeshData& Definition,const double* Transform) const;
+    bool PrepareMutableResource(const FString& Id,const FString& Asset);
     bool CatalogStaging() const;
     void HideInstance(const FString& Id);
     void AdvanceGeometryResources(double Budget=.003,int32 MaxJobs=64);

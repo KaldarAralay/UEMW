@@ -164,6 +164,21 @@ bool FMWTerrainBlendTest::RunTest(const FString&) {
     TestNotNull(TEXT("Runtime colour array is allocated"),Color);TestNotNull(TEXT("Runtime detail array is allocated"),Detail);
     if(Color){TestEqual(TEXT("GPU array retains both layers"),Color->GetArraySize(),2);TestEqual(TEXT("GPU array retains mips"),Color->GetNumMips(),10);TestTrue(TEXT("Albedo array samples sRGB"),Color->SRGB);}
     if(Detail)TestFalse(TEXT("Normals/roughness array samples linear data"),Detail->SRGB);
+    auto Preparation=Async(EAsyncExecution::ThreadPool,[Data](){
+        FThreadSafeBool Cancel=false;auto Out=MakeShared<FMWTerrainData,ESPMode::ThreadSafe>();
+        Out->PreparedColor=MWPrepareTerrainArray(Data->Color,Cancel);Out->PreparedDetail=MWPrepareTerrainArray(Data->Detail,Cancel);return Out;
+    });
+    FMWTerrainPtr Prepared=Preparation.Get();Preparation.Reset();
+    TestTrue(TEXT("Both terrain pools are prepared without UObjects on a worker"),Prepared.IsValid() && Prepared->PreparedColor.IsValid() && Prepared->PreparedDetail.IsValid());
+    if(!Prepared || !Prepared->PreparedColor || !Prepared->PreparedDetail)return false;
+    for(int32 I=0;I<Data->Color.Num();++I)for(int32 Kind=0;Kind<2;++Kind) {
+        auto& Bulk=(Kind?Prepared->PreparedDetail:Prepared->PreparedColor)->Mips[I].BulkData;
+        const auto& Image=(Kind?Data->Detail:Data->Color)[I];void* Copy=nullptr;Bulk.GetCopy(&Copy,false);
+        TestTrue(TEXT("Prepared data preserves every byte of every mip and layer"),Copy && Bulk.GetBulkDataSize()==Image.RawData.Num() && FMemory::Memcmp(Copy,Image.RawData.GetData(),Image.RawData.Num())==0);FMemory::Free(Copy);
+    }
+    auto* PreparedColor=MWCreatePreparedTerrainArray(Prepared->PreparedColor,true);auto* PreparedDetail=MWCreatePreparedTerrainArray(Prepared->PreparedDetail,false);
+    TestTrue(TEXT("Prepared pools transfer ownership exactly once"),PreparedColor && PreparedDetail && !Prepared->PreparedColor && !Prepared->PreparedDetail && !MWCreatePreparedTerrainArray(Prepared->PreparedColor,true));
+    FThreadSafeBool Obsolete=true;TestFalse(TEXT("Cancelled terrain preparation cannot publish a payload"),MWPrepareTerrainArray(Data->Color,Obsolete).IsValid());
     auto Shifted=Tiles;Shifted[1].Tile=FIntPoint(1,0);
     auto Reused=MWBuildTerrain(Shifted,MWFixtureRoot(),Upgrades,Cancelled,Data->PoolSignature);
     TestTrue(TEXT("Changing grid coverage reuses the texture pool"),Reused.IsValid() && Reused->Color.Num()==0 && Reused->Signature!=Data->Signature);
@@ -185,6 +200,38 @@ bool FMWTerrainBlendTest::RunTest(const FString&) {
     TestTrue(TEXT("Cooked shader receives real colour array"),MID->K2_GetTextureParameterValue(TEXT("TerrainColorPool"))==Color);
     TestTrue(TEXT("Cooked shader receives native tile lookup"),MID->K2_GetTextureParameterValue(TEXT("TerrainTileMap"))==V->TerrainTileMap);
     V->SetTerrainBlend(false);TestEqual(TEXT("Diagnostic comparison disables actual material scalar"),MID->K2_GetScalarParameterValue(TEXT("NativeTerrainBlend")),0.f);
+    if(!GUsingNullRHI && PreparedColor && PreparedDetail) {
+        V->SetTerrainBlend(true);MID->SetScalarParameterValue(TEXT("NativeLit"),0);MID->SetScalarParameterValue(TEXT("NativeFog"),0);MID->SetScalarParameterValue(TEXT("NativeEffectQuality"),0);MID->SetTextureParameterValue(TEXT("NativeEnvironment"),MWFloatTexture(8,33,{}));
+        FMWMeshData Ground;Ground.Vertices={FVector(-512,0,0),FVector(512,0,0),FVector(512,512,0),FVector(-512,512,0)};Ground.Normals.Init(FVector::UpVector,4);Ground.UVs={FVector2D(0,0),FVector2D(1,0),FVector2D(1,1),FVector2D(0,1)};Ground.Colors.Init(FLinearColor::White,4);Ground.Triangles={0,2,1,0,3,2};
+        auto* Component=NewObject<UStaticMeshComponent>(V);Component->SetStaticMesh(MWBuildMesh(V,Ground,MID));Component->SetMaterial(0,MID);Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->RegisterComponent();
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,128,128,RTF_RGBA16f,FLinearColor::Black,false);auto* Capture=NewObject<USceneCaptureComponent2D>(V);Capture->SetWorldLocationAndRotation(FVector(256,0,2048),FRotator(-90,0,0));Capture->ProjectionType=ECameraProjectionMode::Orthographic;Capture->TextureTarget=Target;Capture->CaptureSource=SCS_SceneColorHDRNoAlpha;Capture->bCaptureEveryFrame=false;Capture->bCaptureOnMovement=false;Capture->PrimitiveRenderMode=ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;Capture->ShowOnlyComponents={Component};Capture->RegisterComponent();
+        auto Image=[&](UTexture2DArray* C,UTexture2DArray* D){MID->SetTextureParameterValue(TEXT("TerrainColorPool"),C);MID->SetTextureParameterValue(TEXT("TerrainDetailPool"),D);World->SendAllEndOfFrameUpdates();Capture->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Pixels);return Pixels;};
+        for(float Width:{1024.f,2048.f,4096.f}) {
+            Capture->OrthoWidth=Width;const auto A=Image(Color,Detail),B=Image(PreparedColor,PreparedDetail);int32 Blue=0,White=0,Mismatch=0;double Difference=0;
+            for(int32 I=0;I<FMath::Min(A.Num(),B.Num());++I){Blue+=A[I].B>.1f && A[I].B>A[I].R+.1f;White+=A[I].R>.1f && A[I].G>.1f;const float D=FMath::Max3(FMath::Abs(A[I].R-B[I].R),FMath::Abs(A[I].G-B[I].G),FMath::Abs(A[I].B-B[I].B));Mismatch+=D>.002f;Difference+=D;}
+            TestTrue(TEXT("Actual GPU terrain retains both source layers across mip scales"),A.Num()==16384 && B.Num()==A.Num() && Blue>20 && White>20);
+            TestTrue(TEXT("Worker-prepared arrays match original terrain GPU pixels"),Mismatch==0 && Difference<.01);
+            AddInfo(FString::Printf(TEXT("Terrain GPU width=%.0f blue=%d white=%d mismatch=%d difference=%.6f"),Width,Blue,White,Mismatch,Difference));
+        }
+        Capture->DestroyComponent();Component->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+    }
+    if(Reused) {
+        V->CreateGeometryMaterial();V->SetTerrainBlend(true);V->TerrainSignature=Data->Signature;V->TerrainPoolSignature=Data->PoolSignature;
+        TArray<UMaterialInstanceDynamic*> Parts={MID};
+        for(int32 I=0;I<2;++I){const FString Key=FString::Printf(TEXT("owned-terrain-%d"),I);auto* Part=UMaterialInstanceDynamic::Create(Material,V);V->GeometryMaterials.Add(Key,Part);V->MeshData.Add(Key).Terrain=true;V->BindTerrainMaterial(Part);Parts.Add(Part);}
+        auto* OldMap=V->TerrainTileMap;
+        V->CatalogLoader=new FMWCatalogLoader;auto& Loader=*V->CatalogLoader;const FString Next=TEXT("owned-terrain-rebind");Loader.Name=Next;Loader.DefinitionsCommitted=true;Loader.TerrainMaterialBatchLimit=1;Loader.Data=MakeShared<FMWCatalogData,ESPMode::ThreadSafe>();Loader.Data->TerrainChanged=true;Loader.Data->Terrain=Reused;Loader.Data->TerrainSignature=Reused->Signature;
+        const double Until=FPlatformTime::Seconds()+3;
+        while(Loader.TerrainStage<3 && FPlatformTime::Seconds()<Until){V->LoadCatalog(Next);FPlatformProcess::Sleep(.001f);}
+        TestEqual(TEXT("Staged terrain waits for a separate material handoff phase"),Loader.TerrainStage,3);
+        TestTrue(TEXT("Incomplete rebinding invalidates both preceding and target signatures"),V->TerrainSignature.IsEmpty());
+        for(int32 Step=1;Step<=3;++Step) {
+            V->LoadCatalog(Next);int32 Updated=0;
+            for(auto* Part:Parts){const bool New=Part->K2_GetVectorParameterValue(TEXT("TerrainLayout")).B==3;Updated+=New;TestTrue(TEXT("Every material keeps its matching map and layout during handoff"),Part->K2_GetTextureParameterValue(TEXT("TerrainTileMap"))==(New?V->TerrainTileMap:OldMap));}
+            TestEqual(TEXT("Material handoff respects its per-call item bound"),Loader.TerrainMaterialIndex,Step);TestEqual(TEXT("Only the bounded subset changes in each step"),Updated,Step);
+            TestEqual(TEXT("The terrain signature commits only after all old materials update"),V->TerrainSignature,Step==3?Reused->Signature:FString());
+        }
+    }
     V->Destroy();
     return true;
 }
@@ -1415,6 +1462,24 @@ bool FMWResourceProgressTest::RunTest(const FString&) {
     }else AddError(TEXT("Mutable resource did not commit"));
     if(const auto* Palette=View->UploadedBonePalettes.Find(TEXT("resource-1")))TestEqual(TEXT("GPU palette also uses the latest native pose"),(*Palette)[3],1001.f);
     else AddError(TEXT("Native skin palette did not commit"));
+    // An animated rigid body part may gain and lose native shear. Its current
+    // geometry must never wait behind unrelated cold resource jobs, and the
+    // valid CPU representation must not flip back to an unprepared rigid one.
+    Pose(1100);States[0].Transform[1]=.15f;
+    TestTrue(TEXT("Visible rigid-to-affine transition applies without a resource hole"),View->UpdateGeometry(Packet,&States,&Frames) && !View->GeometryPartial);
+    auto* AffinePart=View->GeometryComponents.FindRef(TEXT("resource-0"));
+    TestTrue(TEXT("Native shear transitions to a visible exact affine section"),AffinePart && View->InstanceSubmitted(TEXT("resource-0")) && !View->RigidVisible.Contains(TEXT("resource-0")));
+    if(AffinePart)TestTrue(TEXT("Current native shear reaches actual vertex positions"),FMath::IsNearlyEqual(double(AffinePart->GetProcMeshSection(0)->ProcVertexBuffer[2].Position.Y),1100.6,.001));
+    if(auto* RetiredBatch=View->RigidBatches.FindRef(TEXT("rigid")))View->ReleaseGeometryPrimitive(RetiredBatch);
+    View->RigidBatches.Remove(TEXT("rigid")); // deliberately no alternate ready representation
+    Pose(1200);View->UpdateGeometry(Packet,&States,&Frames);
+    TestTrue(TEXT("An orthogonal frame keeps the same ready affine component"),View->GeometryComponents.FindRef(TEXT("resource-0"))==AffinePart && View->InstanceSubmitted(TEXT("resource-0")));
+    if(AffinePart)TestEqual(TEXT("Sticky affine rendering still updates the current pose"),AffinePart->GetProcMeshSection(0)->ProcVertexBuffer[0].Position.Y,1200.0);
+    // Other rigid instances may now need their batch; the existing CPU part
+    // must continue even with that unrelated resource work outstanding.
+    TestTrue(TEXT("No alternate representation is required for a ready CPU section"),View->GeometryResourceReady(View->GeometryBindings[0],States[0]));
+    View->PrepareRigidBatch(TEXT("rigid"));Pose(1300);States[0].Transform[1]=.2f;View->UpdateGeometry(Packet,&States,&Frames);
+    TestTrue(TEXT("Repeated native shear changes retain component identity and visibility"),View->GeometryComponents.FindRef(TEXT("resource-0"))==AffinePart && View->InstanceSubmitted(TEXT("resource-0")));
     const int32 Built=View->SharedMeshes.Num();
     if(!Load(TEXT("catalog-resources-1.json"))){AddError(TEXT("Second resource catalog failed"));View->Destroy();return false;}
     Pose(2000);View->UpdateGeometry(Packet,&States,&Frames);TestTrue(TEXT("Membership change queues retirement and replacement resources"),View->ResourceJobs.Num()>0);
@@ -1625,13 +1690,12 @@ bool FMWRigidReuseTest::RunTest(const FString&) {
             if(!View->UpdateGeometry(Packet,&States,&Frames)){AddError(TEXT("Warm rigid/affine mode change requested more resources"));break;}
             TestTrue(TEXT("Exact affine buffer is reused"),View->GeometryComponents.FindRef(TEXT("rigid-mode"))==CPU);
             TestEqual(TEXT("Native object keeps its stable instance ID"),View->RigidSlots[TEXT("rigid-mode")].Id,StableId);
-            if(Shear) {
-                if(auto* Section=CPU->GetProcMeshSection(0))TestEqual(TEXT("Sheared native coordinates stay exact"),Section->ProcVertexBuffer[2].Position.Y,(double)i+1);
-            }else {
-                FTransform Transform;TestTrue(TEXT("Updated native rigid transform is in the real rendered world placement"),Batch->GetInstanceTransform(0,Transform,true));
-                TestEqual(TEXT("Instance uses the latest original X coordinate"),Transform.GetLocation().Y,(double)i);
+            if(auto* Section=CPU->GetProcMeshSection(0)) {
+                TestEqual(TEXT("Both orthogonal and sheared frames use the latest native translation"),Section->ProcVertexBuffer[0].Position.Y,(double)i);
+                TestEqual(TEXT("The exact current native shear is preserved"),Section->ProcVertexBuffer[2].Position.Y,(double)i+(Shear?1:0));
             }
-            if(auto* PC=World->GetFirstPlayerController())TestEqual(TEXT("Only the active affine path appears in the view"),PC->HiddenPrimitiveComponents.Contains(TWeakObjectPtr<UPrimitiveComponent>(CPU)),!Shear);
+            TestFalse(TEXT("Dormant rigid representation cannot draw another copy"),View->RigidVisible.Contains(TEXT("rigid-mode")));
+            if(auto* PC=World->GetFirstPlayerController())TestFalse(TEXT("The ready exact affine path remains in the view through mode changes"),PC->HiddenPrimitiveComponents.Contains(TWeakObjectPtr<UPrimitiveComponent>(CPU)));
         }
         TestEqual(TEXT("Animation mode changes allocate no replacement resources"),View->PerfResourceBuilds,Built);
         TestEqual(TEXT("Changed matrices do not request replacement scene proxies"),View->PerfRigidProxyCreations,Proxies);
@@ -1640,6 +1704,7 @@ bool FMWRigidReuseTest::RunTest(const FString&) {
         View->RemoveRigid(TEXT("rigid-mode"));View->FlushRigidBatches();
         TestEqual(TEXT("Retired final instance empties the actual buffer"),Batch->GetInstanceCount(),0);
         if(auto* PC=World->GetFirstPlayerController())TestTrue(TEXT("Empty native batch cannot leave a stale GPU draw"),PC->HiddenPrimitiveComponents.Contains(TWeakObjectPtr<UPrimitiveComponent>(Batch)));
+        View->PrepareResourceIdentity(TEXT("rigid-mode"),TEXT("retired"));
         State.Visible=true;State.Transform[1]=0;
         TestTrue(TEXT("New native instance can reuse the empty batch"),Apply());
         TestEqual(TEXT("Repopulated buffer has one instance"),Batch->GetInstanceCount(),1);
@@ -1879,7 +1944,23 @@ bool FMWMaterialContinuityTest::RunTest(const FString&) {
     TestTrue(TEXT("Mutable section survives lighting update"),CPU && CPU==V->GeometryComponents.FindRef(TEXT("resource-2")));
     TestTrue(TEXT("Rigid geometry shares its existing GPU buffer"),Shared && Shared==V->SharedMeshes.FindRef(TEXT("rigid-lighting")));
     if(MID)TestEqual(TEXT("New native sunlight eligibility applied"),MID->K2_GetScalarParameterValue(TEXT("NativeObjectSun")),0.f);
-    Pose(500);States[1].Visible=false;TestTrue(TEXT("Original hiding still applies after handoff"),V->UpdateGeometry(P,&States,&Frames,nullptr,&Incoming));TestFalse(TEXT("Hidden native actor is excluded"),V->InstanceSubmitted(TEXT("resource-1")));
+    // The actor becomes ready only after the earlier alias pass. Its actual
+    // ready GPU mesh is sufficient for a lighting-only handoff, without a new
+    // buffer job or hiding an already drawable section.
+    const FString Late=TEXT("skin-late-ready");const auto PreviousAsset=V->GeometryBindings[1].Asset;
+    auto LateDefinition=V->MeshData[PreviousAsset];auto* LateMaterial=V->GeometryMaterials.FindRef(PreviousAsset);
+    V->MeshData.Add(Late,MoveTemp(LateDefinition));V->GeometryMaterials.Add(Late,LateMaterial);
+    auto LateBindings=V->GeometryBindings;LateBindings[1].Asset=Late;
+    TestFalse(TEXT("Late alias fixture has no prepared destination GPU entry"),V->SharedMeshes.Contains(Late));
+    auto Foreign=LateBindings[1];Foreign.Cell=TEXT("foreign-cell");V->RetargetCompatibleResources({Foreign});
+    TestEqual(TEXT("Cell changes cannot borrow the previous actor resource"),V->InstanceAssets.FindRef(Foreign.Id),PreviousAsset);
+    V->RetargetCompatibleResources(LateBindings);
+    TestTrue(TEXT("Late-ready native skin shares the component's exact GPU mesh"),V->SharedMeshes.FindRef(Late)==Skin->GetStaticMesh());
+    TestTrue(TEXT("Late alias remains resource-ready with its existing palette and component"),V->GeometryResourceReady(LateBindings[1],States[1]) && V->SkinnedComponents.FindRef(TEXT("resource-1"))==Skin && V->PaletteTextures.FindRef(TEXT("resource-1"))==Palette);
+    V->GeometryBindings=LateBindings;V->Catalog=TEXT("owned-late-resource-handoff");P->SetStringField(TEXT("scene_catalog"),V->Catalog);
+    Pose(500);TestTrue(TEXT("A late compatible handoff applies the current native pose without partial geometry"),V->UpdateGeometry(P,&States,&Frames) && !V->GeometryPartial && V->InstanceSubmitted(TEXT("resource-1")));
+    TestEqual(TEXT("A late handoff does not replay the previous bone pose"),V->UploadedBonePalettes[TEXT("resource-1")][3],501.f);
+    States[1].Visible=false;TestTrue(TEXT("Original hiding still applies after handoff"),V->UpdateGeometry(P,&States,&Frames));TestFalse(TEXT("Hidden native actor is excluded"),V->InstanceSubmitted(TEXT("resource-1")));
     V->ResetScene();V->Destroy();return true;
 }
 

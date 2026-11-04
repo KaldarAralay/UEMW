@@ -699,6 +699,8 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         auto Abandoned=MoveTemp(Loader.Data);auto Completed=MoveTemp(Loader.Future);
         if(Abandoned.IsValid() || Completed.IsValid())Async(EAsyncExecution::ThreadPool,[Abandoned=MoveTemp(Abandoned),Completed=MoveTemp(Completed)]()mutable{Abandoned.Reset();if(Completed.IsValid())Completed.Get();Completed.Reset();});
         const double ResetDone=FPlatformTime::Seconds();
+        Loader.TerrainFenceStarted=false;
+        Loader.TerrainMaterialKeys.Empty();Loader.TerrainMaterialIndex=0;
         Loader.DefinitionIndex=Loader.MeshIndex=Loader.TextureIndex=Loader.AliasIndex=Loader.TerrainStage=0;Loader.DefinitionBatches=0;Loader.DefinitionTotalMs=Loader.DefinitionMaxMs=0;Loader.Name=Name;Loader.DefinitionsCommitted=Loader.BindingsCommitted=false;Loader.Cancelled=false;Loader.Error.Empty();ResourceError.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;
         TSet<FString> KnownMeshes,KnownTextures;TMap<FString,uint8> KnownClassification;
         TArray<FString> IncompleteMeshes;
@@ -822,26 +824,40 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         return false;
     }
     const double Began=FPlatformTime::Seconds();
-    if(Data.TerrainChanged && Loader.TerrainStage<3) {
+    if(Data.TerrainChanged && Loader.TerrainStage<4) {
         StagePart=TEXT("terrain");
         const double Start=FPlatformTime::Seconds();
-        if(Data.Terrain.IsValid()) {
+        if(Loader.TerrainStage==3) {
+            int32 Bound=0;
+            while(Loader.TerrainMaterialIndex<Loader.TerrainMaterialKeys.Num()) {
+                const auto& Key=Loader.TerrainMaterialKeys[Loader.TerrainMaterialIndex++];
+                if(const auto* M=MeshData.Find(Key))if(M->Terrain)BindTerrainMaterial(GeometryMaterials.FindRef(Key));
+                if(++Bound>=FMath::Max(1,Loader.TerrainMaterialBatchLimit) || FPlatformTime::Seconds()-Start>=.002)break;
+            }
+            // No completed signature is advertised until every old material
+            // updates. Supersession must restage even when returning to the
+            // preceding grid, not mistake its old signature for current work.
+            if(Loader.TerrainMaterialIndex==Loader.TerrainMaterialKeys.Num()){TerrainSignature=Data.TerrainSignature;++Loader.TerrainStage;}
+        }else if(Data.Terrain.IsValid()) {
             auto& T=*Data.Terrain;
-            if(Loader.TerrainStage==0){PendingTerrainColorPool=T.Color.Num()?MWCreateTerrainArray(T.Color):TerrainColorPool;T.Color.Empty();++Loader.TerrainStage;}
-            else if(Loader.TerrainStage==1){PendingTerrainDetailPool=T.Detail.Num()?MWCreateTerrainArray(T.Detail):TerrainDetailPool;T.Detail.Empty();++Loader.TerrainStage;}
+            if(Loader.TerrainStage==0){PendingTerrainColorPool=T.PreparedColor?MWCreatePreparedTerrainArray(T.PreparedColor,true):T.Color.Num()?MWCreateTerrainArray(T.Color):TerrainColorPool;T.Color.Empty();++Loader.TerrainStage;}
+            else if(Loader.TerrainStage==1){PendingTerrainDetailPool=T.PreparedDetail?MWCreatePreparedTerrainArray(T.PreparedDetail,false):T.Detail.Num()?MWCreateTerrainArray(T.Detail):TerrainDetailPool;T.Detail.Empty();Loader.TerrainFence.BeginFence();Loader.TerrainFenceStarted=true;++Loader.TerrainStage;}
             else {
+                // Poll queued resource initialization; never wait or publish a
+                // half-prepared colour/detail pair to existing terrain.
+                if(Loader.TerrainFenceStarted && !Loader.TerrainFence.IsFenceComplete())return false;
                 auto* Map=MWFloatTexture(T.Size.X,T.Size.Y,T.Map);auto* Finishes=MWFloatTexture(T.Finishes.Num(),1,T.Finishes);
                 if(PendingTerrainColorPool && PendingTerrainDetailPool && Map && Finishes) {
                     TerrainColorPool=PendingTerrainColorPool;TerrainDetailPool=PendingTerrainDetailPool;TerrainTileMap=Map;TerrainFinishes=Finishes;
                     TerrainLayout=FVector4f(T.Origin.X,T.Origin.Y,T.Size.X,T.Size.Y);TerrainLayers=T.Textures.Num();TerrainTiles=T.TileCount;
                     TerrainPoolSignature=T.PoolSignature;if(T.Bytes)TerrainPoolBytes=T.Bytes;TerrainStatus=TEXT("continuous native tile blend");
                 }else {TerrainLayers=TerrainTiles=0;TerrainStatus=TEXT("original tile fallback / array allocation unavailable");}
-                TerrainSignature=Data.TerrainSignature;PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;++Loader.TerrainStage;
-                for(const auto& Pair:GeometryMaterials)if(const auto* M=MeshData.Find(Pair.Key))if(M->Terrain)BindTerrainMaterial(Pair.Value);
+                TerrainSignature.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;++Loader.TerrainStage;
+                for(const auto& Pair:GeometryMaterials)if(const auto* M=MeshData.Find(Pair.Key))if(M->Terrain)Loader.TerrainMaterialKeys.Add(Pair.Key);
             }
         }else {
-            TerrainColorPool=TerrainDetailPool=nullptr;TerrainTileMap=TerrainFinishes=nullptr;TerrainLayers=TerrainTiles=0;TerrainPoolBytes=0;TerrainPoolSignature.Empty();TerrainSignature=Data.TerrainSignature;TerrainStatus=TEXT("original tile fallback / no supported terrain grid");Loader.TerrainStage=3;
-            for(const auto& Pair:GeometryMaterials)if(const auto* M=MeshData.Find(Pair.Key))if(M->Terrain)BindTerrainMaterial(Pair.Value);
+            TerrainColorPool=TerrainDetailPool=nullptr;TerrainTileMap=TerrainFinishes=nullptr;TerrainLayers=TerrainTiles=0;TerrainPoolBytes=0;TerrainPoolSignature.Empty();TerrainSignature.Empty();TerrainStatus=TEXT("original tile fallback / no supported terrain grid");Loader.TerrainStage=3;
+            for(const auto& Pair:GeometryMaterials)if(const auto* M=MeshData.Find(Pair.Key))if(M->Terrain)Loader.TerrainMaterialKeys.Add(Pair.Key);
         }
         PeakTerrainUploadMs=FMath::Max(PeakTerrainUploadMs,(FPlatformTime::Seconds()-Start)*1000);return false;
     }
@@ -1276,7 +1292,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             SetPrimitiveShown(C,true);TArray<double> Saved;Saved.Append(RigidMatrix,13);LastRigidTransforms.Add(Id,MoveTemp(Saved));
             continue;
         }
-        if(!Data->Lines && !IsDeformed && !Data->Transparent && MWCanInstance(RigidMatrix)) {
+        if(!IsDeformed && UseRigidResource({Id,Asset,CellKey},*Data,RigidMatrix)) {
             SetPrimitiveShown(GeometryComponents.FindRef(Id),false);
             const auto& Transform=Typed?Empty:Compact?(*Row)[1]->AsArray():Instance->GetArrayField(TEXT("transform"));
             double M[13];for(int32 i=0;i<13;++i)M[i]=Typed?Typed->Transform[i]:Transform[i]->AsNumber();

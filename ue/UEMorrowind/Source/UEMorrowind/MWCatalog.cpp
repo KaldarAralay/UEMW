@@ -473,6 +473,7 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
     Result->TerrainSignature=MWTerrainSignature(TerrainTiles);Result->TerrainChanged=Result->TerrainSignature!=KnownTerrain;
     if(Result->TerrainChanged && TerrainTiles.Num())Result->Terrain=MWBuildTerrain(TerrainTiles,AssetsPath,*Result->UpgradeIndex,Cancelled,KnownTerrainPool,Distant?256:512);
     if(Distant && Result->TerrainChanged && TerrainTiles.Num() && !Result->Terrain.IsValid())return nullptr;
+    if(Result->Terrain.IsValid() && FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_TERRAIN_PREPARED_DATA"))!=TEXT("0") && !MWPrepareTerrainPools(*Result->Terrain,Cancelled))return nullptr;
     const double TextureBegan=FPlatformTime::Seconds();
     const auto SelectedUpgrades=MWChooseTextureUpgrades(*Result->UpgradeIndex,WantedTextures,KnownTextures,Result->UpgradeReservedBytes);
     for(const auto& Key:WantedTextures)if(Result->UpgradeIndex->Entries.Contains(Key) && !SelectedUpgrades.Contains(Key))++Result->UpgradeBudgetSkipped;

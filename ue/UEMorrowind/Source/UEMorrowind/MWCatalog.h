@@ -54,6 +54,11 @@ struct FMWCatalogLoader {
     int32 DefinitionBatches=0;
     double DefinitionTotalMs=0,DefinitionMaxMs=0;
     int32 TerrainStage=0;
+    FRenderCommandFence TerrainFence;
+    bool TerrainFenceStarted=false;
+    TArray<FString> TerrainMaterialKeys;
+    int32 TerrainMaterialIndex=0;
+    int32 TerrainMaterialBatchLimit=128;
     FThreadSafeBool Cancelled=false;
     FString Error;
     bool DefinitionsCommitted=false,BindingsCommitted=false;
