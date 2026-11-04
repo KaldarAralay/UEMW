@@ -28,6 +28,7 @@ struct FMWCatalogData {
     int32 PoseSourceCount=0;
     TArray<int32> PoseRemap;
     TMap<FString,FMWMeshData> Meshes;
+    TArray<FString> MeshKeys,TextureKeys,AliasKeys;
     TMap<FString,FString> AlphaModes;
     TMap<FString,FMWTextureImages> Images;
     TSet<FString> WantedAssets,WantedTextures,WantedMaskedTextures,WantedDetailTextures;
@@ -49,7 +50,9 @@ struct FMWCatalogLoader {
     FMWCatalogPtr Data;
     FMWTextureUpgradePtr UpgradeIndex;
     TArray<FString> MeshKeys,TextureKeys,AliasKeys;
-    int32 MeshIndex=0,TextureIndex=0,AliasIndex=0;
+    int32 DefinitionIndex=0,MeshIndex=0,TextureIndex=0,AliasIndex=0;
+    int32 DefinitionBatches=0;
+    double DefinitionTotalMs=0,DefinitionMaxMs=0;
     int32 TerrainStage=0;
     FThreadSafeBool Cancelled=false;
     FString Error;

@@ -1065,6 +1065,32 @@ bool FMWCatalogProgressTest::RunTest(const FString&) {
     while((View->CatalogStaging() || OldStaged.IsValid() || OldDecoded.IsValid()) && FPlatformTime::Seconds()<SupersedeDeadline){View->Tick(.016f);FPlatformProcess::Sleep(.002f);}
     TestFalse(TEXT("Abandoned staged storage is eventually released"),OldStaged.IsValid());TestFalse(TEXT("Unconsumed completed storage is eventually released"),OldDecoded.IsValid());
     TestTrue(TEXT("Supersession commits only the new catalog's exact validated table"),!View->CatalogStaging() && View->GeometryBindings.Num()==2 && View->CatalogBindingSnapshot.IsValid() && MWEqualBindingTables(*View->CatalogBindingSnapshot,View->GeometryBindings));
+    // Exercise a real yield between definitions, then overtake that catalog.
+    // Existing native bindings/materials must survive; incomplete CPU metadata
+    // must be decoded/staged again rather than treated as a ready cache hit.
+    View->CatalogDefinitionBatchLimit=1;
+    const auto RetainedBindings=View->GeometryBindings;auto* RetainedMaterial=View->GeometryMaterials.FindRef(TEXT("rigid"));
+    const FString Cold=TEXT("catalog-binding-plans.json");View->LoadCatalog(Cold);
+    const double ColdDeadline=FPlatformTime::Seconds()+4;
+    while((!View->CatalogLoader->Data.IsValid() || View->CatalogLoader->DefinitionIndex==0) && FPlatformTime::Seconds()<ColdDeadline){View->LoadCatalog(Cold);FPlatformProcess::Sleep(.001f);}
+    TestTrue(TEXT("Cold definition adoption actually yields before completion"),View->CatalogLoader->DefinitionIndex==1 && !View->CatalogLoader->DefinitionsCommitted);
+    TestTrue(TEXT("Partial CPU adoption cannot promote bindings or replace active materials"),View->Catalog==Name && MWEqualBindingTables(View->GeometryBindings,RetainedBindings) && View->GeometryMaterials.FindRef(TEXT("rigid"))==RetainedMaterial);
+    const int32 SelectionRebuilds=View->RenderSelectionRebuilds;View->EnsureRenderSelection();
+    TestEqual(TEXT("Partial adoption patches selection without a full world-index rebuild"),View->RenderSelectionRebuilds,SelectionRebuilds);
+    View->LoadCatalog(Name);
+    while(View->CatalogStaging() && FPlatformTime::Seconds()<ColdDeadline){View->LoadCatalog(Name);FPlatformProcess::Sleep(.001f);}
+    TestTrue(TEXT("A partly adopted cold catalog can be superseded safely"),!View->CatalogStaging() && View->Catalog==Name && MWEqualBindingTables(View->GeometryBindings,RetainedBindings));
+    View->LoadCatalog(Cold);int32 DefinitionCalls=0;
+    while(View->CatalogStaging() && FPlatformTime::Seconds()<ColdDeadline) {
+        const int32 Before=View->CatalogLoader->DefinitionIndex;View->LoadCatalog(Cold);
+        const int32 Added=View->CatalogLoader->DefinitionIndex-Before;
+        TestTrue(TEXT("Each definition batch respects the item bound"),Added>=0 && Added<=1);DefinitionCalls+=Added>0;
+        if(View->CatalogLoader->DefinitionIndex>0 && !View->CatalogLoader->DefinitionsCommitted)TestTrue(TEXT("Prior bindings remain authoritative through every partial batch"),View->Catalog==Name && MWEqualBindingTables(View->GeometryBindings,RetainedBindings));
+        FPlatformProcess::Sleep(.001f);
+    }
+    TestTrue(TEXT("Cold retry completes across multiple definition batches"),DefinitionCalls>1 && !View->CatalogStaging() && View->Catalog==Cold);
+    for(const auto& B:View->GeometryBindings)TestTrue(TEXT("Every committed binding has its fully staged metadata and material"),View->MeshData.Contains(B.Asset) && View->GeometryMaterials.Contains(B.Asset));
+    TestTrue(TEXT("Cold retry retains exact prepared classifications"),View->BuildStateWitness({},0)->GetBoolField(TEXT("catalog_classification_matches")));
     View->Destroy();
     return true;
 }
@@ -2087,7 +2113,7 @@ bool FMWCatalogHandoffPlanTest::RunTest(const FString&) {
     auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
     auto* R=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
     if(!V || !R)return false;ON_SCOPE_EXIT {V->ResetScene();R->ResetScene();V->Destroy();R->Destroy();};
-    for(auto* Owner:{V,R}){Owner->AssetsPath=Folder;Owner->CreateGeometryMaterial();Owner->CatalogHandoffPlans=Owner==V;
+    for(auto* Owner:{V,R}){Owner->AssetsPath=Folder;Owner->CreateGeometryMaterial();Owner->CatalogHandoffPlans=Owner==V;Owner->CatalogDefinitionBatches=Owner==V;Owner->CatalogDefinitionBatchLimit=1;
         // New source work may overtake a GPU-staged catalog. This must never
         // discard the committed table or borrow that newer source's bindings.
         Owner->SourceBindingCatalog=TEXT("newer-source-catalog");Owner->SourceBindingSnapshot=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>();

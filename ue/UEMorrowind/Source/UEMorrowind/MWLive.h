@@ -106,6 +106,8 @@ public:
     int32 RenderSelectionMeshes=-1,RenderSelectionInstances=-1;
     bool RenderSelectionDirty=true;
     bool CatalogHandoffPlans=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_CATALOG_HANDOFF_PLANS"))!=TEXT("0");
+    bool CatalogDefinitionBatches=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_CATALOG_DEFINITION_BATCHES"))!=TEXT("0");
+    int32 CatalogDefinitionBatchLimit=128;
     uint64 CatalogPlanCommits=0,CatalogReferenceCommits=0,EmptyRigidScansSkipped=0;
     bool TargetedRenderUpdates=true; // full-scan diagnostic is opt-in only
     bool RigidComponentTransforms=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_RIGID_COMPONENT_TRANSFORMS"))!=TEXT("0");

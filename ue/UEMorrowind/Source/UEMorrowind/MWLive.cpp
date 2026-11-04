@@ -699,7 +699,7 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         auto Abandoned=MoveTemp(Loader.Data);auto Completed=MoveTemp(Loader.Future);
         if(Abandoned.IsValid() || Completed.IsValid())Async(EAsyncExecution::ThreadPool,[Abandoned=MoveTemp(Abandoned),Completed=MoveTemp(Completed)]()mutable{Abandoned.Reset();if(Completed.IsValid())Completed.Get();Completed.Reset();});
         const double ResetDone=FPlatformTime::Seconds();
-        Loader.MeshIndex=Loader.TextureIndex=Loader.AliasIndex=Loader.TerrainStage=0;Loader.Name=Name;Loader.DefinitionsCommitted=Loader.BindingsCommitted=false;Loader.Cancelled=false;Loader.Error.Empty();ResourceError.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;
+        Loader.DefinitionIndex=Loader.MeshIndex=Loader.TextureIndex=Loader.AliasIndex=Loader.TerrainStage=0;Loader.DefinitionBatches=0;Loader.DefinitionTotalMs=Loader.DefinitionMaxMs=0;Loader.Name=Name;Loader.DefinitionsCommitted=Loader.BindingsCommitted=false;Loader.Cancelled=false;Loader.Error.Empty();ResourceError.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;
         TSet<FString> KnownMeshes,KnownTextures;TMap<FString,uint8> KnownClassification;
         TArray<FString> IncompleteMeshes;
         KnownMeshes.Reserve(MeshData.Num());KnownClassification.Reserve(MeshData.Num());
@@ -750,6 +750,14 @@ bool AMWLive::LoadCatalog(const FString& Name) {
                     const auto& Old=(*PoseSourceBindings)[*I];
                     if(Old.Asset!=B.Asset && MWCompatibleBinding(Old,B))Data->ResourceAliases.FindOrAdd(B.Asset)=Old.Asset;
                 }
+                // Priority/job ordering is CPU-only work too. A cold catalog's
+                // map lookups inside Sort used to stall the adopting frame.
+                Data->Meshes.GetKeys(Data->MeshKeys);Data->Images.GetKeys(Data->TextureKeys);
+                Data->ResourceAliases.GetKeys(Data->AliasKeys);Data->AliasKeys.Sort();Data->TextureKeys.Sort();
+                Data->MeshKeys.Sort([&](const FString& A,const FString& B){
+                    const bool NearA=Data->Meshes[A].FirstPerson,NearB=Data->Meshes[B].FirstPerson;
+                    return NearA!=NearB?NearA:A<B;
+                });
             }
             return Data;
         });
@@ -771,23 +779,47 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         if(!Loader.Data.IsValid())return Fail(TEXT("Invalid native catalog or asset"));
         Loader.UpgradeIndex=Loader.Data->UpgradeIndex;
         TextureUpgradeStatus=Loader.UpgradeIndex->Status;PeakTextureWorkMs=FMath::Max(PeakTextureWorkMs,Loader.Data->TextureWorkMs);TextureUpgradeFallbacks+=Loader.Data->UpgradeFallbacks;
-        Loader.Data->Meshes.GetKeys(Loader.MeshKeys);Loader.Data->Images.GetKeys(Loader.TextureKeys);
-        Loader.Data->ResourceAliases.GetKeys(Loader.AliasKeys);Loader.AliasKeys.Sort();
-        Loader.MeshKeys.Sort([&](const FString& A,const FString& B){
-            const bool NearA=Loader.Data->Meshes[A].FirstPerson,NearB=Loader.Data->Meshes[B].FirstPerson;
-            return NearA!=NearB?NearA:A<B;
-        });
-        Loader.TextureKeys.Sort();
+        if(CatalogDefinitionBatches) {
+            Loader.MeshKeys=MoveTemp(Loader.Data->MeshKeys);Loader.TextureKeys=MoveTemp(Loader.Data->TextureKeys);Loader.AliasKeys=MoveTemp(Loader.Data->AliasKeys);
+        }else {
+            // Retain the old path for exact owned-fixture/live comparisons.
+            Loader.Data->Meshes.GetKeys(Loader.MeshKeys);Loader.Data->Images.GetKeys(Loader.TextureKeys);
+            Loader.Data->ResourceAliases.GetKeys(Loader.AliasKeys);Loader.AliasKeys.Sort();
+            Loader.MeshKeys.Sort([&](const FString& A,const FString& B){
+                const bool NearA=Loader.Data->Meshes[A].FirstPerson,NearB=Loader.Data->Meshes[B].FirstPerson;
+                return NearA!=NearB?NearA:A<B;
+            });
+            Loader.TextureKeys.Sort();
+        }
     }
     auto& Data=*Loader.Data;
     if(!Loader.DefinitionsCommitted) {
         StagePart=TEXT("definitions");
-        // The background decoder validated every definition and image. Adopt
-        // CPU metadata first; active bindings remain intact during GPU staging.
+        // The decoder validated the whole catalog, but a cold catalog can have
+        // thousands of definitions. Adopt CPU metadata with the same yielding
+        // policy as GPU jobs; bindings still commit only after all staging.
+        const double DefinitionBegan=FPlatformTime::Seconds();int32 Adopted=0;
         EnsureRenderSelection();
-        for(auto& Pair:Data.Meshes){const auto& D=Pair.Value;UpdateWaterReflectionDefinition(Pair.Key,D);SetRenderAssetTraits(Pair.Key,(!TargetedRenderUpdates || D.Background || D.FirstPerson?1:0)|(!TargetedRenderUpdates || !D.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(D)?2:0)|(!TargetedRenderUpdates || !D.MaterialValueGroup.IsEmpty()?4:0));if(D.FirstPerson && ViewCachedAssets.Num()<128)ViewCachedAssets.Add(Pair.Key);MeshData.Add(Pair.Key,MoveTemp(Pair.Value));}
-        Data.Meshes.Empty();
-        Loader.DefinitionsCommitted=true;return false;
+        while(Loader.DefinitionIndex<Loader.MeshKeys.Num()) {
+            const auto& Key=Loader.MeshKeys[Loader.DefinitionIndex++];auto& D=Data.Meshes[Key];
+            UpdateWaterReflectionDefinition(Key,D);
+            SetRenderAssetTraits(Key,(!TargetedRenderUpdates || D.Background || D.FirstPerson?1:0)|(!TargetedRenderUpdates || !D.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(D)?2:0)|(!TargetedRenderUpdates || !D.MaterialValueGroup.IsEmpty()?4:0));
+            if(D.FirstPerson && ViewCachedAssets.Num()<128)ViewCachedAssets.Add(Key);
+            // Superseding unfinished material work can replace an incomplete
+            // entry. Its old plain arrays must not be freed in this frame.
+            if(auto* Old=MeshData.Find(Key))Data.RetiredMeshes.Add(MoveTemp(*Old));
+            MeshData.Add(Key,MoveTemp(D));++Adopted;
+            if(CatalogDefinitionBatches && (Adopted>=FMath::Max(1,CatalogDefinitionBatchLimit) || FPlatformTime::Seconds()-DefinitionBegan>=.002))break;
+        }
+        // Traits were patched for every adopted asset. Keep the valid instance
+        // index instead of rebuilding it merely because MeshData grew.
+        RenderSelectionMeshes=MeshData.Num();
+        const double DefinitionMs=(FPlatformTime::Seconds()-DefinitionBegan)*1000;
+        ++Loader.DefinitionBatches;Loader.DefinitionTotalMs+=DefinitionMs;Loader.DefinitionMaxMs=FMath::Max(Loader.DefinitionMaxMs,DefinitionMs);
+        Loader.DefinitionsCommitted=Loader.DefinitionIndex==Loader.MeshKeys.Num();
+        if(Loader.DefinitionsCommitted)UE_LOG(LogTemp,Display,TEXT("UEMW catalog definitions: catalog=%s auxiliary=%d batched=%d count=%d batches=%d total_ms=%.3f max_ms=%.3f"),*Name,AuxiliaryGeometry?1:0,CatalogDefinitionBatches?1:0,Loader.DefinitionIndex,Loader.DefinitionBatches,Loader.DefinitionTotalMs,Loader.DefinitionMaxMs);
+        // Moved-from map storage is retained in the DTO for off-thread cleanup.
+        return false;
     }
     const double Began=FPlatformTime::Seconds();
     if(Data.TerrainChanged && Loader.TerrainStage<3) {
