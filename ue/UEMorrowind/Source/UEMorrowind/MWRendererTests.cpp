@@ -514,6 +514,46 @@ bool FMWLightingTest::RunTest(const FString&) {
     V->SetLightingFidelity(false);V->UpdateNativeLighting(E);TestEqual(TEXT("Comparison bypass restores previous native ambient interpretation"),V->NativeInteriorSky->Intensity,.3f);TestEqual(TEXT("Bypass detaches all native light functions"),V->NativeLightFunctions.Num(),0);
     V->ActiveCellKey=TEXT("interior");V->SetStableLighting(true);TestEqual(TEXT("Stable indoor view relies on native vertex/cavity occlusion instead of camera AO"),V->Camera->PostProcessSettings.AmbientOcclusionIntensity,0.f);
     V->SetStableLighting(false);TestEqual(TEXT("Independent comparison restores the former camera AO"),V->Camera->PostProcessSettings.AmbientOcclusionIntensity,.65f);
+    if(!GUsingNullRHI && SurfaceBase) {
+        // Compare the cooked vertex-light shader to a mesh whose primary
+        // colours were lit/clamped on the CPU before interpolation. This
+        // catches clamping irradiance first and interpolating light/colour
+        // separately, even though both look plausible on a flat white mesh.
+        TArray<FVector4f> Pixels;Pixels.SetNumZeroed(8*33);Pixels[0]=FVector4f(2,2,2,1);
+        auto* Environment=MWFloatTexture(8,33,Pixels);
+        auto* Lit=UMaterialInstanceDynamic::Create(SurfaceBase,V);
+        auto* Prelit=UMaterialInstanceDynamic::Create(SurfaceBase,V);
+        for(auto* M:{Lit,Prelit}) {
+            for(const TCHAR* Name:{TEXT("NativeModernLighting"),TEXT("NativeSurfaceQuality"),TEXT("NativeFog"),TEXT("NativeEffectQuality"),TEXT("NativeInteriorDiffuse"),TEXT("NativeExteriorDiffuse")})M->SetScalarParameterValue(Name,0);
+            for(const TCHAR* Name:{TEXT("NativeUnshadowedReference"),TEXT("NativeRain"),TEXT("NativeLightingFidelity")})M->SetScalarParameterValue(Name,1);
+            M->SetTextureParameterValue(TEXT("NativeEnvironment"),Environment);
+        }
+        Lit->SetScalarParameterValue(TEXT("NativePixelLighting"),0);Prelit->SetScalarParameterValue(TEXT("NativeLit"),0);
+        FMWMeshData Ground;Ground.Vertices={FVector(-128,-128,0),FVector(128,-128,0),FVector(128,128,0),FVector(-128,128,0)};Ground.Normals.Init(FVector::UpVector,4);Ground.UVs.Init(FVector2D::ZeroVector,4);Ground.Triangles={0,2,1,0,3,2};
+        Ground.Colors={FLinearColor(.2,.4,.6,1),FLinearColor(.8,.2,.4,1),FLinearColor(.4,.8,.2,1),FLinearColor(.6,.4,.8,1)};
+        auto* Component=NewObject<UStaticMeshComponent>(V);Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->RegisterComponent();
+        auto* Mesh=MWBuildMesh(V,Ground,Lit);
+        for(auto& C:Ground.Colors){C.R=FMath::Min(1.f,2*C.R);C.G=FMath::Min(1.f,2*C.G);C.B=FMath::Min(1.f,2*C.B);}
+        auto* ReferenceMesh=MWBuildMesh(V,Ground,Prelit);
+        auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,64,64,RTF_RGBA16f,FLinearColor::Black,false);
+        auto* Capture=NewObject<USceneCaptureComponent2D>(V);Capture->SetWorldLocationAndRotation(FVector(0,0,1024),FRotator(-90,0,0));Capture->ProjectionType=ECameraProjectionMode::Orthographic;Capture->OrthoWidth=256;Capture->TextureTarget=Target;Capture->CaptureSource=SCS_SceneColorHDRNoAlpha;Capture->bCaptureEveryFrame=false;Capture->bCaptureOnMovement=false;Capture->PrimitiveRenderMode=ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;Capture->ShowOnlyComponents={Component};Capture->RegisterComponent();
+        auto Image=[&](UStaticMesh* Shape,UMaterialInstanceDynamic* M){Component->SetStaticMesh(Shape);Component->SetMaterial(0,M);World->SendAllEndOfFrameUpdates();Capture->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Result;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Result);return Result;};
+        const auto A=Image(Mesh,Lit),B=Image(ReferenceMesh,Prelit);int32 Covered=0,Mismatch=0;float MaxError=0;
+        for(int32 I=0;I<FMath::Min(A.Num(),B.Num());++I){Covered+=B[I].R>.1f;const float D=FMath::Max3(FMath::Abs(A[I].R-B[I].R),FMath::Abs(A[I].G-B[I].G),FMath::Abs(A[I].B-B[I].B));Mismatch+=D>.004f;MaxError=FMath::Max(MaxError,D);}
+        TestTrue(TEXT("Actual GPU lighting fixture covers the target"),A.Num()==4096 && B.Num()==A.Num() && Covered>3500);
+        TestTrue(TEXT("Cooked Gouraud primary colour matches CPU prelit vertices"),Mismatch==0);
+        AddInfo(FString::Printf(TEXT("Native lighting GPU covered=%d mismatch=%d max_error=%.6f"),Covered,Mismatch,MaxError));
+        if(A.Num()==4096 && B.Num()==4096)AddInfo(FString::Printf(TEXT("Native lighting centre actual=%s reference=%s"),*A[2080].ToString(),*B[2080].ToString()));
+        FImage Dark(1,1,ERawImageFormat::BGRA8,EGammaSpace::sRGB);const uint8 DarkPixel[]={20,51,102,255};FMemory::Memcpy(Dark.RawData.GetData(),DarkPixel,4);TArray<FImage> DarkMips;MWBuildTextureMips(Dark,DarkMips);
+        Lit->SetTextureParameterValue(TEXT("SpriteTexture"),MWCreateNativeTexture(DarkMips));Lit->SetScalarParameterValue(TEXT("NativeLit"),0);Lit->SetScalarParameterValue(TEXT("NativePixelLighting"),1);
+        Ground.Colors.Init(FLinearColor(.2,.2,.2,1),4);auto* TextureMesh=MWBuildMesh(V,Ground,Lit);
+        Ground.Colors.Init(FLinearColor((102.f/255)*.2f,(51.f/255)*.2f,(20.f/255)*.2f,1),4);auto* ProductMesh=MWBuildMesh(V,Ground,Prelit);
+        const auto TextureImage=Image(TextureMesh,Lit),ProductImage=Image(ProductMesh,Prelit);int32 ProductMismatch=0;float ProductError=0;
+        for(int32 I=0;I<FMath::Min(TextureImage.Num(),ProductImage.Num());++I){const float D=FMath::Max3(FMath::Abs(TextureImage[I].R-ProductImage[I].R),FMath::Abs(TextureImage[I].G-ProductImage[I].G),FMath::Abs(TextureImage[I].B-ProductImage[I].B));ProductMismatch+=D>.0005f;ProductError=FMath::Max(ProductError,D);}
+        TestTrue(TEXT("Base-only native RGB modulation matches independently premultiplied display colours"),TextureImage.Num()==4096 && ProductImage.Num()==4096 && ProductMismatch==0);
+        AddInfo(FString::Printf(TEXT("Native base texture GPU mismatch=%d max_error=%.6f"),ProductMismatch,ProductError));
+        Capture->DestroyComponent();Component->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+    }
     V->Destroy();
     return true;
 }

@@ -127,7 +127,8 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
         stage_samples[slot]=sample
     base_rgb=expression(m,u.MaterialExpressionComponentMask,r=True,g=True,b=True);link(stage_samples[0],'',base_rgb,'')
     base_alpha=expression(m,u.MaterialExpressionComponentMask,r=False,g=False,b=False,a=True);link(stage_samples[0],'',base_alpha,'')
-    rgb=custom_node(m,'native_stage_colour.hlsl',('A','B','Alpha','Dark','Detail','Decal','Apply','Active'))
+    rgb=custom_node(m,'native_stage_colour.hlsl',('A','B','Alpha','Dark','Detail','Decal','Apply','Active','DisplayRGB'))
+    link(colour_active,'',rgb,'DisplayRGB')
     apply_mode=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeTextureApply',default_value=2.)
     stages_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeStagesActive',default_value=0.)
     for e,n in ((base_alpha,'Alpha'),(stage_samples[1],'Dark'),(stage_samples[2],'Detail'),(stage_samples[6],'Decal'),(apply_mode,'Apply'),(stages_active,'Active')):link(e,'',rgb,n)
@@ -186,8 +187,12 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
     lighting=custom_node(m,'native_lighting.hlsl',('Environment','Position','Normal','Lit','LightMask','MaskActive','SunActive'))
     for e,n in((light_mask,'LightMask'),(mask_active,'MaskActive'),(object_sun,'SunActive')):link(e,'',lighting,n)
     for e,pin,n in ((environment,'','Environment'),(world_position,'','Position'),(normal_node,normal_pin,'Normal'),(lit,'','Lit')):link(e,pin,lighting,n)
+    # Original Gouraud lighting clamps the combined vertex colour, not light
+    # and colour independently. Reuse the existing interpolator budget.
+    lit_vertex=custom_node(m,'native_vertex_lighting.hlsl',('VertexColour','Lighting','Apply','StagesActive'))
+    for e,n in ((vertex_rgb,'VertexColour'),(lighting,'Lighting'),(apply_mode,'Apply'),(stages_active,'StagesActive')):link(e,'',lit_vertex,n)
     interpolated=expression(m,u.MaterialExpressionVertexInterpolator)
-    link(lighting,'',interpolated,'VS')
+    link(lit_vertex,'',interpolated,'VS')
     interpolated_normal=expression(m,u.MaterialExpressionVertexInterpolator)
     link(normal_node,normal_pin,interpolated_normal,'VS')
     if solid:
@@ -228,17 +233,23 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
             for pin,target in (('PackedOut','Packed'),('RoughnessOut','Roughness'),('StrengthOut','Strength'),('VariationOut','Variation')):link(terrain,pin,normal_detail,target)
     detail=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativePixelLighting',default_value=1.)
     surface_position=expression(m,u.MaterialExpressionWorldPosition)
-    surface=custom_node(m,'native_lighting.hlsl',('Environment','Position','Normal','Lit','VertexLighting','Detail','LightMask','MaskActive','SunActive'),prefix='if(Detail<0.5)return VertexLighting;\n')
+    surface=custom_node(m,'native_lighting.hlsl',('Environment','Position','Normal','Lit','VertexLighting','Detail','LightMask','MaskActive','SunActive','VertexColour','Apply','StagesActive'),prefix='if(Detail<0.5)return (StagesActive<.5 || Apply>=1.5)?VertexLighting/max(VertexColour.rgb,1e-6):VertexLighting;\n')
+    for e,n in ((vertex_rgb,'VertexColour'),(apply_mode,'Apply'),(stages_active,'StagesActive')):link(e,'',surface,n)
     for e,n in((light_mask,'LightMask'),(mask_active,'MaskActive'),(object_sun,'SunActive')):link(e,'',surface,n)
     for e,pin,n in ((environment,'','Environment'),(surface_position,'','Position'),(interpolated_normal,'','Normal'),(lit,'','Lit'),(interpolated,'','VertexLighting'),(detail,'','Detail')):link(e,pin,surface,n)
     if solid:
         exterior_normal=expression(m,u.MaterialExpressionLinearInterpolate)
         link(interpolated_normal,'',exterior_normal,'A');link(normal_detail,'',exterior_normal,'B');link(shadowed_diffuse,'',exterior_normal,'Alpha');link(exterior_normal,'',surface,'Normal')
-        solar_base=custom_node(m,'native_exterior_colour.hlsl',('Environment','LinearBase','Lighting','Normal','SunActive','Active','Position','LightMask','Exterior'))
+        solar_base=custom_node(m,'native_exterior_colour.hlsl',('Environment','LinearBase','Lighting','Normal','SunActive','Active','Position','LightMask','Exterior','VertexColour','Apply','StagesActive'))
+        for e,n in ((vertex_rgb,'VertexColour'),(apply_mode,'Apply'),(stages_active,'StagesActive')):link(e,'',solar_base,n)
         link(exterior_diffuse,'',solar_base,'Exterior')
         native_fill=u.CustomOutput();native_fill.set_editor_property('output_name','AmbientLocal');native_fill.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT3);solar_base.set_editor_property('additional_outputs',[native_fill])
         for e,pin,n in((environment,'','Environment'),(rgb,'','LinearBase'),(surface,'','Lighting'),(exterior_normal,'','Normal'),(object_sun,'','SunActive'),(shadowed_diffuse,'','Active'),(light_mask,'','LightMask')):link(e,pin,solar_base,n)
         link(surface_position,'',solar_base,'Position')
+        reference_colour=custom_node(m,'native_display_lighting.hlsl',('LinearBase','Lighting','VertexColour','Apply','StagesActive'))
+        for e,n in ((vertex_rgb,'VertexColour'),(apply_mode,'Apply'),(stages_active,'StagesActive')):link(e,'',reference_colour,n)
+        link(rgb,'',reference_colour,'LinearBase');link(surface,'',reference_colour,'Lighting')
+        reference_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeUnshadowedReference',default_value=0.)
     shaded=expression(m,u.MaterialExpressionMultiply);link(rgb,'',shaded,'A');link(surface,'',shaded,'B')
     emission=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeEmission',default_value=u.LinearColor(0,0,0,1))
     emitted_base=expression(m,u.MaterialExpressionMultiply);link(base_rgb,'',emitted_base,'A');link(emission,'',emitted_base,'B')
@@ -313,6 +324,9 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
         exterior_emission=expression(m,u.MaterialExpressionAdd);link(exterior_fill,'',exterior_emission,'A');link(emitted,'',exterior_emission,'B')
         exterior_choice=expression(m,u.MaterialExpressionLinearInterpolate)
         link(final_color,'',exterior_choice,'A');link(exterior_emission,'',exterior_choice,'B');link(shadowed_diffuse,'',exterior_choice,'Alpha');final_color=exterior_choice
+    if solid:
+        reference_emission=expression(m,u.MaterialExpressionAdd);link(reference_colour,'',reference_emission,'A');link(emitted,'',reference_emission,'B')
+        reference_choice=expression(m,u.MaterialExpressionLinearInterpolate);link(final_color,'',reference_choice,'A');link(reference_emission,'',reference_choice,'B');link(reference_active,'',reference_choice,'Alpha');final_color=reference_choice
     fog=custom_node(m,'native_fog.hlsl',('Environment','Position','CameraPosition','Color','BaseTexture','Fog','Sky','Background','Quality'))
     link(atmosphere_quality,'',fog,'Quality')
     transmission=u.CustomOutput();transmission.set_editor_property('output_name','Transmittance');transmission.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT1)

@@ -1,8 +1,42 @@
 # Rendering hitches and transient visibility
 
+## Native lighting and neutral SDR output (light07)
 
+The build fixes four confirmed differences while retaining original light authority:
 
-Latest update: allocator trims and first-person resource ownership (2026-11-04), below. Older sections retain their original measurements and failures; they are not current scanout guarantees.
+- Static upload preserves native display-RGB bytes. UE's runtime `BuildFromMeshDescriptions` encodes linear input with `ToFColor(true)`; passing already encoded values encoded them again. The mutable path already preserved the bytes.
+- MODULATE saturates combined vertex colour/light. The optional Gouraud reference combines them before interpolation; production retains pixel lighting. REPLACE/DECAL retain their prior path.
+- Base-only texture/vertex multiplication uses display RGB in the native-lighting path, matching the secondary-stage path. Absence of a secondary stage previously selected linear-space multiplication.
+- The camera disables UE's default vignette, which darkened identical source colours as they moved toward screen edges despite neutral exposure/tone-curve settings.
+
+An owned eight-colour strip in the **actual scene/backbuffer** isolated the last issue. Before the vignette fix, grey 128 became 124, warm (32,16,8) became (29,14,6), and (64,32,16) became (55,27,13) near the right edge, while central greys were correct. Afterward all eight RGB samples match exactly. The strip binds the real native environment texture and expires after five seconds. Earlier white-strip captures used an invalid placeholder environment and are excluded.
+
+A read-only original Direct3D draw-state probe matched source positions/counts/transforms for 149 world draws. All 2,001 sampled vertex colours and all 149 enabled-light lists matched. Replaying captured material/light/transform states through Direct3D's software vertex pipeline agreed with the supported normalized-direction calculation within half an RGB byte on all samples. An owned depth-varying triangle confirmed perspective-correct colour interpolation. Affine interpolation and raw sun-direction hypotheses were rejected. These are sampled input/calculation checks, not verification of every original effect.
+
+Console pause held camera and native lights fixed for the image comparison. The independent original window used the restored normal pinned graphics wrapper, cropped to its 1024x768 client. UE matched that viewport/camera. `UEMW_TEXTURE_UPGRADES=0` and a zero-upgrade witness excluded enhanced albedo. Console, HUD and tooltip regions were excluded. Mean absolute RGB errors use byte values; lower is closer to this one original frame.
+
+| Fixed patch | Default enhanced, before vignette fix | Default enhanced, after | Unshadowed native vertex reference, after |
+|---|---:|---:|---:|
+| Left plaster | 8.160 | 4.221 | 1.138 |
+| Right plaster | 12.793 | 8.065 | 0.622 |
+| Lower door | 2.230 | 2.430 | 0.821 |
+| Floor | 7.673 | 5.390 | 4.249 |
+
+Most measured default patches improve, but this is **not full lighting parity**. The native reference disables UE direct lighting/material enhancement while preserving tone curve and native membership. The remaining floor difference includes unresolved texture/filtering/material effects. Default UE PBR and shadows remain separate approximations. No global warm tint, disabled production shadows or gamma-only output workaround was adopted.
+
+All **409 source tests, 37 packaged renderer tests and eight GPU runs** pass on this package. The cooked Gouraud path matches independent CPU-prelit owned colours over 4,096 pixels on D3D11/threaded D3D12 (maximum linear-channel error 0.000122). Before static-upload correction, all 4,096 mismatched, maximum error 0.534668. The dark base-only texture test failed before its colour-space fix (0.002598) and passes afterward (0.000198, within a 0.0005 quantization allowance). Mutable attributes, skin poses, rigid placement, terrain blending, reflection membership and alpha GPU regressions also pass.
+
+A **12-second normal-launch** warm exterior walk at actual 1024x768, with default optional texture enhancement restored and screenshot/trace/presentation-stat flags disabled, measured CPU interval median/p95/max **16.667/17.334/56.810 ms**. GPU time was 3.225/4.866/5.371 ms; resource-rebind hides were zero. Forty-one exact weapon pose/placement witnesses and two draws (520.4/439.6 ms, including native animation and observer polling) passed after disposable checkpoint restoration. DXGI statistics were disabled. These CPU/GPU observations are not displayed FPS or an isolated speedup; the 56.81 ms spike remains open.
+
+All 32 protected saves and original/private executable hashes are unchanged. The temporary private draw-probe DLL was removed and exact pinned graphics DLLs restored; probe runs are excluded from performance. No save writes, executable patches or video recording occurred. The final normal unified renderer is paused in original Options with diagnostics off.
+
+Retained exclusions/failures: the initial enhanced-albedo comparison could not isolate original lighting; repeating with original albedo did not eliminate the discrepancy. A paused candle toggle changed no measured pixels and proves no isolated contribution. Gamma-only output was too bright and rejected. An off-view stale light-cache record and authored mip averages did not explain the broad output mismatch; no runtime heap scan or new mip infrastructure was integrated.
+
+Remaining approximations include enhanced specular/roughness/cavity/normals, shared UE shadow compensation/filtering/softness, 32-light/four-interior/two-exterior local-shadow budgets, effects/transparency and broader interior/exterior parity. Full fixed-function/material-combination coverage and sustained frame pacing are unproven.
+
+Local evidence: `light07-results.json`, `light07-ramp-valid.json`, `light07-ramp-neutral.json`, `light07-original-draw-state.jsonl`, `light07-original-colour-bytes.json`, `light07-original-light-membership.json`, `light07-d3d-math-comparison.json`, `light07-neutral-sdr-cases.json` and metrics, `light07-native-albedo-compare.stdout.log` (pre-vignette baseline), `light07-release-*.log`, `light07-release-live.json` and `light07-release-walk-benchmark.json`. Earlier candidate images/results remain investigation evidence, not final acceptance.
+
+Previous update: allocator trims and first-person resource ownership (2026-11-04), below. Older sections retain their original measurements and failures; they are not current scanout guarantees.
 
 ## Allocator trims and first-person resource ownership
 

@@ -63,7 +63,12 @@ UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterfa
             const auto Corner=Description.CreateVertexInstance(Vertices[V]);Corners.Add(Corner);
             const FVector3f NativeNormal=Data.Normals.Num()==Data.Vertices.Num()?FVector3f(Data.Normals[V].Y,Data.Normals[V].X,Data.Normals[V].Z).GetSafeNormal():N;
             Normals[Corner]=NativeNormal;Tangents[Corner]=T;Signs[Corner]=1;
-            const auto& Color=Data.Colors[V];Colors[Corner]=FVector4f(Color.R,Color.G,Color.B,Color.A);
+            // Runtime BuildFromMeshDescriptions encodes linear vertex colours
+            // with ToFColor(true). Our native/owned mesh data carries display
+            // RGB bytes, like the mutable vertex path; decode before handing
+            // them to that builder so its upload preserves those exact bytes.
+            const auto Color=FLinearColor::FromSRGBColor(Data.Colors[V].ToFColor(false));
+            Colors[Corner]=FVector4f(Color.R,Color.G,Color.B,Color.A);
             UVs.Set(Corner,0,FVector2f(Data.UVs[V]));
             if(Data.SkinUVs.Num())UVs.Set(Corner,1,FVector2f(Data.SkinUVs[V]));
             if(Data.StageUV1.Num()){UVs.Set(Corner,2,FVector2f(Data.StageUV1[V]));UVs.Set(Corner,3,FVector2f(Data.StageUV2[V]));}

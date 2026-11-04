@@ -39,9 +39,16 @@ def wait_for(check,seconds,poll=.05):
     raise RuntimeError('Timed out waiting for '+check.__name__)
 
 
-def witness(ids,*,poll=.05,visual_profile=None,water_fog_mode=None,terrain_blend=None,water_reflections=None,background_visible=None,ambient_probe=None,water_atmosphere=None,water_planar=None,reflection_capture=None,effect_quality=None,interior_lighting=None,foliage_quality=None,celestial_quality=None,outdoor_lighting=None,surface_reflections=None,targeted_render_updates=None,presentation_sync=None,presentation_latency=None,presentation_frame_limit=None,rain_interpolation=None,lighting_fidelity=None,stable_lighting=None,exterior_fidelity=None,exterior_fog=None,shadow_maps=None,record_seconds=None,distant_scenery=None,memory_trim=None):
+def witness(ids,*,poll=.05,visual_profile=None,water_fog_mode=None,terrain_blend=None,water_reflections=None,background_visible=None,ambient_probe=None,water_atmosphere=None,water_planar=None,reflection_capture=None,effect_quality=None,interior_lighting=None,foliage_quality=None,celestial_quality=None,outdoor_lighting=None,surface_reflections=None,targeted_render_updates=None,presentation_sync=None,presentation_latency=None,presentation_frame_limit=None,rain_interpolation=None,lighting_fidelity=None,stable_lighting=None,exterior_fidelity=None,exterior_fog=None,shadow_maps=None,record_seconds=None,distant_scenery=None,memory_trim=None,native_light_reference=None,native_irradiance=None,native_colour_ramp=None):
     token=str(uuid.uuid4());folder=ROOT/'local/bridge'
     request=dict(protocol='uemw.witness.request',version=1,request_id=token,unix_ns=time.time_ns(),ids=ids)
+    if native_colour_ramp is not None:
+        if type(native_colour_ramp)is not bool:raise ValueError('Invalid native colour ramp diagnostic')
+        request['native_colour_ramp']=native_colour_ramp
+    for name,value,allowed in(('native_light_reference',native_light_reference,('off','pixel','vertex')),('native_irradiance',native_irradiance,('pixel','vertex'))):
+        if value is not None:
+            if value not in allowed:raise ValueError('Invalid native lighting comparison mode')
+            request[name]=value
     if memory_trim is not None:
         if memory_trim is not True:raise ValueError('Expected an explicit diagnostic memory trim')
         request['memory_trim']=True

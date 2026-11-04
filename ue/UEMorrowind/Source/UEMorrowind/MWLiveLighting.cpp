@@ -31,8 +31,8 @@ void AMWLive::ApplyNativeLightSet(UMaterialInstanceDynamic* Material,const FMWMe
     for(int32 I=0;I<NativeLightIds.Num() && I<32;++I)if(Mesh.NativeLightSet.Contains(NativeLightIds[I]))Mask|=1u<<I;
     Material->SetVectorParameterValue(TEXT("NativeLightMask"),FLinearColor(Mask&65535,Mask>>16,0,0));
     Material->SetScalarParameterValue(TEXT("NativeLightSetActive"),Active?1:0);
-    Material->SetScalarParameterValue(TEXT("NativeInteriorDiffuse"),Active && !Exterior?1:0);
-    Material->SetScalarParameterValue(TEXT("NativeExteriorDiffuse"),Active && Exterior?1:0);
+    Material->SetScalarParameterValue(TEXT("NativeInteriorDiffuse"),Active && !Exterior && !LightingReferenceMode?1:0);
+    Material->SetScalarParameterValue(TEXT("NativeExteriorDiffuse"),Active && Exterior && !LightingReferenceMode?1:0);
     Material->SetScalarParameterValue(TEXT("NativeObjectSun"),Mesh.NativeSunActive?1:0);
 }
 void AMWLive::SetStableLighting(bool Enabled) {
@@ -41,7 +41,7 @@ void AMWLive::SetStableLighting(bool Enabled) {
 
 void AMWLive::SetLightingVisible(bool Visible) {
     LightingSceneVisible=Visible;
-    const bool Enabled=Visible && LightingReady && !VisualReference;
+    const bool Enabled=Visible && LightingReady && !VisualReference && !LightingReferenceMode;
     if(NativeSun)NativeSun->SetVisibility(Enabled && NativeSun->Intensity>0);
     const bool Exterior=ActiveCellKey.StartsWith(TEXT("exterior:"));
     OutdoorAmbientActive=Enabled && AmbientProbeEnabled && MWOutdoorLightingActive(OutdoorLightingEnabled,Exterior,NativeUnderwater,VisualReference) && NativeOutdoorSky && NativeOutdoorSky->NativeProbeReady();

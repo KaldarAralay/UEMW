@@ -1,4 +1,6 @@
 #include "MWLive.h"
+#include "MWMesh.h"
+#include "Components/StaticMeshComponent.h"
 #include "DynamicRHI.h"
 #include "RenderingThread.h"
 #include "HAL/PlatformOutputDevices.h"
@@ -130,6 +132,8 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("foliage_materials"),LeafMaterials);Out->SetNumberField(TEXT("foliage_upgraded_materials"),UpgradedLeaves);Out->SetBoolField(TEXT("foliage_quality"),FoliageFidelityEnabled);
     Out->SetBoolField(TEXT("interior_lighting"),InteriorLightingEnabled);
     Out->SetBoolField(TEXT("lighting_fidelity"),LightingFidelityEnabled);
+    Out->SetNumberField(TEXT("native_irradiance_mode"),NativeIrradianceMode);
+    Out->SetNumberField(TEXT("native_light_reference_mode"),LightingReferenceMode);
     Out->SetBoolField(TEXT("stable_lighting"),StableLightingEnabled);
     Out->SetBoolField(TEXT("shadow_maps"),NativeShadowMapsEnabled);
     Out->SetBoolField(TEXT("interior_shadowed_diffuse"),LightingFidelityEnabled && !VisualReference && !ActiveCellKey.StartsWith(TEXT("exterior:")));
@@ -278,6 +282,15 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
         if(const auto* Frame=AppliedMaterialFrames.Find(InstanceAssets.FindRef(Id)))Row->SetNumberField(TEXT("texture_frame"),*Frame);
         if(auto* Material=SkinMaterials.FindRef(Id)?SkinMaterials.FindRef(Id):GeometryMaterials.FindRef(InstanceAssets.FindRef(Id))) {
             const auto V=Material->K2_GetVectorParameterValue(TEXT("NativeAlphaTest"));Row->SetArrayField(TEXT("alpha_test"),{MakeShared<FJsonValueNumber>(V.R),MakeShared<FJsonValueNumber>(V.G),MakeShared<FJsonValueNumber>(V.B)});
+            if(DiagnosticScreenshots) {
+                auto Values=MakeShared<FJsonObject>();
+                for(const TCHAR* Name:{TEXT("NativeLit"),TEXT("NativeLightSetActive"),TEXT("NativeObjectSun"),TEXT("NativePixelLighting"),TEXT("NativeUnshadowedReference"),TEXT("NativeStagesActive"),TEXT("NativeTextureApply"),TEXT("NativeLightingFidelity"),TEXT("NativeInteriorDiffuse"),TEXT("NativeExteriorDiffuse")})Values->SetNumberField(Name,Material->K2_GetScalarParameterValue(Name));
+                const auto Tint=Material->K2_GetVectorParameterValue(TEXT("NativeTint"));Values->SetArrayField(TEXT("NativeTint"),{MakeShared<FJsonValueNumber>(Tint.R),MakeShared<FJsonValueNumber>(Tint.G),MakeShared<FJsonValueNumber>(Tint.B),MakeShared<FJsonValueNumber>(Tint.A)});
+                Row->SetObjectField(TEXT("native_material_parameters"),Values);
+                if(const auto* Data=MeshData.Find(InstanceAssets.FindRef(Id))) {
+                    TArray<TSharedPtr<FJsonValue>> Colours;for(int32 I=0;I<FMath::Min(4,Data->Colors.Num());++I){const auto C=Data->Colors[I];for(float F:{C.R,C.G,C.B,C.A})Colours.Add(MakeShared<FJsonValueNumber>(F));}Row->SetArrayField(TEXT("mesh_colour_samples"),Colours);
+                }
+            }
         }
         if(const auto* Data=MeshData.Find(InstanceAssets.FindRef(Id)))if(!Data->TextureEffectGroup.IsEmpty()) {
             auto* Material=SkinMaterials.FindRef(Id);if(!Material)Material=GeometryMaterials.FindRef(InstanceAssets.FindRef(Id));
@@ -319,6 +332,22 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetArrayField(TEXT("instances"),Rows);return Out;
 }
 
+void AMWLive::SetDiagnosticColourRamp(bool Enabled) {
+    if(DiagnosticColourRamp){DiagnosticColourRamp->DestroyComponent();DiagnosticColourRamp=nullptr;}
+    if(!Enabled || !DiagnosticScreenshots || !Camera)return;
+    auto* Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/UEMW/Materials/MW_Opaque.MW_Opaque"));if(!Base)return;
+    auto* Material=UMaterialInstanceDynamic::Create(Base,this);
+    Material->SetTextureParameterValue(TEXT("NativeEnvironment"),EnvironmentTexture);
+    for(const TCHAR* Name:{TEXT("NativeLit"),TEXT("NativeFog"),TEXT("NativeModernLighting"),TEXT("NativeSurfaceQuality"),TEXT("NativeEffectQuality"),TEXT("NativeInteriorDiffuse"),TEXT("NativeExteriorDiffuse")})Material->SetScalarParameterValue(Name,0);
+    for(const TCHAR* Name:{TEXT("NativeRain"),TEXT("NativeUnshadowedReference")})Material->SetScalarParameterValue(Name,1);
+    Material->SetScalarParameterValue(TEXT("NativePixelLighting"),0);
+    const FColor Colours[]={FColor(0,0,0),FColor(8,8,8),FColor(16,16,16),FColor(32,32,32),FColor(64,64,64),FColor(128,128,128),FColor(32,16,8),FColor(64,32,16)};
+    const FVector Forward=Camera->GetForwardVector(),Right=Camera->GetRightVector(),Up=Camera->GetUpVector(),Origin=Camera->GetComponentLocation()+Forward;
+    const double Half=FMath::Tan(FMath::DegreesToRadians(Camera->FieldOfView*.5));FMWMeshData Data;
+    for(int32 I=0;I<8;++I){const int32 Start=Data.Vertices.Num();const double A=Half*(-1+I*.25),B=A+Half*.25;for(const FVector2D P:{FVector2D(A,-Half*.2),FVector2D(B,-Half*.2),FVector2D(B,Half*.2),FVector2D(A,Half*.2)}){const auto V=Origin+Right*P.X+Up*P.Y;Data.Vertices.Add(FVector(V.Y,V.X,V.Z));Data.Normals.Add(FVector::UpVector);Data.UVs.Add(FVector2D::ZeroVector);const auto C=Colours[I];Data.Colors.Add(FLinearColor(C.R/255.f,C.G/255.f,C.B/255.f,1));}Data.Triangles.Append({Start,Start+2,Start+1,Start,Start+3,Start+2});}
+    auto* Component=NewObject<UStaticMeshComponent>(this);Component->SetStaticMesh(MWBuildMesh(this,Data,Material));Component->SetMaterial(0,Material);Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetCastShadow(false);Component->SetReceivesDecals(false);Component->RegisterComponent();Component->AttachToComponent(Camera,FAttachmentTransformRules::KeepWorldTransform);DiagnosticColourRamp=Component;DiagnosticColourRampUntil=FPlatformTime::Seconds()+5;
+}
+
 void AMWLive::PublishStateWitness() {
     const double Tick=FPlatformTime::Seconds();if(SnapshotPath.IsEmpty() || Tick-LastWitnessPoll<.1)return;LastWitnessPoll=Tick;
     const FString Folder=FPaths::GetPath(SnapshotPath);FString Text;TSharedPtr<FJsonObject> Request;
@@ -330,6 +359,23 @@ void AMWLive::PublishStateWitness() {
         !Request->TryGetNumberField(TEXT("unix_ns"),Stamp) || !FMath::IsFinite(Stamp) || Now<Stamp/1e9 || Now-Stamp/1e9>30 ||
         !Request->TryGetArrayField(TEXT("ids"),Values) || Values->Num()>64)return;
     TArray<FString> Ids;for(const auto& V:*Values){FString Id;if(!V.IsValid() || !V->TryGetString(Id) || Id.IsEmpty() || Id.Len()>96)return;Ids.Add(Id);}
+    if(Request->HasField(TEXT("native_colour_ramp"))){bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("native_colour_ramp"),Enabled))return;SetDiagnosticColourRamp(Enabled);}
+    if(Request->HasField(TEXT("native_light_reference")) || Request->HasField(TEXT("native_irradiance"))) {
+        if(!DiagnosticScreenshots)return;
+        int32 Reference=LightingReferenceMode,Irradiance=NativeIrradianceMode;FString Mode;
+        if(Request->HasField(TEXT("native_light_reference"))) {
+            if(!Request->TryGetStringField(TEXT("native_light_reference"),Mode) || (Mode!=TEXT("off") && Mode!=TEXT("pixel") && Mode!=TEXT("vertex")))return;
+            Reference=Mode==TEXT("off")?0:Mode==TEXT("pixel")?1:2;
+        }
+        if(Request->HasField(TEXT("native_irradiance"))) {
+            if(!Request->TryGetStringField(TEXT("native_irradiance"),Mode) || (Mode!=TEXT("pixel") && Mode!=TEXT("vertex")))return;
+            Irradiance=Mode==TEXT("vertex")?0:1;
+        }
+        LightingReferenceMode=Reference;NativeIrradianceMode=Irradiance;
+        for(const auto& Pair:GeometryMaterials){ApplyVisualParameters(Pair.Value);if(const auto* D=MeshData.Find(Pair.Key))ApplyNativeLightSet(Pair.Value,*D);}
+        for(const auto& Pair:SkinMaterials){ApplyVisualParameters(Pair.Value);if(const auto* Asset=InstanceAssets.Find(Pair.Key))if(const auto* D=MeshData.Find(*Asset))ApplyNativeLightSet(Pair.Value,*D);}
+        SetLightingVisible(LightingSceneVisible);NativePoseValid=false;
+    }
     if(Request->HasField(TEXT("distant_scenery"))) {
         bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("distant_scenery"),Enabled))return;DistantEnabled=Enabled;
     }

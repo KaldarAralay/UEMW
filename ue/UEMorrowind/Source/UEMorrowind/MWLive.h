@@ -177,6 +177,10 @@ public:
     bool InteriorLightingEnabled=true,InteriorProbeActive=false;
     bool AmbientProbeEnabled=true;
     bool LightingFidelityEnabled=true,StableLightingEnabled=true;
+    int32 NativeIrradianceMode=1,LightingReferenceMode=0; // pixel / original vertex; diagnostics default off
+    UPROPERTY() UStaticMeshComponent* DiagnosticColourRamp=nullptr;
+    double DiagnosticColourRampUntil=0;
+    void SetDiagnosticColourRamp(bool Enabled);
     bool NativeShadowMapsEnabled=true;
     void SetNativeShadowMaps(bool Enabled);
     bool ExteriorFidelityEnabled=true,ExteriorFogEnabled=true;

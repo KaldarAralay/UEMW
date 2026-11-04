@@ -64,8 +64,11 @@ uint count=min(32u,(uint)round(Environment.Load(int3(4,0,0)).z));
         ueDirect+=pk*rgb*ueAttenuation*cosine;
     }
 }
-float3 ambientColour=encoded*saturate(min(unshadowed,Lighting));
-float3 fullColour=encoded*saturate(Lighting);
+float3 vertex=max(VertexColour.rgb,0);
+bool modulate=StagesActive<.5 || Apply>=1.5;
+float3 textureColour=encoded/max(vertex,1e-6);
+float3 ambientColour=modulate?textureColour*saturate(vertex*min(unshadowed,Lighting)):encoded*saturate(min(unshadowed,Lighting));
+float3 fullColour=modulate?textureColour*saturate(vertex*Lighting):encoded*saturate(Lighting);
 AmbientLocal=lerp(ambientColour/12.92,pow((ambientColour+.055)/1.055,2.4),step(.04045,ambientColour));
 float3 full=lerp(fullColour/12.92,pow((fullColour+.055)/1.055,2.4),step(.04045,fullColour));
 return saturate(max(full-AmbientLocal,0)/max(ueDirect,1e-6));

@@ -391,6 +391,10 @@ AMWLive::AMWLive() {
     Camera->PostProcessSettings.ToneCurveAmount=0;
     Camera->PostProcessSettings.bOverride_ExpandGamut=true;
     Camera->PostProcessSettings.ExpandGamut=0;
+    // Original lighting has no camera-centred vignette. UE's default darkens
+    // the same native surface as it moves toward the screen edge.
+    Camera->PostProcessSettings.bOverride_VignetteIntensity=true;
+    Camera->PostProcessSettings.VignetteIntensity=0;
     Camera->PostProcessSettings.bOverride_BloomIntensity=true;
     Camera->PostProcessSettings.BloomIntensity=.08f;
     Camera->PostProcessSettings.bOverride_BloomThreshold=true;Camera->PostProcessSettings.BloomThreshold=1.5f;
@@ -632,11 +636,12 @@ void AMWLive::CreateGeometryMaterial() {
 
 void AMWLive::ApplyVisualParameters(UMaterialInstanceDynamic* Material) const {
     if(!Material)return;
-    Material->SetScalarParameterValue(TEXT("NativePixelLighting"),1);
+    Material->SetScalarParameterValue(TEXT("NativePixelLighting"),LightingReferenceMode==2?0:LightingReferenceMode==1?1:NativeIrradianceMode);
+    Material->SetScalarParameterValue(TEXT("NativeUnshadowedReference"),LightingReferenceMode?1:0);
     Material->SetScalarParameterValue(TEXT("NativeMipBias"),0);
-    Material->SetScalarParameterValue(TEXT("NativeModernLighting"),VisualReference?0:1);
+    Material->SetScalarParameterValue(TEXT("NativeModernLighting"),VisualReference || LightingReferenceMode?0:1);
     Material->SetScalarParameterValue(TEXT("NativeLightingFidelity"),LightingFidelityEnabled && !VisualReference?1:0);
-    Material->SetScalarParameterValue(TEXT("NativeSurfaceQuality"),VisualReference?0:1);
+    Material->SetScalarParameterValue(TEXT("NativeSurfaceQuality"),VisualReference || LightingReferenceMode?0:1);
     Material->SetScalarParameterValue(TEXT("NativeAmbientProbe"),AmbientProbeActive?1:0);
     Material->SetScalarParameterValue(TEXT("NativeWaterAtmosphere"),WaterAtmosphereEnabled?1:0);
     Material->SetScalarParameterValue(TEXT("NativePlanarWater"),WaterReflectionActive?1:0);
@@ -1668,6 +1673,7 @@ void AMWLive::Tick(float Delta) {
     const double TickBegan=FPlatformTime::Seconds();
     ON_SCOPE_EXIT {if(PerfTickMs.Num()<120)PerfTickMs.Add((FPlatformTime::Seconds()-TickBegan)*1000);};
     Super::Tick(Delta);
+    if(DiagnosticColourRamp && FPlatformTime::Seconds()>=DiagnosticColourRampUntil)SetDiagnosticColourRamp(false);
     if(PresentationSamples && GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
         MWPollPresentation(GEngine->GameViewport->Viewport->GetViewportRHI(),PresentationSamples.ToSharedRef());
     if(PerfFrameIntervalMs.Num()<120)PerfFrameIntervalMs.Add(Delta*1000.);
