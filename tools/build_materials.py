@@ -63,8 +63,8 @@ def clear_material(m):
 foliage_model=next((getattr(u.MaterialShadingModel,n)for n in dir(u.MaterialShadingModel)if n.startswith('MSM_')and 'FOLIAGE'in n),None)
 if foliage_model is None:raise RuntimeError('Installed engine has no two-sided foliage shading model')
 policies=[('Opaque',u.BlendMode.BLEND_OPAQUE),('Masked',u.BlendMode.BLEND_MASKED),('Foliage',u.BlendMode.BLEND_MASKED),('Translucent',u.BlendMode.BLEND_TRANSLUCENT),
-          ('Additive',u.BlendMode.BLEND_ADDITIVE),('Premultiplied',u.BlendMode.BLEND_ALPHA_COMPOSITE),('Modulate',u.BlendMode.BLEND_MODULATE),('Water',u.BlendMode.BLEND_OPAQUE),('Terrain',u.BlendMode.BLEND_OPAQUE),('Hair',u.BlendMode.BLEND_MASKED),('Glass',u.BlendMode.BLEND_TRANSLUCENT)]
-for label,blend,environment_map in [(label,blend,env)for label,blend in policies for env in ((False,)if label in ('Water','Terrain')else(False,True))]:
+          ('Additive',u.BlendMode.BLEND_ADDITIVE),('Premultiplied',u.BlendMode.BLEND_ALPHA_COMPOSITE),('Modulate',u.BlendMode.BLEND_MODULATE),('Water',u.BlendMode.BLEND_OPAQUE),('Terrain',u.BlendMode.BLEND_OPAQUE),('Hair',u.BlendMode.BLEND_MASKED),('Glass',u.BlendMode.BLEND_TRANSLUCENT),('SunGlare',u.BlendMode.BLEND_TRANSLUCENT)]
+for label,blend,environment_map in [(label,blend,env)for label,blend in policies for env in ((False,)if label in ('Water','Terrain','SunGlare')else(False,True))]:
   for skin in (False,True):
     name='MW_'+label+('_Env'if environment_map else'')+('_Skin' if skin else '')
     path=D+'/'+name
@@ -75,9 +75,12 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
     clear_material(m)
     m.set_editor_property('two_sided',True)
     m.set_editor_property('blend_mode',blend)
+    # The original weather-controller pick/vertex alpha owns flare occlusion.
+    # Its near-pass overlay must not be clipped a second time by UE world depth.
+    m.set_editor_property('disable_depth_test',label=='SunGlare')
     if label in ('Masked','Hair','Foliage'):m.set_editor_property('opacity_mask_clip_value',1/3)
     solid=label in ('Opaque','Masked','Terrain','Hair','Glass','Foliage')
-    transparent=label in ('Translucent','Additive','Premultiplied','Modulate','Glass')
+    transparent=label in ('Translucent','Additive','Premultiplied','Modulate','Glass','SunGlare')
     water=label=='Water'
     m.set_editor_property('shading_model',foliage_model if label=='Foliage'else u.MaterialShadingModel.MSM_SINGLE_LAYER_WATER if water else u.MaterialShadingModel.MSM_DEFAULT_LIT if solid else u.MaterialShadingModel.MSM_UNLIT)
     m.set_editor_property('tangent_space_normal',False)
@@ -339,7 +342,7 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
         distance=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeSoftDistance',default_value=6.)
         intersection=expression(m,u.MaterialExpressionDepthFade);link(distance,'',intersection,'FadeDistance')
         one=expression(m,u.MaterialExpressionConstant,r=1.);link(one,'',intersection,'Opacity')
-        policy=expression(m,u.MaterialExpressionConstant,r={'Translucent':1,'Glass':1,'Additive':2,'Premultiplied':3,'Modulate':4}[label])
+        policy=expression(m,u.MaterialExpressionConstant,r={'Translucent':1,'Glass':1,'SunGlare':1,'Additive':2,'Premultiplied':3,'Modulate':4}[label])
         composite=custom_node(m,'native_transparency.hlsl',('Fogged','Unfogged','Transmittance','Opacity','Intersection','Soft','Kind','Quality','Policy','Background'))
         opacity_out=u.CustomOutput();opacity_out.set_editor_property('output_name','OpacityOut');opacity_out.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT1);composite.set_editor_property('additional_outputs',[opacity_out])
         for e,pin,n in ((celestial,'','Fogged'),(final_color,'','Unfogged'),(fog,'Transmittance','Transmittance'),(blend_alpha,'','Opacity'),(intersection,'','Intersection'),(soft,'','Soft'),(effect_kind,'','Kind'),(effect_quality,'','Quality'),(policy,'','Policy'),(background_switch,'','Background')):link(e,pin,composite,n)

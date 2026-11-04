@@ -38,7 +38,7 @@ def discover(reader,shape):
     water=shape.get('cell_key')in('aux:water','aux:ripple')
     sky=shape.get('cell_key')=='aux:sky'and shape.get('color_mode',2)!=0
     name=shape.get('texture','').replace('\\','/').rsplit('/',1)[-1].lower()
-    flare=shape.get('cell_key')in('view:first-person','aux:sky')and name.startswith('tx_sun_flash')
+    flare=shape.get('cell_key')in('view:first-person','aux:sky','aux:sun_glare')and name.startswith('tx_sun_flash')
     if not morph and not sky and not water and not flare and not uv_controller:return None
     topology=shape.get('topology','triangles');header_size=0x38 if topology=='lines' else 0x48
     model=int(shape['model'],16);raw=reader.read(model,header_size);color=struct.unpack_from('<I',raw,0x24)[0]
@@ -47,7 +47,7 @@ def discover(reader,shape):
     key=identity(raw,topology)
     if key[0]!=shape['vertex_count']or (topology!='lines' and key[6]!=shape['triangle_count'])or not key[2]or not key[7]:raise SceneReadChanged('Native mutable geometry layout changed')
     if uv_controller and not key[5]:raise SceneReadChanged('Native UV controller lost its resolved UV buffer')
-    return dict(shape=ptr,model=model,identity=key,colors=colors,uvs=bool(key[5]),morph=morph,count=key[0],topology=topology,header_size=header_size,**(dict(uv_controller=uv_controller,uv_sets=struct.unpack_from('<H',raw,0xa)[0])if uv_controller else{}))
+    return dict(shape=ptr,model=model,identity=key,colors=colors,uvs=bool(key[5]),morph=morph,count=key[0],topology=topology,header_size=header_size,**(dict(billboard=shape['rigid_billboard'])if shape.get('rigid_billboard')else{}),**(dict(uv_controller=uv_controller,uv_sets=struct.unpack_from('<H',raw,0xa)[0])if uv_controller else{}))
 
 
 class AttributeCapture:

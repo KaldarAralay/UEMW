@@ -112,7 +112,13 @@ def main():
                 if reason in drop_reasons or len(drop_reasons)<16:drop_reasons[reason]+=1
                 wait_period(capture,began,period);continue
             except (OSError,ValueError,RuntimeError)as e:
-                value=dict(protocol='uemw.ui',version=1,status='unavailable',pid=a.pid,session=a.session,sequence=frame_sequence,sample_unix_ns=stamp,error=str(e),input_events_sent=0);value=publish_ui(value)
+                value=dict(protocol='uemw.ui',version=1,status='unavailable',pid=a.pid,session=a.session,sequence=frame_sequence,sample_unix_ns=stamp,error=str(e),input_events_sent=0)
+                try:value=publish_ui(value)
+                except BlockingIOError:
+                    # Startup/loading can fail capture while the consumer owns
+                    # the channel. A busy fault publication must not kill this
+                    # lane. Keep old stamps unchanged and try a new capture.
+                    drops+=1;wait_period(capture,began,period);continue
             menus=tuple(value.get('ui',{}).get('active_menus',[]))
             if time.monotonic()-last_log>=5 or value['status']!=last_status or menus!=last_menus:
                 print(json.dumps({k:v for k,v in value.items()if k!='textures'},separators=(',',':')),flush=True);last_log=time.monotonic();last_status=value['status']

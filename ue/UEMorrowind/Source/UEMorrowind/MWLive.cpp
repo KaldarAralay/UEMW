@@ -611,9 +611,9 @@ void AMWLive::CreateGeometryMaterial() {
     TerrainBlendEnabled=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_TERRAIN_BLEND"))!=TEXT("0");
     GeometryTextureParameter=TEXT("SpriteTexture");
     GeometryBaseMaterials.Empty();SkinBaseMaterials.Empty();
-    for(const auto* Mode:{TEXT("Opaque"),TEXT("Masked"),TEXT("Foliage"),TEXT("Translucent"),TEXT("Additive"),TEXT("Premultiplied"),TEXT("Modulate"),TEXT("Water"),TEXT("Terrain"),TEXT("Hair"),TEXT("Glass")}) {
+    for(const auto* Mode:{TEXT("Opaque"),TEXT("Masked"),TEXT("Foliage"),TEXT("Translucent"),TEXT("Additive"),TEXT("Premultiplied"),TEXT("Modulate"),TEXT("Water"),TEXT("Terrain"),TEXT("Hair"),TEXT("Glass"),TEXT("SunGlare")}) {
       for(bool EnvironmentMap:{false,true}) {
-        if(EnvironmentMap && (FString(Mode)==TEXT("Water") || FString(Mode)==TEXT("Terrain")))continue;
+        if(EnvironmentMap && (FString(Mode)==TEXT("Water") || FString(Mode)==TEXT("Terrain") || FString(Mode)==TEXT("SunGlare")))continue;
         const FString Suffix=EnvironmentMap?TEXT("_Env"):TEXT("");
         const FString Key=FString(Mode).ToLower()+(EnvironmentMap?TEXT("-environment"):TEXT(""));
         const FString BaseName=FString(TEXT("MW_"))+Mode+Suffix;
@@ -830,6 +830,10 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         StagePart=TEXT("materials");
         const FString& Key=Loader.MeshKeys[Loader.MeshIndex++];auto* Mesh=MeshData.Find(Key);
         FString Mode=Mesh->Terrain?TEXT("terrain"):Mesh->Water?TEXT("water"):Mesh->Glass?TEXT("glass"):Mesh->Foliage?TEXT("foliage"):Mesh->Character==2 && Mesh->Masked?TEXT("hair"):Data.AlphaModes.FindRef(Key);
+        if(Mesh->CelestialKind==7) {
+            if(Mode!=TEXT("translucent") || Mesh->SkinBones || !Mesh->TextureEffectGroup.IsEmpty())return Fail(TEXT("Unsupported native sunglare blend/layout"));
+            Mode=TEXT("sunglare");
+        }
         if(!Mesh->TextureEffectGroup.IsEmpty() && Mesh->TextureEffectSupported)Mode+=TEXT("-environment");
         auto* Base=Mesh->SkinBones?SkinBaseMaterials.FindRef(Mode):GeometryBaseMaterials.FindRef(Mode);
         if(!Base)return Fail(TEXT("Native material blend policy is unavailable"));

@@ -54,7 +54,7 @@ void AMWLive::InvalidateWaterReflection() {
 bool AMWLive::CanReflectPrimitive(UPrimitiveComponent* Component,const FString& Asset) const {
     const auto* D=MeshData.Find(Asset);
     if(!Component || !Component->IsVisible() || NativeHiddenPrimitives.Contains(TWeakObjectPtr<UPrimitiveComponent>(Component)) ||
-        !D || D->Water || D->FirstPerson || D->Rain)return false;
+        !D || D->Water || D->FirstPerson || D->Rain || D->CelestialKind==7)return false;
     // World transparency/emissive effects are real captured geometry too.
     // Camera-relative rain and foreground arms do not belong to this view.
     return true;
@@ -64,7 +64,7 @@ void AMWLive::UpdateWaterReflectionDefinition(const FString& Asset,const FMWMesh
     // Captured light sets/material values do not affect reflection membership.
     // Real inclusion/blend classification changes still force reconciliation.
     if(const auto* Old=MeshData.Find(Asset))if(Old->Water!=Next.Water || Old->FirstPerson!=Next.FirstPerson || Old->Rain!=Next.Rain ||
-        Old->Transparent!=Next.Transparent || Old->NativeParticle!=Next.NativeParticle)WaterReflectionMembershipDirty=true;
+        Old->Transparent!=Next.Transparent || Old->NativeParticle!=Next.NativeParticle || Old->CelestialKind!=Next.CelestialKind)WaterReflectionMembershipDirty=true;
 }
 
 void AMWLive::TrackWaterReflectionMember(UPrimitiveComponent* Component,const FString& Asset) {

@@ -249,8 +249,8 @@ class Geometry:
                 definition={**definition,'texture_animation':dict(id=flip['id'],frames=files)}
             shading={**definition.get('shading',dict(lit=False,emissive=[0.,0.,0.],fog=True,sky=False))}
             layer=shape.get('cell_key','')
-            if shape.get('particles') or layer in ('aux:sky','aux:weather','aux:world_effect'):shading['lit']=False
-            if layer=='aux:sky':shading.update(fog=False,background=True)
+            if shape.get('particles') or layer in ('aux:sky','aux:sun_glare','aux:weather','aux:world_effect'):shading['lit']=False
+            if layer in('aux:sky','aux:sun_glare'):shading.update(fog=False,background=True)
             if layer=='aux:water':shading['water']=True
             if layer=='view:first-person':shading['first_person']=True
             if layer=='aux:weather'and shape.get('texture','').replace('\\','/').rsplit('/',1)[-1].lower()=='tx_raindrop_01.tga':shading['rain']=True
@@ -651,6 +651,9 @@ class Geometry:
                 local,colors,uvs=attributes[ptr]
                 if skin is not None:
                     points=skin.deform(worlds,strict=True,vertices=local)
+                elif self.native_attributes[ptr].get('billboard'):
+                    from native_billboard import rigid_points
+                    points=rigid_points(local,transforms[index],anchor['camera'],raw[self.native_attributes[ptr]['billboard']])
                 else:
                     placement=matrix(transforms[index]);points=local@placement[:3,:3].T+placement[:3,3]
                 if uvs is not None:

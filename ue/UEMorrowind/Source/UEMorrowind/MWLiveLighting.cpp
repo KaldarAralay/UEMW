@@ -167,9 +167,9 @@ void AMWLive::SetCelestialFidelity(bool Enabled) {
     CelestialFidelityEnabled=Enabled;
     for(const auto& Pair:GeometryMaterials)ApplyVisualParameters(Pair.Value);
     for(const auto& Pair:SkinMaterials)ApplyVisualParameters(Pair.Value);
-    for(const auto& Pair:RigidBatches)if(Pair.Value)if(const auto* D=MeshData.Find(Pair.Key))if(D->Background)Pair.Value->SetTranslucentSortPriority(Enabled?MWCelestialPriority(D->CelestialKind):-100);
+    for(const auto& Pair:RigidBatches)if(Pair.Value)if(const auto* D=MeshData.Find(Pair.Key))if(D->Background)Pair.Value->SetTranslucentSortPriority(Enabled || D->CelestialKind==7?MWCelestialPriority(D->CelestialKind):-100);
     for(const auto& Pair:InstanceAssets)if(const auto* D=MeshData.Find(Pair.Value))if(D->Background) {
-        const int32 Priority=Enabled?MWCelestialPriority(D->CelestialKind):-100;
+        const int32 Priority=Enabled || D->CelestialKind==7?MWCelestialPriority(D->CelestialKind):-100;
         if(auto* C=GeometryComponents.FindRef(Pair.Key))C->SetTranslucentSortPriority(Priority);
         if(auto* C=SkinnedComponents.FindRef(Pair.Key))C->SetTranslucentSortPriority(Priority);
     }
@@ -177,7 +177,8 @@ void AMWLive::SetCelestialFidelity(bool Enabled) {
 }
 void AMWLive::UpdateCelestialShafts() {
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UpdateCelestialShafts);
-    bool SourceVisible=false;
+    bool SourceVisible=false,NativeGlare=false;
+    for(const auto& Pair:ViewInstances)if(const auto* D=MeshData.Find(Pair.Value))if(D->CelestialKind==7){NativeGlare=true;break;}
     for(const auto& Id:CelestialSunIds)if(VisibleInstances.Contains(Id))if(const auto* D=MeshData.Find(InstanceAssets.FindRef(Id))) {
         if(const auto* Value=CurrentMaterialValues.Find(D->MaterialValueGroup))if(Value->Tint.A<=.001f)continue;
         if(const auto* Pose=UploadedVertexPoses.Find(Id))if(Pose->Colors.Num()) {
@@ -185,7 +186,7 @@ void AMWLive::UpdateCelestialShafts() {
         }
         SourceVisible=true;break;
     }
-    const bool Enabled=MWCelestialShafts(CelestialFidelityEnabled && LightingReady && LightingSceneVisible && !VisualReference && GeometryActive,ActiveCellKey.StartsWith(TEXT("exterior:")),NativeUnderwater,SourceVisible,CelestialSunPeak);
+    const bool Enabled=MWCelestialShafts(CelestialFidelityEnabled && LightingReady && LightingSceneVisible && !VisualReference && GeometryActive,ActiveCellKey.StartsWith(TEXT("exterior:")),NativeUnderwater,SourceVisible,CelestialSunPeak,NativeGlare);
     CelestialShaftsActive=Enabled;
     if(NativeSun->bEnableLightShaftBloom!=Enabled) {
         NativeSun->bEnableLightShaftBloom=Enabled;

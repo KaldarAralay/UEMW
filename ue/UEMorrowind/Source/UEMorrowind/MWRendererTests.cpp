@@ -337,9 +337,13 @@ bool FMWOutdoorMaterialTest::RunTest(const FString&) {
     TestEqual(TEXT("Constellations retain a distinct background role"),MWCelestialKind(TEXT("Textures\\Tx_Stars_Mage.tga"),true),1);
     TestEqual(TEXT("Original lunar phase artwork is identified"),MWCelestialKind(TEXT("tx_masser_half_wan.dds"),true),2);
     TestEqual(TEXT("Moon shadow masks are not luminous discs"),MWCelestialKind(TEXT("tx_mooncircle_full_M.dds"),true),3);
+    TestEqual(TEXT("Original glare is separate from the sun disc"),MWCelestialKind(TEXT("Textures/tx_sun_flash_grey_05.dds"),true),7);
+    TestEqual(TEXT("World texture names do not acquire flare behavior"),MWCelestialKind(TEXT("tx_sun_flash_grey_05.dds"),false),0);
+    TestTrue(TEXT("Native glare composites after world translucency"),MWCelestialPriority(7)>0);
     TestTrue(TEXT("Native stars remain behind moon occlusion and clouds"),MWCelestialPriority(1)<MWCelestialPriority(3) && MWCelestialPriority(3)<MWCelestialPriority(2) && MWCelestialPriority(2)<MWCelestialPriority(5));
     TestTrue(TEXT("Native atmosphere remains behind constellations"),MWCelestialPriority(6)<MWCelestialPriority(1));
     TestTrue(TEXT("Visible native daylight can produce shafts"),MWCelestialShafts(true,true,false,true,.8f));
+    TestFalse(TEXT("Original flare replaces the additional UE bloom"),MWCelestialShafts(true,true,false,true,.8f,true));
     TestFalse(TEXT("Night cannot invent solar rays"),MWCelestialShafts(true,true,false,true,0));
     TestFalse(TEXT("Hidden original sun disables shafts"),MWCelestialShafts(true,true,false,false,.8f));
     TestFalse(TEXT("Underwater never receives the solar ray pass"),MWCelestialShafts(true,true,true,true,.8f));
@@ -866,6 +870,9 @@ bool FMWRenderSelectionTest::RunTest(const FString&) {
     TestFalse(TEXT("Native-hidden primitive cannot leak into a capture"),V->CanReflectPrimitive(Primitive,TEXT("0")));
     V->SetPrimitiveShown(Primitive,true);
     TestTrue(TEXT("Native visibility restoration also restores reflection eligibility"),V->CanReflectPrimitive(Primitive,TEXT("0")));
+    V->MeshData[TEXT("0")].CelestialKind=7;
+    TestFalse(TEXT("Native screen glare cannot leak into water reflections"),V->CanReflectPrimitive(Primitive,TEXT("0")));
+    V->MeshData[TEXT("0")].CelestialKind=0;
     TestFalse(TEXT("First-person geometry remains excluded from reflections"),V->CanReflectPrimitive(Primitive,TEXT("hand")));
     V->MeshData[TEXT("0")].Water=true;
     TestFalse(TEXT("Water does not recursively reflect itself"),V->CanReflectPrimitive(Primitive,TEXT("0")));
@@ -1199,6 +1206,7 @@ static void MWCheckMutableGPU(FAutomationTestBase& Test,UWorld* World) {
         if(Phase)Test.TestEqual(TEXT("Only the actually changed native channels are scheduled"),int32(Native->LastUploadMask),Phase==1?3:Phase==2?4:8);
         Reference->UpdateMeshSection_LinearColor(0,P,N,UV,C,T,false);
         const auto A=Image(Native),B=Image(Reference);Test.TestEqual(TEXT("Both real GPU paths return the whole image"),A.Num(),4096);Test.TestEqual(TEXT("Reference image extent matches"),B.Num(),A.Num());
+        Test.TestTrue(TEXT("Ordinary mutable world geometry retains occlusion queries"),Native->SceneProxy && Native->SceneProxy->CanBeOccluded());
         double Difference=0;int32 Visible=0,Changed=0;
         for(int32 I=0;I<FMath::Min(A.Num(),B.Num());++I){Difference+=FMath::Abs(A[I].R-B[I].R)+FMath::Abs(A[I].G-B[I].G)+FMath::Abs(A[I].B-B[I].B);Visible+=FMath::Max3(A[I].R,A[I].G,A[I].B)>.01f;if(Initial.IsValidIndex(I))Changed+=FMath::Max3(FMath::Abs(A[I].R-Initial[I].R),FMath::Abs(A[I].G-Initial[I].G),FMath::Abs(A[I].B-Initial[I].B))>.01f;}
         Test.TestTrue(TEXT("Actual mutable GPU triangles remain visible"),Visible>20);Test.TestTrue(TEXT("Selective uploads match the general UE path in real GPU pixels"),Difference<.01*FMath::Max(1,A.Num()));
@@ -1241,6 +1249,27 @@ static void MWCheckMutableGPU(FAutomationTestBase& Test,UWorld* World) {
     Test.TestTrue(TEXT("Modern normal updates match UE with an explicitly owned direct light"),ModernDifference<.01*FMath::Max(1,ModernNative.Num()));Test.TestTrue(TEXT("Owned UE direct lighting detects a normal-only upload"),ModernChanged>10);
     Sun->SetVisibility(false);const auto WithoutSun=Image(Native);int32 SunPixels=0;for(int32 I=0;I<FMath::Min(ModernNative.Num(),WithoutSun.Num());++I)SunPixels+=ModernNative[I].R+ModernNative[I].G+ModernNative[I].B>WithoutSun[I].R+WithoutSun[I].G+WithoutSun[I].B+.02f;
     Test.TestTrue(TEXT("Modern fixture detects actual owned light contribution"),SunPixels>10);Sun->DestroyComponent();
+    // Original glare is a native-alpha overlay, even behind world geometry.
+    auto* GlareBase=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/UEMW/Materials/MW_SunGlare.MW_SunGlare"));
+    Test.TestNotNull(TEXT("Cooked original glare policy exists"),GlareBase);
+    if(GlareBase) {
+        auto* Glare=UMaterialInstanceDynamic::Create(GlareBase,Owner);auto* Green=UMaterialInstanceDynamic::Create(Base,Owner);
+        auto* White=LoadObject<UTexture2D>(nullptr,TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+        for(auto* Material:{Glare,Green}){Material->CopyInterpParameters(M);Material->SetTextureParameterValue(TEXT("SpriteTexture"),White);Material->SetScalarParameterValue(TEXT("NativeLit"),0);}
+        Glare->SetVectorParameterValue(TEXT("NativeTint"),FLinearColor(1,0,0,.5));Green->SetVectorParameterValue(TEXT("NativeTint"),FLinearColor(0,1,0,1));
+        for(auto& Color:C)Color=FLinearColor::White;
+        Native->UpdateNativeSection(P,N,UV,{},{},C);Reference->UpdateMeshSection_LinearColor(0,P,N,UV,C,T,false);
+        Native->SetMaterial(0,Glare);Reference->SetMaterial(0,Green);Reference->SetWorldLocation(FVector(0,0,200));
+        const auto Behind=Image(Reference);
+        auto Composite=[&](){World->SendAllEndOfFrameUpdates();Capture->ShowOnlyComponents={Native,Reference};Capture->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Pixels);return Pixels;};
+        const auto WithGlare=Composite();Glare->SetVectorParameterValue(TEXT("NativeTint"),FLinearColor(1,0,0,0));const auto HiddenGlare=Composite();
+        int32 GreenPixels=0,FlarePixels=0;double HiddenDifference=0;
+        for(int32 I=0;I<FMath::Min3(Behind.Num(),WithGlare.Num(),HiddenGlare.Num());++I){GreenPixels+=Behind[I].G>.1f;FlarePixels+=Behind[I].G>.1f && WithGlare[I].R>Behind[I].R+.05f;HiddenDifference+=FMath::Abs(Behind[I].R-HiddenGlare[I].R)+FMath::Abs(Behind[I].G-HiddenGlare[I].G)+FMath::Abs(Behind[I].B-HiddenGlare[I].B);}
+        Test.TestTrue(TEXT("Owned world occluder actually rendered"),GreenPixels>20);
+        Test.TestTrue(TEXT("Native flare alpha composites over closer world depth"),FlarePixels>20);
+        Test.TestTrue(TEXT("Native zero alpha removes the glare exactly"),HiddenDifference<.001*FMath::Max(1,Behind.Num()));
+        Test.AddInfo(FString::Printf(TEXT("Owned sunglare GPU green=%d flare=%d hidden RGB difference=%.6f"),GreenPixels,FlarePixels,HiddenDifference));
+    }
     Capture->DestroyComponent();Native->DestroyComponent();Reference->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);Owner->Destroy();
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWVertexAttributeTest,"UEMW.Renderer.NativeVertexAttributes",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
@@ -1267,6 +1296,10 @@ bool FMWVertexAttributeTest::RunTest(const FString&) {
     auto* Mutable=Cast<UMWMutableMeshComponent>(Component);TestNotNull(TEXT("Native mutable resource uses selective GPU channels"),Mutable);
     if(Component) {
         TestEqual(TEXT("Background translucency draws before world precipitation"),Component->TranslucencySortPriority,-100);
+        if(FApp::CanEverRender()) {
+            World->SendAllEndOfFrameUpdates();FlushRenderingCommands();
+            TestTrue(TEXT("Background shader displacement cannot use near world occlusion bounds"),Component->SceneProxy && !Component->SceneProxy->CanBeOccluded());
+        }
         auto* Section=Component->GetProcMeshSection(0);TestNotNull(TEXT("Native mutable mesh section exists"),Section);
         if(Section && Section->ProcVertexBuffer.Num()==3)TestTrue(TEXT("Original vertex coordinates use exact axis mapping"),Section->ProcVertexBuffer[0].Position.Equals(FVector(2,1,3)));
         const int32 Updates=View->PerfVertexPoseUpdates;

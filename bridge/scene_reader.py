@@ -96,6 +96,10 @@ class SceneReader:
         from node_ownership import cell_roots
         own_cells=[(int(c['cell_ptr'],16),[int(p,16)for p in c['roots']])for c in cells]if cells is not None else [(cell,None)]
         cell_root_owners=cell_roots(self.r,own_cells)if owned_scene or any(a['layer']=='player'and a.get('owner_ref')for a in aux_roots or())else{}
+        # The original borrows glare for its near draw. Its weather slot owns
+        # lifetime/visibility; a temporary weapon-pass parent is not an owner.
+        from native_billboard import glare_owners
+        cell_root_owners.update(glare_owners(self.r,aux_roots))
         if cells is None:
             if roots is None:roots=scene_roots(self.r,cell)
             pending=[(p,False,(0,0,0,2),0,(),index>=2,'interior:'+hex(cell)) for index,p in enumerate(roots) if p]
@@ -252,6 +256,11 @@ class SceneReader:
                                    'material':hex(material),'color_mode':color_mode,'lighting_mode':lighting_mode,
                                    'transform':{'rotation':values[:9],'position':values[9:12],'scale':values[12]},'parents':parents,'terrain':terrain,
                                    'switch_gates':gates})
+                    if cell_key in('aux:sky','aux:sun_glare','view:first-person')and textures[texture].replace('\\','/').rsplit('/',1)[-1].lower().startswith('tx_sun'):
+                        for parent in reversed(parents):
+                            if 'NiBillboardNode'in self.ancestry(parent):
+                                if self.r.u32(parent+0x14)&0x60==0x40:shapes[-1]['rigid_billboard']=parent
+                                break
                     if strips:shapes[-1]['topology']='strips'
                     if lines:shapes[-1]['topology']='lines';counts['rendered_line_shapes']+=1;counts['rendered_line_segments']+=triangle_count
                     if environment_effects.get(effect_state):shapes[-1]['native_environment_effect']=hex(environment_effects[effect_state])

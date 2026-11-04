@@ -22,9 +22,10 @@ class FMWMutableProxy final : public FPrimitiveSceneProxy {
     FMaterialRenderProxy* Material;
     FMaterialRelevance Relevance;
     uint32 VertexCount=0;
+    bool NativeBackground=false;
 public:
     explicit FMWMutableProxy(UMWMutableMeshComponent* Component)
-        :FPrimitiveSceneProxy(Component),Factory(GetScene().GetFeatureLevel(),"UEMWMutableMesh") {
+        :FPrimitiveSceneProxy(Component),Factory(GetScene().GetFeatureLevel(),"UEMWMutableMesh"),NativeBackground(Component->NativeBackground) {
         const auto* S=Component->GetProcMeshSection(0);
         auto* M=Component->GetMaterial(0);if(!M)M=UMaterial::GetDefaultMaterial(MD_Surface);
         Material=M->GetRenderProxy();Relevance=M->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
@@ -41,7 +42,10 @@ public:
     virtual ~FMWMutableProxy(){Factory.ReleaseResource();Indices.ReleaseResource();Buffers.PositionVertexBuffer.ReleaseResource();Buffers.StaticMeshVertexBuffer.ReleaseResource();Buffers.ColorVertexBuffer.ReleaseResource();}
     virtual SIZE_T GetTypeHash() const override {static uint8 Identity;return reinterpret_cast<SIZE_T>(&Identity);}
     virtual uint32 GetMemoryFootprint() const override {return sizeof(*this)+VertexCount*sizeof(FDynamicMeshVertex)+Indices.Indices.GetAllocatedSize();}
-    virtual bool CanBeOccluded() const override {return !Relevance.bDisableDepthTest;}
+    // Sky WPO places original near bounds at background depth. Querying that
+    // near sphere causes false occlusion during movement; world depth testing
+    // still occludes the rendered sky. Ordinary geometry keeps its queries.
+    virtual bool CanBeOccluded() const override {return !NativeBackground && !Relevance.bDisableDepthTest;}
     virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override {
         FPrimitiveViewRelevance Out;Out.bDrawRelevance=IsShown(View);Out.bDynamicRelevance=true;Out.bShadowRelevance=IsShadowCast(View);
         Out.bRenderInMainPass=ShouldRenderInMainPass();Out.bRenderCustomDepth=ShouldRenderCustomDepth();Out.bUsesLightingChannels=GetLightingChannelMask()!=GetDefaultLightingChannelMask();

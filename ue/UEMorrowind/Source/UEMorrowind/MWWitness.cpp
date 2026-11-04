@@ -122,8 +122,8 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("sun_shadow_resolution_cap"),IConsoleManager::Get().FindConsoleVariable(TEXT("r.Shadow.MaxCSMResolution"))->GetInt());
     Out->SetNumberField(TEXT("surface_reflection_method"),(int32)Camera->PostProcessSettings.ReflectionMethod);
     Out->SetNumberField(TEXT("surface_reflection_intensity"),Camera->PostProcessSettings.ScreenSpaceReflectionIntensity);
-    int32 CelestialCounts[7]={};for(const auto& Pair:MeshData)if(Pair.Value.CelestialKind>0 && Pair.Value.CelestialKind<7)++CelestialCounts[Pair.Value.CelestialKind];
-    auto Celestial=MakeShared<FJsonObject>();const TCHAR* CelestialNames[]={TEXT("other"),TEXT("stars"),TEXT("moon"),TEXT("moon_mask"),TEXT("sun"),TEXT("cloud"),TEXT("atmosphere")};for(int32 I=1;I<7;++I)Celestial->SetNumberField(CelestialNames[I],CelestialCounts[I]);
+    int32 CelestialCounts[8]={};for(const auto& Pair:MeshData)if(Pair.Value.CelestialKind>0 && Pair.Value.CelestialKind<8)++CelestialCounts[Pair.Value.CelestialKind];
+    auto Celestial=MakeShared<FJsonObject>();const TCHAR* CelestialNames[]={TEXT("other"),TEXT("stars"),TEXT("moon"),TEXT("moon_mask"),TEXT("sun"),TEXT("cloud"),TEXT("atmosphere"),TEXT("glare")};for(int32 I=1;I<8;++I)Celestial->SetNumberField(CelestialNames[I],CelestialCounts[I]);
     Out->SetObjectField(TEXT("celestial_materials"),Celestial);Out->SetBoolField(TEXT("celestial_quality"),CelestialFidelityEnabled);Out->SetBoolField(TEXT("sun_shafts_active"),CelestialShaftsActive);
     int32 LeafMaterials=0,UpgradedLeaves=0;for(const auto& Pair:MeshData)if(Pair.Value.Foliage){++LeafMaterials;UpgradedLeaves+=UpgradedTextureKeys.Contains(Pair.Value.Texture)?1:0;}
     Out->SetNumberField(TEXT("foliage_materials"),LeafMaterials);Out->SetNumberField(TEXT("foliage_upgraded_materials"),UpgradedLeaves);Out->SetBoolField(TEXT("foliage_quality"),FoliageFidelityEnabled);

@@ -1,6 +1,7 @@
 #include "MWMesh.h"
 #include "MWCelestial.h"
 #include "MWLive.h"
+#include "MWMutableMesh.h"
 #include "Engine/StaticMesh.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
@@ -11,6 +12,7 @@ void MWNativeDrawLayer(UPrimitiveComponent* Component,const FMWMeshData& Data) {
     // Shader-displaced clouds retain near native CPU bounds. Distance sorting
     // alone can draw them over closer rain; keep background translucency first.
     Component->SetTranslucentSortPriority(Data.Background?MWCelestialPriority(Data.CelestialKind):0);
+    if(auto* Mutable=Cast<UMWMutableMeshComponent>(Component))Mutable->NativeBackground=Data.Background;
 }
 
 FTransform MWNativeTransform(const double* M) {

@@ -172,6 +172,10 @@ class Reader:
         if weather:
             raw=self.read(weather,0x80)
             for layer,offset in (('sky',0x4C),('weather',0x5C),('weather',0x60),('weather',0x6C)):add(layer,struct.unpack_from('<I',raw,offset)[0])
+            # Sunglare is borrowed by the native near pass, but is not a hand
+            # or weapon. Bind its authoritative weather-controller root first
+            # so draw/sheath and third-person gates cannot suppress it.
+            add('sun_glare',struct.unpack_from('<I',raw,0x8)[0])
         water=self.u32(data+0xB4EC)
         if water:
             raw=self.read(water,0xB8)
