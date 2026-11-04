@@ -163,6 +163,8 @@ class Geometry:
         self.weapon_state=weapon_signature(base)
         effect_targets={int(v['root'],16):v['target_ref']for v in aux if v.get('target_ref')}
         for shape in scene['shapes']:
+            from node_ownership import actor_geometry
+            shape['native_actor']=actor_geometry(shape,scene.get('actor_owners',{}))
             shape.pop('effect_target',None)
             for node in(*shape.get('parents',()),int(shape['id'],16)):
                 if node in effect_targets:shape['effect_target']=effect_targets[node]
@@ -196,7 +198,7 @@ class Geometry:
             # Only rigid world definitions qualify. Native poses, mutable sky,
             # water, particles, skins and first-person animation keep live lanes.
             eligible=recorder and not shape.get('particles')and shape.get('skin')=='0x0'and shape.get('controller','0x0')=='0x0'and not shape.get('cell_key','').startswith(('aux:','view:'))
-            descriptor=tuple(shape.get(k)for k in('model','skin','controller','texture','texture_property','material','color_mode','lighting_mode','alpha_mode','blend_native_opacity','alpha_flags','alpha_ref','vertex_count','triangle_count','generation','cell_key','terrain','native_lights','native_sun','native_environment_effect'))+(tuple(shape['transform']['position'])if shape.get('terrain')else None,)
+            descriptor=tuple(shape.get(k)for k in('model','skin','controller','texture','texture_property','material','color_mode','lighting_mode','alpha_mode','blend_native_opacity','alpha_flags','alpha_ref','vertex_count','triangle_count','generation','cell_key','terrain','native_lights','native_sun','native_environment_effect','native_actor'))+(tuple(shape['transform']['position'])if shape.get('terrain')else None,)
             cached=previous_definitions.get(shape['render_id'])if eligible else None
             if cached and cached[0]==descriptor and recorder.matches(cached[3]):
                 _,tag,prepared,dependencies=cached;definition,flip,material,mutable,*stage_extra=prepared
@@ -255,6 +257,7 @@ class Geometry:
             if layer=='view:first-person':shading['first_person']=True
             if layer=='aux:weather'and shape.get('texture','').replace('\\','/').rsplit('/',1)[-1].lower()=='tx_raindrop_01.tga':shading['rain']=True
             if shape.get('particles'):shading['native_particle']=True
+            shading['native_actor']=shape['native_actor']
             if 'native_lights'in shape:shading.update(native_lights=sorted(set(shape['native_lights'])),native_sun=shape['native_sun'])
             if source_roles.get(int(shape['id'],16))=='atmosphere':shading['sky']=True
             definition={**definition,'shading':shading}

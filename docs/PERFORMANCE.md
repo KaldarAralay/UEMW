@@ -1,5 +1,43 @@
 # Rendering hitches and transient visibility
 
+## Original shadow footprint and material response (light08)
+
+The previous native-diffuse adapter calculated source light energy, then multiplied both ambient and direct terms by texture-derived cavity. Inferred normals also changed the original diffuse calculation, and inferred metallic/specular finishes changed the UE response used to reproduce it. These additions could darken or brighten surfaces independently of the original light state. The matching path now uses source normals for native irradiance, omits the extra cavity multiplier and inferred metallic/specular BRDF for that path, and retains authored glow/gloss/environment stages. Inferred normal relief remains in the UE receiver/compensation path; the older non-native material paths remain available.
+
+The original real-time shadow setting controls actor shadows. The private game's read-only shadow level was 6. Our previous policy also let lit scenery cast: 447 world caster components competed with 182 actor components in the interior fixture, and 1,702 with 282 outdoors. The new optional catalog Boolean `shading.native_actor` comes from captured reference-owned ancestry, covering rigid heads/equipment and skinned bodies. Known scenery is a receiver; known actors retain caster eligibility. Older definitions without that metadata keep their previous behavior. Shadow maps remain enabled, with the existing four interior/two exterior local-light budget and sun cascades. Native hiding/removal still disables casters immediately; tests cover recovery and policy changes without stale eligibility returning.
+
+These two corrections must be assessed together. Material matching alone made some patches darker under the extra scenery shadows. No blanket shadow disable or warm-tint workaround was adopted. The original fixed-function shadow stencil, filter, exact actor/light selection and shadow slider/count behavior are not emulated by this UE policy.
+
+The comparisons use independent original-window captures, original albedo (`upgraded_textures == 0`), identical actual 1024x768 viewports, and console-paused camera/light values. HUD, console and tooltip regions were excluded. The prior policy is reproduced with diagnostic switches on the same final renderer binary; it agrees with the preserved previous build's first-room measurements within rounding. Mean absolute RGB errors use 0..255 byte values; smaller is closer to the same original frame.
+
+| Measured patch | Previous response and scenery shadows | Matching response and actor shadows |
+|---|---:|---:|
+| First room, left plaster | 2.857 | 1.112 |
+| First room, right plaster | 6.680 | 1.023 |
+| First room, lower door | 2.645 | 0.924 |
+| First room, floor | 5.278 | 4.298 |
+| Merchant, left plaster | 2.863 | 2.307 |
+| Merchant, right plaster | 4.899 | 3.255 |
+| Merchant, counter | 4.473 | 2.608 |
+| Merchant, robe | 4.577 | 3.720 |
+| Daylight, stone | 14.530 | 13.007 |
+| Daylight, door | 11.147 | 6.361 |
+| Daylight, ground | 15.425 | 2.171 |
+
+This is a visible, measured improvement across these patches, not whole-game pixel parity. Residual errors also appear in the unshadowed original-vertex reference: first-room floor 4.289, merchant robe 3.602, daylight stone/door 12.791/6.069. Their causes remain unresolved. The remaining work includes original diffuse/texture filtering, actor shadow projection/filtering, bounded/shared UE light compensation and enhanced foliage/effect response. Two interior cameras and one exterior camera do not cover arbitrary weather, materials or locations.
+
+The owned GPU test now compares **actual deferred direct lighting** against independently CPU-prelit native colours, with deliberate cavity/metal data. Previous mean linear RGB error was 0.012917; matching response reaches 0.000245 on both D3D11 and threaded D3D12. Existing static upload, Gouraud clamp and base-texture colour calculations still pass. All **411 source tests, 37 packaged renderer tests and eight GPU runs** pass, including actual moving point-light shadow pixels, native skin palettes, terrain, reflection membership and alpha boundaries.
+
+The live checks exposed an integration regression: adding actor ownership to the full-catalog shading dictionary changed the independent foreground reuse key. The raw converter lacked that irrelevant shadow annotation, so reuse failed; after equipping the sword an independent native graph had 18 sections while the near layout still had 12. The owned cache-rebinding test fails before correcting the key. It now canonicalizes that foreground-irrelevant metadata while still rejecting changed geometry or lighting. Source freshness, native transforms and hide checks were not relaxed. The final normal-launch test matched all 18 sections across 40 exact observations and two draws (485.6/443.1 ms including native animation and polling).
+
+The final **12-second normal-launch** exterior walk restored normal optional texture enhancement and disabled screenshot/trace/presentation-stat flags. CPU interval median/p95/max was **16.667/20.071/96.389 ms**, GPU time **2.172/3.381/8.595 ms**, with zero compatible-resource rebind hides. There is no measured overall pacing improvement or locked-60 claim. The 96.39 ms interval remains an open hitch. The prior unarmed-fixture walk reached 85.773 ms and is preserved; another pre-correction walk reached 39.817 ms. These are sequential, different allocation/streaming histories, not isolated performance comparisons. DXGI statistics were disabled.
+
+Excluded observations remain available: one source-frame copy was busy during the initial comparison, and the first cold normal-launch witness timed out before settling. Initial weapon checks also encountered an unarmed checkpoint and then the reproduced metadata regression. The completed test uses the existing native iron longsword, equipped through the original console; no item was added and no save was written. Misplaced provisional second-camera views outside the room were not used in metrics. The accepted merchant view was inside beside verified actor positions.
+
+The final package refresh includes the foreground Python fix; renderer executable/material inputs are unchanged from the accepted lighting captures, and the refreshed package has its own tests and manifest. The private game is paused with normal unified presentation. All 32 protected saves and original/private executables remain unchanged, with pinned graphics DLLs intact. No video recording or Steam-installation change was made. Source-only packaging and publication audit are refreshed separately from local game-derived evidence.
+
+Local evidence: `light08-results.json`, `light08-before-cases.json`, `light08-material-cases.json`, `light08-actor-cases.json`, `light08-{merchant,daylight}-cases.json` and their metrics/captures, `light08-native-shadow-config.json`, `light08-native-sword-topology.json`, `light08-near-metadata-rejected.log`, `light08-source-tests.log`, `light08-headless.log`, `light08-*-d3d*.log`, `light08-final-live.json`, `light08-final-walk-benchmark.json` and retained rejected observation logs. Captures, native data, logs and binaries remain local and excluded from source publication.
+
 ## Native lighting and neutral SDR output (light07)
 
 The build fixes four confirmed differences while retaining original light authority:

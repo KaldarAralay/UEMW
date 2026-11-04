@@ -8,6 +8,13 @@
 #include "Materials/MaterialInterface.h"
 #include "Components/PrimitiveComponent.h"
 
+bool MWNativeCastsShadow(const FMWMeshData& Data,bool ActorPolicy) {
+    // Vanilla real-time shadows are actor-owned. Older/owned definitions
+    // without classification retain their prior eligibility.
+    return Data.Lit && !Data.Sky && !Data.Background && !Data.Water && !Data.FirstPerson &&
+        (!ActorPolicy || !Data.HaveNativeActor || Data.NativeActor);
+}
+
 void MWNativeDrawLayer(UPrimitiveComponent* Component,const FMWMeshData& Data) {
     // Shader-displaced clouds retain near native CPU bounds. Distance sorting
     // alone can draw them over closer rain; keep background translucency first.

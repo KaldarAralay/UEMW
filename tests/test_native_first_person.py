@@ -10,7 +10,9 @@ class NearPassLaneTests(unittest.TestCase):
     def test_cached_rebinding_checks_real_converted_surface_and_never_substitutes_a_different_mesh(self):
         def check(lane,r,base):
             surface=dict(asset='geometry-content',texture='textures/owned.png',alpha_mode='opaque',shading=dict(lit=True,fog=True,sky=False,emissive=[0,0,0]))
-            lane.rows[0]['reuse']=surface_key(surface);cache=DefinitionCache(r);cache.ingest(lane.definition,'epoch')
+            # World-shadow ownership does not change a first-person surface.
+            # A full catalog carries it; the independent raw converter does not.
+            lane.rows[0]['reuse']=surface_key({**surface,'shading':{**surface['shading'],'native_actor':False}});cache=DefinitionCache(r);cache.ingest(lane.definition,'epoch')
             r.read=lambda p,n:header((3,0))[:n]
             graph=dict(shapes=[dict(id='0x20000',model='0x3',skin='0x0',parents=[0x70000],texture='owned.dds')])
             with patch('game_assets.Assets')as assets,patch('native_attributes.discover',return_value=None),patch('material_values.discover',return_value=None),patch('native_materials.discover',return_value=None):

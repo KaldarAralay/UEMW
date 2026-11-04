@@ -184,6 +184,8 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
     interior_diffuse=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeInteriorDiffuse',default_value=0.)
     exterior_diffuse=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeExteriorDiffuse',default_value=0.)
     shadowed_diffuse=expression(m,u.MaterialExpressionAdd);link(interior_diffuse,'',shadowed_diffuse,'A');link(exterior_diffuse,'',shadowed_diffuse,'B')
+    material_match=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeMaterialMatch',default_value=1.)
+    native_response=expression(m,u.MaterialExpressionMultiply);link(shadowed_diffuse,'',native_response,'A');link(material_match,'',native_response,'B')
     lighting=custom_node(m,'native_lighting.hlsl',('Environment','Position','Normal','Lit','LightMask','MaskActive','SunActive'))
     for e,n in((light_mask,'LightMask'),(mask_active,'MaskActive'),(object_sun,'SunActive')):link(e,'',lighting,n)
     for e,pin,n in ((environment,'','Environment'),(world_position,'','Position'),(normal_node,normal_pin,'Normal'),(lit,'','Lit')):link(e,pin,lighting,n)
@@ -239,8 +241,13 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
     for e,pin,n in ((environment,'','Environment'),(surface_position,'','Position'),(interpolated_normal,'','Normal'),(lit,'','Lit'),(interpolated,'','VertexLighting'),(detail,'','Detail')):link(e,pin,surface,n)
     if solid:
         exterior_normal=expression(m,u.MaterialExpressionLinearInterpolate)
-        link(interpolated_normal,'',exterior_normal,'A');link(normal_detail,'',exterior_normal,'B');link(shadowed_diffuse,'',exterior_normal,'Alpha');link(exterior_normal,'',surface,'Normal')
-        solar_base=custom_node(m,'native_exterior_colour.hlsl',('Environment','LinearBase','Lighting','Normal','SunActive','Active','Position','LightMask','Exterior','VertexColour','Apply','StagesActive'))
+        link(interpolated_normal,'',exterior_normal,'A');link(normal_detail,'',exterior_normal,'B');link(shadowed_diffuse,'',exterior_normal,'Alpha')
+        # Authored irradiance uses the native normal. Inferred relief remains
+        # in UE's shadow receiver, so its normal is used only for compensation.
+        irradiance_normal=expression(m,u.MaterialExpressionLinearInterpolate);link(exterior_normal,'',irradiance_normal,'A');link(interpolated_normal,'',irradiance_normal,'B');link(native_response,'',irradiance_normal,'Alpha');link(irradiance_normal,'',surface,'Normal')
+        native_cavity=expression(m,u.MaterialExpressionLinearInterpolate,const_b=1.);link(normal_detail,'Cavity',native_cavity,'A');link(native_response,'',native_cavity,'Alpha')
+        solar_base=custom_node(m,'native_exterior_colour.hlsl',('Environment','LinearBase','Lighting','Normal','NativeNormal','SunActive','Active','Position','LightMask','Exterior','VertexColour','Apply','StagesActive'))
+        link(irradiance_normal,'',solar_base,'NativeNormal')
         for e,n in ((vertex_rgb,'VertexColour'),(apply_mode,'Apply'),(stages_active,'StagesActive')):link(e,'',solar_base,n)
         link(exterior_diffuse,'',solar_base,'Exterior')
         native_fill=u.CustomOutput();native_fill.set_editor_property('output_name','AmbientLocal');native_fill.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT3);solar_base.set_editor_property('additional_outputs',[native_fill])
@@ -320,7 +327,7 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
         choice=expression(m,u.MaterialExpressionLinearInterpolate)
         link(final_color,'',choice,'A');link(modern_emission,'',choice,'B');link(modern,'',choice,'Alpha')
         final_color=choice
-        exterior_fill=expression(m,u.MaterialExpressionMultiply);link(solar_base,'AmbientLocal',exterior_fill,'A');link(normal_detail,'Cavity',exterior_fill,'B')
+        exterior_fill=expression(m,u.MaterialExpressionMultiply);link(solar_base,'AmbientLocal',exterior_fill,'A');link(native_cavity,'',exterior_fill,'B')
         exterior_emission=expression(m,u.MaterialExpressionAdd);link(exterior_fill,'',exterior_emission,'A');link(emitted,'',exterior_emission,'B')
         exterior_choice=expression(m,u.MaterialExpressionLinearInterpolate)
         link(final_color,'',exterior_choice,'A');link(exterior_emission,'',exterior_choice,'B');link(shadowed_diffuse,'',exterior_choice,'Alpha');final_color=exterior_choice
@@ -399,7 +406,7 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
         active=expression(m,u.MaterialExpressionMultiply);link(modern,'',active,'A');link(lit,'',active,'B')
         fade=expression(m,u.MaterialExpressionMultiply);link(active,'',fade,'A');link(fog,'Transmittance',fade,'B')
         base=expression(m,u.MaterialExpressionMultiply);link(rgb,'',base,'A');link(fade,'',base,'B')
-        exterior_base=expression(m,u.MaterialExpressionMultiply);link(solar_base,'',exterior_base,'A');link(normal_detail,'Cavity',exterior_base,'B')
+        exterior_base=expression(m,u.MaterialExpressionMultiply);link(solar_base,'',exterior_base,'A');link(native_cavity,'',exterior_base,'B')
         chosen_base=expression(m,u.MaterialExpressionLinearInterpolate);link(rgb,'',chosen_base,'A');link(exterior_base,'',chosen_base,'B');link(shadowed_diffuse,'',chosen_base,'Alpha');link(chosen_base,'',base,'A')
         if label=='Foliage':
             leaf_quality=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeFoliageQuality',default_value=1.)
@@ -423,6 +430,9 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
             if label=='Terrain' and parameter=='NativeSpecular':node=terrain;pin='SpecularOut'
             if parameter!='NativeRoughness':
                 scaled=expression(m,u.MaterialExpressionMultiply);link(node,pin,scaled,'A');link(fade,'',scaled,'B');node=scaled
+            # The supported original draws have no inferred metallic/specular
+            # BRDF. Their authored environment/gloss stages remain in emission.
+            matched=expression(m,u.MaterialExpressionLinearInterpolate,const_b=0.);link(node,'',matched,'A');link(native_response,'',matched,'Alpha');node=matched
             output(node,'',m,prop)
     alpha_settings=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeAlphaTest',default_value=u.LinearColor(0,0,0,0))
     if transparent:

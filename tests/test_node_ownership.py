@@ -1,7 +1,7 @@
 import struct
 import unittest
 import numpy as np
-from node_ownership import identity,discover,player_owner
+from node_ownership import identity,discover,player_owner,actor_geometry
 from live_probe import SceneReadChanged
 from pose_frame import PoseLayout,PoseFrame
 from test_pose_frame import header,CAMERA
@@ -14,6 +14,17 @@ def reference(node=0x10000,flags=0,target=12):
 
 
 class OwnershipTests(unittest.TestCase):
+    def test_actor_geometry_uses_reference_owned_ancestry_for_rigid_and_skinned_parts(self):
+        owners={0x1000:dict(reference=0x9000)}
+        self.assertTrue(actor_geometry(dict(id='0x1000'),owners))
+        self.assertTrue(actor_geometry(dict(id='0x2000',parents=(0x3000,0x1000)),owners))
+        self.assertFalse(actor_geometry(dict(id='0x2000',parents=(0x3000,)),owners))
+
+    def test_actor_names_and_same_cell_do_not_turn_scenery_into_a_shadow_actor(self):
+        shape=dict(id='0x2000',parents=(0x3000,),name='NPC head',texture='TX_B_head.dds',cell_key='interior')
+        self.assertFalse(actor_geometry(shape,{0x4000:dict(role='interior')}))
+        self.assertFalse(actor_geometry(shape,{}))
+
     def test_actor_render_parent_can_change_but_native_reference_and_node_identity_must_match(self):
         root=bytearray(header());struct.pack_into('<2I',root,0,0x1234,0);struct.pack_into('<I',root,0x18,0x90000)
         raw={0x10000:bytes(root),0x20000:header((3,0)),0x60000:reference()}

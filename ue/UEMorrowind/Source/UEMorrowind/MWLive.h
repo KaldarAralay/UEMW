@@ -77,6 +77,7 @@ struct FMWMeshData {
     bool NativeParticle=false,Glass=false,BlendFiltered=false,Transparent=false,Lines=false;
     TArray<FString> NativeLightSet;
     bool HaveNativeLightSet=false,NativeSunActive=true;
+    bool HaveNativeActor=false,NativeActor=false;
 };
 struct FMWBinding {FString Id,Asset,Cell;FMWResourceIdentity Continuity;};
 struct FMWRigidSlot {FString Asset;int32 Id;};
@@ -178,6 +179,7 @@ public:
     bool AmbientProbeEnabled=true;
     bool LightingFidelityEnabled=true,StableLightingEnabled=true;
     int32 NativeIrradianceMode=1,LightingReferenceMode=0; // pixel / original vertex; diagnostics default off
+    bool NativeMaterialMatch=true,NativeActorShadows=true;
     UPROPERTY() UStaticMeshComponent* DiagnosticColourRamp=nullptr;
     double DiagnosticColourRampUntil=0;
     void SetDiagnosticColourRamp(bool Enabled);
@@ -354,6 +356,8 @@ private:
     void HideRigid(const FString& Id);
     void FlushRigidBatches();
     void SetPrimitiveShown(UPrimitiveComponent* Component,bool Shown);
+    void SetNativeCastShadow(UPrimitiveComponent* Component,const FMWMeshData& Data);
+    void ApplyNativeShadowPolicy();
     void ClearPrimitiveFilters();
     FMWFrameReader* FrameReader=nullptr;
     FMWCameraReader* CameraReader=nullptr;

@@ -13,6 +13,20 @@
 #include "Misc/ScopeExit.h"
 #include "GameFramework/PlayerController.h"
 
+void AMWLive::SetNativeCastShadow(UPrimitiveComponent* Component,const FMWMeshData& Data) {
+    if(!Component)return;
+    static const FName Tag(TEXT("UEMWShadowCaster"));
+    const bool Eligible=!AuxiliaryGeometry && MWNativeCastsShadow(Data,NativeActorShadows);
+    if(Eligible)Component->ComponentTags.AddUnique(Tag);else Component->ComponentTags.Remove(Tag);
+    Component->SetCastShadow(Eligible && Component->GetVisibleFlag() && !NativeHiddenPrimitives.Contains(TWeakObjectPtr<UPrimitiveComponent>(Component)));
+}
+
+void AMWLive::ApplyNativeShadowPolicy() {
+    for(const auto& Pair:RigidBatches)if(const auto* D=MeshData.Find(Pair.Key))SetNativeCastShadow(Pair.Value,*D);
+    for(const auto& Pair:GeometryComponents)if(const auto* D=MeshData.Find(InstanceAssets.FindRef(Pair.Key)))SetNativeCastShadow(Pair.Value,*D);
+    for(const auto& Pair:SkinnedComponents)if(const auto* D=MeshData.Find(InstanceAssets.FindRef(Pair.Key)))SetNativeCastShadow(Pair.Value,*D);
+}
+
 void AMWLive::SetPrimitiveShown(UPrimitiveComponent* Component,bool Shown) {
     if(!Component)return;
     if(DiagnosticVisibility && Component->IsA<UMWNativeSkinComponent>()) {
@@ -108,7 +122,7 @@ bool AMWLive::PrepareRigidBatch(const FString& Asset) {
     if(!D || !Mesh || !Material)return false;
     auto* Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);Batch->SetStaticMesh(Mesh);Batch->SetMaterial(0,Material);
     MWNativeDrawLayer(Batch,*D);
-    Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);Batch->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Batch->SetRenderCustomDepth(D->Water);Batch->SetCustomDepthStencilValue(1);
+    Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);SetNativeCastShadow(Batch,*D);Batch->SetRenderCustomDepth(D->Water);Batch->SetCustomDepthStencilValue(1);
     Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);TrackWaterReflectionMember(Batch,Asset);
     // Capacity has no pose authority. Only the next fresh native packet can
     // put an instance into this initially empty batch.
@@ -168,7 +182,7 @@ bool AMWLive::PrepareMutableResource(const FString& Id,const FString& Asset) {
     PrepareResourceIdentity(Id,Asset);auto* C=GeometryComponents.FindRef(Id);
     if(!C) {
         C=D->Lines?static_cast<UProceduralMeshComponent*>(NewObject<UMWNativeLineComponent>(this)):NewObject<UMWMutableMeshComponent>(this);C->SetMobility(EComponentMobility::Movable);MWNativeDrawLayer(C,*D);
-        C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetSimulatePhysics(false);C->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);C->SetRenderCustomDepth(D->Water);C->SetCustomDepthStencilValue(1);C->bUseAsyncCooking=false;C->SetAbsolute(true,true,true);C->SetWorldTransform(FTransform::Identity);
+        C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetSimulatePhysics(false);SetNativeCastShadow(C,*D);C->SetRenderCustomDepth(D->Water);C->SetCustomDepthStencilValue(1);C->bUseAsyncCooking=false;C->SetAbsolute(true,true,true);C->SetWorldTransform(FTransform::Identity);
         GeometryComponents.Add(Id,C);TrackWaterReflectionMember(C,Asset);
     }
     if(C->GetNumSections()==0) {
@@ -332,7 +346,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 MID->CopyInterpParameters(Material);MID->SetScalarParameterValue(TEXT("NativeViewActive"),0);
                 auto* C=NewObject<UMWNativeSkinComponent>(this);C->UseNativeBounds=false;C->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(C,*D);C->SetAbsolute(true,true,true);C->SetStaticMesh(Mesh);C->SetMaterial(0,MID);
-                C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetSimulatePhysics(false);C->SetCastShadow(false);
+                C->SetCollisionEnabled(ECollisionEnabled::NoCollision);C->SetSimulatePhysics(false);SetNativeCastShadow(C,*D);
                 C->RegisterComponent();SetPrimitiveShown(C,false);SkinnedComponents.Add(Job.Id,C);SkinMaterials.Add(Job.Id,MID);TrackWaterReflectionMember(C,Job.Asset);
             }
         }
@@ -354,7 +368,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
                 MWNativeDrawLayer(Component,*D);
                 SetPrimitiveShown(Component,false);UploadedBonePalettes.Remove(Job.Id);
                 Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);Component->SetStaticMesh(Mesh);Component->SetMaterial(0,Skin);
-                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && D->Lit && !D->Sky && !D->Background && !D->Water);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
+                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);SetNativeCastShadow(Component,*D);Component->SetRenderCustomDepth(D->Water);Component->SetCustomDepthStencilValue(1);
                 Component->SetNativeBounds(Job.Bound);Component->RegisterComponent();
                 PaletteTextures.Add(Job.Id,Palette);SkinMaterials.Add(Job.Id,Skin);SkinnedComponents.Add(Job.Id,Component);TrackWaterReflectionMember(Component,Job.Asset);
             }

@@ -49,6 +49,8 @@ Unified presentation keeps the small GPU-only inventory portrait on the original
 
 The packaged client defaults to D3D12/SM5 with a separate rendering submission thread. Unified mode uses capped VSync on measured 59/60 Hz outputs. For a D3D11-only GPU or a backend-specific problem, run `Start-UEMW-Unified.cmd -RHI d3d11` (or `Start-UEMW.cmd -RHI d3d11` for separate windows). This switches only this project's renderer; it leaves the original game running.
 
+Native lighting matching preserves the original diffuse colour and authored glow/environment stages. Actor bodies and equipment cast UE shadows; scenery receives those shadows without adding the previous building/prop casters. Shadow filtering, some materials/effects and frame pacing remain approximate; see the status and performance notes.
+
 `Stop-UE-View.cmd` closes UE and its bridge while leaving the game open. Save/exit the original normally. `Stop-UEMW.cmd` force-stops the whole private session, discarding unsaved progress. Normal launches do not record video or screenshots.
 
 Your private game/saves are under `local/Morrowind`; converted assets are under `local/assets`. They are generated from **your own** game and must not be committed or uploaded as source. All game/engine assets, binaries, downloads and local diagnostics are excluded from Git. See [third-party notices](THIRD_PARTY_NOTICES.md).

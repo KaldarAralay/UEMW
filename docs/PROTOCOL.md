@@ -2,6 +2,8 @@
 
 This is a local single-user protocol between the original-game reader and UE. It contains observed render state, not gameplay commands. Counts, formats and identity/freshness checks are enforced in both implementations; malformed data fails closed. No network listener is used.
 
+Immutable mesh `shading.native_actor`, when present, is a Boolean derived from captured native actor-reference ancestry. It covers rigid attachments as well as skinned body geometry and participates in the asset/continuity identity. The matching shadow policy restricts casters to those actors; scenery remains a receiver. Absence preserves legacy eligibility for older definitions. This additive catalog metadata does not change the motion wire format, relax native visibility or identify the original shadow stencil/filter as a UE shadow map.
+
 ## Identity and world transport
 
 Every committed world snapshot is bound to the original PID, bridge session UUID, scene-epoch UUID, monotonically increasing sequence and original capture timestamp. Catalog bindings define immutable ordered `(render id, asset)` entries, with cell generation/ownership metadata. Loading and scene changes invalidate old identities. Newly allocated native addresses do not inherit a retired object's lifetime.

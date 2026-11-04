@@ -35,6 +35,11 @@ def cell_root_matches(raw,checks):
     try:return all(struct.unpack_from('<I',raw[address])[0]==pointer for address,pointer in checks)
     except(KeyError,struct.error):return False
 
+def actor_geometry(shape,owners):
+    """Classify actual reference-owned actor ancestry, never texture/name guesses."""
+    return any(node in owners for node in (*shape.get('parents',()),int(shape['id'],16)))
+
+
 def player_owner(reader,reference,node,cell_root):
     raw=reader.read(reference,0x50);key=identity(raw)
     if key[1]!=node or not matches(raw,key):raise SceneReadChanged('Player render reference changed')

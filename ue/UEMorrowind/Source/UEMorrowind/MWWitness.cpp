@@ -1,6 +1,7 @@
 #include "MWLive.h"
 #include "MWMesh.h"
 #include "Components/StaticMeshComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "DynamicRHI.h"
 #include "RenderingThread.h"
 #include "HAL/PlatformOutputDevices.h"
@@ -134,6 +135,14 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetBoolField(TEXT("lighting_fidelity"),LightingFidelityEnabled);
     Out->SetNumberField(TEXT("native_irradiance_mode"),NativeIrradianceMode);
     Out->SetNumberField(TEXT("native_light_reference_mode"),LightingReferenceMode);
+    Out->SetBoolField(TEXT("native_material_match"),NativeMaterialMatch);
+    Out->SetBoolField(TEXT("native_actor_shadows"),NativeActorShadows);
+    int32 ActorCasters=0,WorldCasters=0;
+    auto CountCaster=[&](const UPrimitiveComponent* C,const FMWMeshData* D){if(C && C->CastShadow && D && D->HaveNativeActor){if(D->NativeActor)++ActorCasters;else ++WorldCasters;}};
+    for(const auto& Pair:RigidBatches)CountCaster(Pair.Value,MeshData.Find(Pair.Key));
+    for(const auto& Pair:GeometryComponents)CountCaster(Pair.Value,MeshData.Find(InstanceAssets.FindRef(Pair.Key)));
+    for(const auto& Pair:SkinnedComponents)CountCaster(Pair.Value,MeshData.Find(InstanceAssets.FindRef(Pair.Key)));
+    Out->SetNumberField(TEXT("actor_shadow_casters"),ActorCasters);Out->SetNumberField(TEXT("world_shadow_casters"),WorldCasters);
     Out->SetBoolField(TEXT("stable_lighting"),StableLightingEnabled);
     Out->SetBoolField(TEXT("shadow_maps"),NativeShadowMapsEnabled);
     Out->SetBoolField(TEXT("interior_shadowed_diffuse"),LightingFidelityEnabled && !VisualReference && !ActiveCellKey.StartsWith(TEXT("exterior:")));
@@ -265,6 +274,9 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
         bool Shown=RigidVisible.Contains(Id);
         auto Visible=[&](UPrimitiveComponent* C){return C && C->IsRegistered() && C->GetVisibleFlag() && (!PC || !PC->HiddenPrimitiveComponents.Contains(TWeakObjectPtr<UPrimitiveComponent>(C)));};
         Shown|=Visible(SkinnedComponents.FindRef(Id)) || Visible(GeometryComponents.FindRef(Id));
+        if(const auto* D=MeshData.Find(InstanceAssets.FindRef(Id))){Row->SetBoolField(TEXT("native_actor_known"),D->HaveNativeActor);Row->SetBoolField(TEXT("native_actor"),D->NativeActor);}
+        const UPrimitiveComponent* Caster=SkinnedComponents.FindRef(Id);if(!Caster)Caster=GeometryComponents.FindRef(Id);if(!Caster)if(const auto* Slot=RigidSlots.Find(Id))Caster=RigidBatches.FindRef(Slot->Asset);
+        Row->SetBoolField(TEXT("casts_shadow"),Caster && Caster->CastShadow);
         Row->SetBoolField(TEXT("submitted_visible"),Live && Shown);Row->SetBoolField(TEXT("current_pose_visible"),VisibleInstances.Contains(Id));
         Row->SetStringField(TEXT("resource_expected_asset"),ResourceBindings.FindRef(Id));
         Row->SetStringField(TEXT("near_asset"),ViewLaneAssets.FindRef(Id));
@@ -359,10 +371,13 @@ void AMWLive::PublishStateWitness() {
         !Request->TryGetNumberField(TEXT("unix_ns"),Stamp) || !FMath::IsFinite(Stamp) || Now<Stamp/1e9 || Now-Stamp/1e9>30 ||
         !Request->TryGetArrayField(TEXT("ids"),Values) || Values->Num()>64)return;
     TArray<FString> Ids;for(const auto& V:*Values){FString Id;if(!V.IsValid() || !V->TryGetString(Id) || Id.IsEmpty() || Id.Len()>96)return;Ids.Add(Id);}
+    if(Request->HasField(TEXT("native_actor_shadows"))){bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("native_actor_shadows"),Enabled))return;NativeActorShadows=Enabled;ApplyNativeShadowPolicy();}
     if(Request->HasField(TEXT("native_colour_ramp"))){bool Enabled=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("native_colour_ramp"),Enabled))return;SetDiagnosticColourRamp(Enabled);}
-    if(Request->HasField(TEXT("native_light_reference")) || Request->HasField(TEXT("native_irradiance"))) {
+    if(Request->HasField(TEXT("native_light_reference")) || Request->HasField(TEXT("native_irradiance")) || Request->HasField(TEXT("native_material_match"))) {
         if(!DiagnosticScreenshots)return;
         int32 Reference=LightingReferenceMode,Irradiance=NativeIrradianceMode;FString Mode;
+        bool MaterialMatch=NativeMaterialMatch;
+        if(Request->HasField(TEXT("native_material_match")) && !Request->TryGetBoolField(TEXT("native_material_match"),MaterialMatch))return;
         if(Request->HasField(TEXT("native_light_reference"))) {
             if(!Request->TryGetStringField(TEXT("native_light_reference"),Mode) || (Mode!=TEXT("off") && Mode!=TEXT("pixel") && Mode!=TEXT("vertex")))return;
             Reference=Mode==TEXT("off")?0:Mode==TEXT("pixel")?1:2;
@@ -372,6 +387,7 @@ void AMWLive::PublishStateWitness() {
             Irradiance=Mode==TEXT("vertex")?0:1;
         }
         LightingReferenceMode=Reference;NativeIrradianceMode=Irradiance;
+        NativeMaterialMatch=MaterialMatch;
         for(const auto& Pair:GeometryMaterials){ApplyVisualParameters(Pair.Value);if(const auto* D=MeshData.Find(Pair.Key))ApplyNativeLightSet(Pair.Value,*D);}
         for(const auto& Pair:SkinMaterials){ApplyVisualParameters(Pair.Value);if(const auto* Asset=InstanceAssets.Find(Pair.Key))if(const auto* D=MeshData.Find(*Asset))ApplyNativeLightSet(Pair.Value,*D);}
         SetLightingVisible(LightingSceneVisible);NativePoseValid=false;

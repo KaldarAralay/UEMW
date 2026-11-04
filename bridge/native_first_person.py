@@ -22,6 +22,10 @@ NAME=re.compile(r'view-[0-9a-f]{64}\.json\Z')
 
 def surface_key(definition,weights=None):
     shading=dict(definition['shading']);shading.pop('first_person',None)
+    # Foreground geometry cannot cast world shadows. Full catalogs carry this
+    # ownership annotation, but independent raw conversion does not; it must
+    # not invalidate reuse of otherwise identical native geometry/materials.
+    shading.pop('native_actor',None)
     return json.dumps([definition['asset'],definition['texture'],definition.get('alpha_mode','opaque'),definition.get('blend_native_opacity',True),definition.get('alpha_test'),shading,weights,definition.get('texture_stages'),definition.get('environment_map')],sort_keys=True,separators=(',',':'))
 
 

@@ -8,6 +8,7 @@ if(global.a<.5)return 0;
 float3 b=max(LinearBase,0);
 float3 encoded=lerp(12.92*b,1.055*pow(b,1.0/2.4)-.055,step(.0031308,b));
 float3 N=normalize(Normal);
+float3 sourceN=normalize(NativeNormal);
 float3 sun=max(Environment.Load(int3(1,0,0)).rgb,0);
 float3 direction=normalize(Environment.Load(int3(2,0,0)).rgb);
 float ndl=max(dot(N,-direction),0);
@@ -57,7 +58,7 @@ uint count=min(32u,(uint)round(Environment.Load(int3(4,0,0)).z));
         }
     }
     float cosine=max(dot(N,D),0);
-    if(member)unshadowed+=attenuation*(ambient.rgb+diffuse.rgb*cosine*(represented?1-shadowWeight:1));
+    if(member)unshadowed+=attenuation*(ambient.rgb+diffuse.rgb*max(dot(sourceN,D),0)*(represented?1-shadowWeight:1));
     if(represented) {
         float3 rgb=max(diffuse.rgb/pk,0);
         rgb=lerp(rgb/12.92,pow((rgb+.055)/1.055,2.4),step(.04045,rgb));

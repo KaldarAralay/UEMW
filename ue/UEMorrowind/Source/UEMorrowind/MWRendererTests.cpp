@@ -446,6 +446,12 @@ bool FMWLightingTest::RunTest(const FString&) {
     TestTrue(TEXT("Stone stays rougher than wood"),MWArtworkFinish(TEXT("tx_stone.dds")).Roughness>MWArtworkFinish(TEXT("tx_wood.dds")).Roughness);
     TestEqual(TEXT("Plant names do not imply metal"),MWArtworkFinish(TEXT("Tx_goldkanet_01.tga")).Metallic,0.f);
     TestEqual(TEXT("Wood Elf skin does not become wood"),MWArtworkFinish(TEXT("TX_B_N_Wood Elf_M_H02.bmp")).Roughness,.64f);
+    FMWMeshData Caster;Caster.HaveNativeActor=true;
+    TestFalse(TEXT("Known scenery does not acquire non-native actor shadows"),MWNativeCastsShadow(Caster,true));
+    TestTrue(TEXT("Explicit enhanced comparison retains scenery shadows"),MWNativeCastsShadow(Caster,false));
+    Caster.NativeActor=true;TestTrue(TEXT("Reference-owned rigid or skinned actor can cast"),MWNativeCastsShadow(Caster,true));
+    Caster.FirstPerson=true;TestFalse(TEXT("First-person arms are not world shadow casters"),MWNativeCastsShadow(Caster,true));
+    Caster.FirstPerson=false;Caster.NativeActor=false;Caster.HaveNativeActor=false;TestTrue(TEXT("Older unclassified definitions retain eligibility"),MWNativeCastsShadow(Caster,true));
     FVector4f Row[8];for(auto& V:Row)V=FVector4f(0,0,0,0);
     Row[0]=FVector4f(10,20,30,2);Row[1].W=1;Row[2]=FVector4f(1,.5f,.25f,256);Row[3]=FVector4f(0,0,-1,.5f);Row[4]=FVector4f(1,0,0,1);
     auto Light=MWNativeLightSettings(Row);
@@ -480,6 +486,16 @@ bool FMWLightingTest::RunTest(const FString&) {
     auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);if(!V)return false;
     auto* Function=LoadObject<UMaterial>(nullptr,TEXT("/Game/UEMW/Materials/MW_NativeAttenuation.MW_NativeAttenuation"));TestNotNull(TEXT("Native attenuation material is actually cooked"),Function);
     if(Function)TestEqual(TEXT("Falloff is a light function, not another scene light"),Function->MaterialDomain,MD_LightFunction);
+    auto* CasterComponent=NewObject<UStaticMeshComponent>(V);
+    Caster.HaveNativeActor=true;Caster.NativeActor=false;
+    V->SetNativeCastShadow(CasterComponent,Caster);V->SetPrimitiveShown(CasterComponent,false);V->SetPrimitiveShown(CasterComponent,true);
+    TestFalse(TEXT("Scenery cannot regain a shadow during a hide/show cycle"),CasterComponent->CastShadow);
+    Caster.NativeActor=true;V->SetNativeCastShadow(CasterComponent,Caster);V->SetPrimitiveShown(CasterComponent,false);
+    TestFalse(TEXT("Native-hidden actors lose their shadow immediately"),CasterComponent->CastShadow);
+    V->SetPrimitiveShown(CasterComponent,true);TestTrue(TEXT("Fresh visible actors recover their eligible shadow"),CasterComponent->CastShadow);
+    Caster.NativeActor=false;V->SetNativeCastShadow(CasterComponent,Caster);V->SetPrimitiveShown(CasterComponent,false);V->SetPrimitiveShown(CasterComponent,true);
+    TestFalse(TEXT("Changed caster policy clears saved eligibility"),CasterComponent->CastShadow);
+    CasterComponent->DestroyComponent();
     V->NativeAttenuationMaterial=Function;
     auto* Cube=LoadObject<UTextureCube>(nullptr,TEXT("/Game/UEMW/Materials/MW_InteriorAmbientProbe.MW_InteriorAmbientProbe"));TestNotNull(TEXT("Isotropic indoor ambient cube is cooked"),Cube);
     V->NativeInteriorSky->SetCubemap(Cube);V->ActiveCellKey=TEXT("interior");V->SceneEpoch=TEXT("owned-light-test");
@@ -552,6 +568,29 @@ bool FMWLightingTest::RunTest(const FString&) {
         for(int32 I=0;I<FMath::Min(TextureImage.Num(),ProductImage.Num());++I){const float D=FMath::Max3(FMath::Abs(TextureImage[I].R-ProductImage[I].R),FMath::Abs(TextureImage[I].G-ProductImage[I].G),FMath::Abs(TextureImage[I].B-ProductImage[I].B));ProductMismatch+=D>.0005f;ProductError=FMath::Max(ProductError,D);}
         TestTrue(TEXT("Base-only native RGB modulation matches independently premultiplied display colours"),TextureImage.Num()==4096 && ProductImage.Num()==4096 && ProductMismatch==0);
         AddInfo(FString::Printf(TEXT("Native base texture GPU mismatch=%d max_error=%.6f"),ProductMismatch,ProductError));
+        // Actual deferred lighting must agree with the independently prelit
+        // native colour before any caster is introduced. An inferred cavity
+        // or metal finish must not silently multiply that diffuse energy.
+        auto* White=LoadObject<UTexture2D>(nullptr,TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+        Pixels.Init(FVector4f(0,0,0,0),8*33);Pixels[0]=FVector4f(.1,.1,.1,1);Pixels[1]=FVector4f(.5,.25,.125,0);Pixels[2]=FVector4f(0,0,-1,0);
+        auto* DirectEnvironment=MWFloatTexture(8,33,Pixels);
+        for(auto* M:{Lit,Prelit})M->SetTextureParameterValue(TEXT("SpriteTexture"),White);
+        Lit->SetTextureParameterValue(TEXT("NativeEnvironment"),DirectEnvironment);
+        for(const TCHAR* Name:{TEXT("NativeLit"),TEXT("NativeModernLighting"),TEXT("NativeSurfaceQuality"),TEXT("NativeInteriorDiffuse"),TEXT("NativeLightSetActive"),TEXT("NativeObjectSun"),TEXT("NativeDetailStrength")})Lit->SetScalarParameterValue(Name,1);
+        Lit->SetScalarParameterValue(TEXT("NativeUnshadowedReference"),0);Lit->SetScalarParameterValue(TEXT("NativeMetallic"),.65);Lit->SetScalarParameterValue(TEXT("NativeSpecular"),.5);
+        Lit->SetTextureParameterValue(TEXT("NativeSurfaceDetail"),MWFloatTexture(1,1,{FVector4f(128.f/255,128.f/255,128.f/255,.45f)}));
+        Ground.Colors.Init(FLinearColor(.6,.4,.2,1),4);Ground.UVs={FVector2D(0,0),FVector2D(1,0),FVector2D(1,1),FVector2D(0,1)};
+        auto* DirectMesh=MWBuildMesh(V,Ground,Lit);
+        Ground.Colors.Init(FLinearColor(.6f*.6f,.4f*.35f,.2f*.225f,1),4);auto* DirectReferenceMesh=MWBuildMesh(V,Ground,Prelit);
+        auto* Sun=NewObject<UDirectionalLightComponent>(V);Sun->SetMobility(EComponentMobility::Movable);Sun->SetWorldRotation(FRotator(-90,0,0));Sun->SetLightColor(FLinearColor(1,.5,.25),false);Sun->SetIntensity(PI*.5f);Sun->SetCastShadows(false);Sun->RegisterComponent();
+        const auto DirectReference=Image(DirectReferenceMesh,Prelit);
+        auto Difference=[&](const TArray<FLinearColor>& Actual){double Sum=0;for(int32 I=0;I<FMath::Min(Actual.Num(),DirectReference.Num());++I)Sum+=FMath::Abs(Actual[I].R-DirectReference[I].R)+FMath::Abs(Actual[I].G-DirectReference[I].G)+FMath::Abs(Actual[I].B-DirectReference[I].B);return Actual.Num()?Sum/(Actual.Num()*3):1.;};
+        Lit->SetScalarParameterValue(TEXT("NativeMaterialMatch"),0);const double LegacyError=Difference(Image(DirectMesh,Lit));
+        Lit->SetScalarParameterValue(TEXT("NativeMaterialMatch"),1);const double MatchedError=Difference(Image(DirectMesh,Lit));
+        AddInfo(FString::Printf(TEXT("Native actual direct-light RGB error legacy=%.6f matched=%.6f"),LegacyError,MatchedError));
+        TestTrue(TEXT("The fixture exposes extra material darkening before correction"),LegacyError>.01);
+        TestTrue(TEXT("Actual deferred diffuse preserves native colour despite inferred cavity/metal data"),MatchedError<.002 && MatchedError<LegacyError*.2);
+        Sun->DestroyComponent();
         Capture->DestroyComponent();Component->DestroyComponent();UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
     }
     V->Destroy();

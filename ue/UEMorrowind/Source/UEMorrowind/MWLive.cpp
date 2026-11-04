@@ -637,6 +637,7 @@ void AMWLive::CreateGeometryMaterial() {
 void AMWLive::ApplyVisualParameters(UMaterialInstanceDynamic* Material) const {
     if(!Material)return;
     Material->SetScalarParameterValue(TEXT("NativePixelLighting"),LightingReferenceMode==2?0:LightingReferenceMode==1?1:NativeIrradianceMode);
+    Material->SetScalarParameterValue(TEXT("NativeMaterialMatch"),NativeMaterialMatch?1:0);
     Material->SetScalarParameterValue(TEXT("NativeUnshadowedReference"),LightingReferenceMode?1:0);
     Material->SetScalarParameterValue(TEXT("NativeMipBias"),0);
     Material->SetScalarParameterValue(TEXT("NativeModernLighting"),VisualReference || LightingReferenceMode?0:1);
@@ -1279,7 +1280,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
                 MWNativeDrawLayer(Component,*Data);
                 Component->SetAbsolute(true,true,true);Component->SetWorldTransform(FTransform::Identity);
                 Component->SetStaticMesh(Mesh);Component->SetMaterial(0,Material);
-                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);Component->SetCastShadow(!AuxiliaryGeometry && Data->Lit && !Data->Sky && !Data->Background && !Data->Water);Component->SetRenderCustomDepth(Data->Water);Component->SetCustomDepthStencilValue(1);
+                Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);SetNativeCastShadow(Component,*Data);Component->SetRenderCustomDepth(Data->Water);Component->SetCustomDepthStencilValue(1);
                 Component->SetNativeBounds(Typed->Bound);Component->RegisterComponent();SkinnedComponents.Add(Id,Component);TrackWaterReflectionMember(Component,Asset);
             }
             SetPrimitiveShown(Component,true);Component->SetNativeBounds(Typed->Bound);
@@ -1311,7 +1312,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
                 Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(Batch,*Data);
                 Batch->SetStaticMesh(Mesh);Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);
-                Batch->SetCastShadow(!AuxiliaryGeometry && Data->Lit && !Data->Sky && !Data->Background && !Data->Water);Batch->SetRenderCustomDepth(Data->Water);Batch->SetCustomDepthStencilValue(1);Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);TrackWaterReflectionMember(Batch,Asset);
+                SetNativeCastShadow(Batch,*Data);Batch->SetRenderCustomDepth(Data->Water);Batch->SetCustomDepthStencilValue(1);Batch->SetAbsolute(true,true,true);Batch->RegisterComponent();RigidBatches.Add(Asset,Batch);TrackWaterReflectionMember(Batch,Asset);
             }
             const FTransform Placement=MWNativeTransform(M);
             auto* Slot=RigidSlots.Find(Id);

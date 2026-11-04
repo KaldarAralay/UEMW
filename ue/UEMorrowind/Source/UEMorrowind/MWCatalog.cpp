@@ -447,6 +447,10 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
             if((*Shading)->HasField(TEXT("water")) && !(*Shading)->TryGetBoolField(TEXT("water"),Data.Water))return nullptr;
             if((*Shading)->HasField(TEXT("first_person")) && !(*Shading)->TryGetBoolField(TEXT("first_person"),Data.FirstPerson))return nullptr;
             if((*Shading)->HasField(TEXT("rain")) && !(*Shading)->TryGetBoolField(TEXT("rain"),Data.Rain))return nullptr;
+            if((*Shading)->HasField(TEXT("native_actor"))) {
+                if(!(*Shading)->TryGetBoolField(TEXT("native_actor"),Data.NativeActor))return nullptr;
+                Data.HaveNativeActor=true;
+            }
             if((*Shading)->HasField(TEXT("native_lights"))) {
                 const TArray<TSharedPtr<FJsonValue>>* Lights=nullptr;
                 if(!(*Shading)->TryGetArrayField(TEXT("native_lights"),Lights) || Lights->Num()>128 || !(*Shading)->TryGetBoolField(TEXT("native_sun"),Data.NativeSunActive))return nullptr;

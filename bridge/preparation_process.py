@@ -62,7 +62,7 @@ class PreparationPickler(pickle.Pickler):
                 state['_pose_transfer']={k:v for k,v in layout.__dict__.items()if k not in('records','read_plan')}
             # Pose publication needs full particle descriptors and the binding
             # identities/roles, not thousands of conversion-only dictionaries.
-            keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights','texture_effect','native_environment_effect')
+            keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights','texture_effect','native_environment_effect','native_actor')
             state['shapes']=[s if s.get('particles')else{k:s[k]for k in keys if k in s}for s in obj.shapes]
             state['prepared_definitions']={}
             return restore_geometry,(state,)
@@ -234,7 +234,7 @@ def auxiliary_patch(old,ready,roles):
     """Reuse validated, unchanged resident bindings across an auxiliary edit."""
     if old is None or old.scope!=ready.scope or old.epoch!=ready.epoch:return None
     indices={s['id']:i for i,s in enumerate(old.shapes)};order=[]
-    keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights','texture_effect','native_environment_effect')
+    keys=('id','cell_key','asset','model','skin','generation','parents','effect_target','texture_property','material','switch_gates','native_lights','texture_effect','native_environment_effect','native_actor')
     for shape,row in zip(ready.shapes,ready.records):
         if shape.get('cell_key')in roles:
             i=indices.get(shape['id'])
