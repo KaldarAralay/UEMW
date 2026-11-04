@@ -22,8 +22,9 @@ void AMWLive::ApplyFirstPersonLane(const FMWCameraSample& Sample,double Now) {
         HideInstance(Id);const FString Asset=InstanceAssets.FindRef(Id);ResourceBindings.Remove(Id);
         if(!Asset.IsEmpty())QueueGeometryResource(4,Id,Asset,FVector4f(0,0,0,1));
     }
-    ViewLaneIds.Empty();ViewLaneAssets.Empty();
+    ViewLaneIds.Empty();ViewLaneAssets.Empty();ViewLaneVisibleIds.Empty();
     for(const auto& Row:Sample.ViewStates) {
+        if(Row.Pose.Visible)ViewLaneVisibleIds.Add(Row.Id);
         ViewLaneIds.Add(Row.Id);ViewLaneAssets.Add(Row.Id,Row.Asset);const auto* D=MeshData.Find(Row.Asset);
         ResourceBindings.Add(Row.Id,Row.Asset);
         const bool Ready=GeometryResourceReady({Row.Id,Row.Asset,TEXT("")},Row.Pose);

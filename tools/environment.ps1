@@ -2,6 +2,15 @@
 # the current process environment; it installs nothing and writes no files.
 function Get-UEMWRoot { Split-Path -Parent $PSScriptRoot }
 
+function Get-UEMWAllocatorArgument {
+    $Allocator=if($env:UEMW_ALLOCATOR){$env:UEMW_ALLOCATOR}else{'binned3'}
+    switch($Allocator){
+        'binned3' {return '-binnedmalloc3'}
+        'binned2' {return '-binnedmalloc2'}
+        default {throw 'UEMW_ALLOCATOR must be binned2 or binned3. Nothing was started.'}
+    }
+}
+
 function Get-UEMWConfig {
     param([string]$ProjectRoot=(Get-UEMWRoot))
     $Path=Join-Path $ProjectRoot 'local\config.json'

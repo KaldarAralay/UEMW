@@ -14,6 +14,7 @@ $InitialWidth=$Width;$InitialHeight=$Height
 $ArgsList=@('/Engine/Maps/Entry','-game','-windowed','-UEMWPassive','-UEMWManaged',"-ResX=$InitialWidth","-ResY=$InitialHeight","-$RHI",'-NoSplash','-NoSound',"`"-UEMWRoot=$ProjectRoot`"","`"-abslog=$(Join-Path $ProjectRoot 'logs\ue-runtime.log')`"")
 if($Editor){$ArgsList=@("`"$UProject`"")+$ArgsList}
 $ArgsList+="-UEMWMaxFPS=$MaxFPS"
+$ArgsList+=Get-UEMWAllocatorArgument
 if($TwoWindows){$ArgsList+='-UEMWSeparate'}
 if($RHI -eq 'vulkan' -and $VulkanPresentMode -ne 'auto'){
     # Opt-in diagnostic comparison only. Immediate mode did not fix the

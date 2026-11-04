@@ -2,6 +2,7 @@ param([ValidateRange(128,8192)][int]$Width=1920,[ValidateRange(96,8192)][int]$He
 $ErrorActionPreference='Stop'
 . (Join-Path $PSScriptRoot 'environment.ps1')
 Initialize-UEMWEnvironment
+$AllocatorArgument=Get-UEMWAllocatorArgument
 if($Editor){$EngineRoot=Resolve-UEMWEngineRoot -EngineRoot $EngineRoot}
 if($Overlay){$TwoWindows=$false}
 $DisableRHIThread=$RHI -ne 'd3d12';$ExpectedThreadFlag=if($DisableRHIThread){'norhithread'}else{'rhithread'}
@@ -88,6 +89,12 @@ Write-Output "Native bridge connection verified: $ReaderProcessId"
 $UProject=Join-Path $ProjectRoot 'ue\UEMorrowind\UEMorrowind.uproject'
 $Renderers=@(Get-CimInstance Win32_Process -Filter "Name='UnrealEditor.exe' OR Name='UEMorrowind.exe'" | Where-Object {$_.ExecutablePath -ieq $RendererExe -and $_.CommandLine -match '(?i)(?:^|\s)-UEMWManaged(?:\s|$)' -and (!$Editor -or $_.CommandLine -like "*$UProject*")})
 if($Renderers.Count -gt 1){throw 'Multiple project renderers exist; launch refused.'}
+if($Renderers.Count -and $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)$AllocatorArgument(?:\s|$)"){
+    & (Join-Path $PSScriptRoot 'stop-renderer-guard.ps1')
+    Stop-Process -Id $Renderers[0].ProcessId -ErrorAction Stop
+    $Renderers=@()
+    Write-Output "Restarting this project renderer with $AllocatorArgument."
+}
 if($Renderers.Count -and ($Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-UEMWMaxFPS=$MaxFPS(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-$ExpectedThreadFlag(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-ResX=$Width(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-ResY=$Height(?:\s|$)" -or $Renderers[0].CommandLine -notmatch "(?i)(?:^|\s)-$RHI(?:\s|$)" -or [bool]($Renderers[0].CommandLine -match '(?i)(?:^|\s)-UEMWSeparate(?:\s|$)') -ne [bool]$TwoWindows)){
     # Retain this verified bridge when explicitly changing client settings.
     & (Join-Path $PSScriptRoot 'stop-renderer-guard.ps1')

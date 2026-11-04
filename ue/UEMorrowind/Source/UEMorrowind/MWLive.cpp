@@ -600,7 +600,7 @@ void AMWLive::ResetScene() {
     AcceptedSnapshotStamp=0;AcceptedGeometrySequence=-1;AcceptedSnapshotText.Empty();
     CameraSession.Empty();CameraEpoch.Empty();CameraSequence=-1;LastCameraStamp=0;
     ViewPoseCameraValid=false;ViewPoseStamp=0;ViewPoseBounds.Empty();ViewCorrection=FTransform::Identity;ViewCorrectedMaterials=BackgroundAnchoredMaterials=0;
-    ViewLaneCatalog.Empty();ViewLaneStamp=0;ViewLaneIds.Empty();ViewLaneAssets.Empty();BackgroundPoseValid=false;
+    ViewLaneCatalog.Empty();ViewLaneStamp=0;ViewLaneIds.Empty();ViewLaneAssets.Empty();ViewLaneVisibleIds.Empty();BackgroundPoseValid=false;
     // Release old cell resources at the end of this UE frame, after reconciliation.
     // The original game keeps running; no original assets or process memory change.
     if(HadAssets && GEngine)GEngine->ForceGarbageCollection(true);
@@ -1197,7 +1197,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     if(Native && !EnsureGeometryResources(*Native,Reuse?&Unchanged:nullptr))return false;
     // The complete-world read has no coherent arms-camera capture. While the
     // separately fenced near lane is fresh, it exclusively owns those poses.
-    bool PreserveView=ViewLaneAssets.Num()>0 && PoseNow>=ViewLaneStamp && PoseNow-ViewLaneStamp<.15;
+    bool PreserveView=ViewLaneStamp>0 && PoseNow>=ViewLaneStamp && PoseNow-ViewLaneStamp<.15;
     if(PreserveView)for(const auto& Pair:ViewLaneAssets)if(ResourceBindings.FindRef(Pair.Key)!=Pair.Value){PreserveView=false;break;}
     Part(TEXT("compare_resources"));
     TSet<FString> Present;
@@ -1228,7 +1228,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         const auto* Data=MeshData.Find(Asset);
         if(!Data) return false;
         if(Reconcile && !Native)Present.Add(Id);
-        if(PreserveView && Data->FirstPerson && ViewLaneIds.Contains(Id))continue;
+        if(PreserveView && Data->FirstPerson){if(!ViewLaneIds.Contains(Id))HideInstance(Id);continue;}
         const bool Visible=(Typed?Typed->Visible:Compact?(*Row)[0]->AsBool():Instance->GetBoolField(TEXT("visible"))) && (!Data->Background || BackgroundGeometryVisible);
         if(DiagnosticVisibility && !Visible && SkinnedComponents.Contains(Id) && InstanceSubmitted(Id))UE_LOG(LogTemp,Display,TEXT("UEMW source hide seq=%lld id=%s asset=%s"),Sequence,*Id,*Asset);
         if(Visible && Data->NativeVertices && (!Typed || Typed->Points.Num()!=Data->Vertices.Num()*3 ||

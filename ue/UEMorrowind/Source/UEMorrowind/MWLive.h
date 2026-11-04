@@ -401,6 +401,7 @@ private:
     void UpdateViewCorrection();
     void ApplyCameraLane();
     void ApplyFirstPersonLane(const FMWCameraSample& Sample,double Now);
+    TSet<FString> ViewLaneVisibleIds;
     bool InstanceSubmitted(const FString& Id) const;
     double LightingCpuMs=0;
     TMap<FString,double> GeometryCpuMs;

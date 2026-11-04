@@ -18,6 +18,7 @@ if($RHI -ne 'd3d11' -or $EnableRHIThread){$Log=[IO.Path]::Combine([IO.Path]::Get
 $ThreadFlag=if($EnableRHIThread){'-rhithread'}else{'-norhithread'}
 $Arguments=@('/Engine/Maps/Entry',"-$RHI",'-sm5',$ThreadFlag,'-unattended','-nosound','-nosplash','-windowed','-ResX=128','-ResY=96','-UEMWPassive','-UEMWSeparate',"`"-UEMWRoot=$FixtureRoot`"","`"-ExecCmds=r.RHIThread.Enable,Automation RunTests UEMW.Renderer.$Test`"",'"-TestExit=Automation Test Queue Empty"',"`"-abslog=$Log`"")
 $Started=[datetime]::UtcNow
+$Arguments+=Get-UEMWAllocatorArgument
 if($Test -eq 'NativeUI'){
     $Token=[guid]::NewGuid().ToString('D')
     $Fixture=Start-UEMWPythonProcess -Script (Join-Path $ProjectRoot 'tools/shared_channel_fixture.py') -ScriptArguments @($Token,"`"$FixtureTarget`"") -StandardError (Join-Path $ProjectRoot 'logs/ui-shared-gpu-fixture.stderr.log')
@@ -41,6 +42,8 @@ if(!$Run.WaitForExit(60000)){Stop-Process -Id $Run.Id;throw 'Owned GPU compariso
 }
 if(!(Test-Path -LiteralPath $Log) -or (Get-Item -LiteralPath $Log).LastWriteTimeUtc -lt $Started){throw 'No fresh GPU comparison log'}
 $Contents=Get-Content -LiteralPath $Log -Raw
+$ExpectedAllocator=(Get-UEMWAllocatorArgument).Replace('-binnedmalloc','binned')
+if($Contents -notmatch "LogInit: Allocator: $ExpectedAllocator"){throw 'GPU test did not confirm the requested allocator.'}
 $ExpectedThread=if($EnableRHIThread){1}else{0}
 if($Contents -notmatch "Using Forced RHI: $($RHI.ToUpperInvariant())" -or $Contents -notmatch "r.RHIThread.Enable.*Currently $ExpectedThread"){throw "Owned GPU test did not confirm the requested backend/thread mode: $Log"}
 if($Run.ExitCode -ne 0 -or $Contents -match '(Fatal error|Assertion failed|Ensure condition failed|Result=\{Fail)' -or $Contents -notmatch "Test Completed\. Result=\{Success\}.*$Test" -or $Contents -notmatch 'Queue Empty 1 tests performed'){throw "GPU comparison failed; see $Log"}

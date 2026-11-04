@@ -57,6 +57,7 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetStringField(TEXT("renderer_log_file"),FPaths::ConvertRelativePathToFull(FPlatformOutputDevices::GetAbsoluteLogFilename()));
     Out->SetBoolField(TEXT("live"),Live);Out->SetStringField(TEXT("status"),Status);
     Out->SetStringField(TEXT("renderer_rhi"),GDynamicRHI?GDynamicRHI->GetName():TEXT("None"));Out->SetBoolField(TEXT("renderer_rhi_thread_running"),IsRunningRHIInSeparateThread());
+    Out->SetStringField(TEXT("allocator"),GMalloc->GetDescriptiveName());
     Out->SetBoolField(TEXT("targeted_render_updates"),TargetedRenderUpdates);
     Out->SetBoolField(TEXT("catalog_handoff_plans"),CatalogHandoffPlans);
     bool ClassificationMatches=BindingTraitsCatalog==Catalog && BindingTraits.Num()==GeometryBindings.Num();TArray<FString> ReferenceSuns;
@@ -261,6 +262,8 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
         auto Visible=[&](UPrimitiveComponent* C){return C && C->IsRegistered() && C->GetVisibleFlag() && (!PC || !PC->HiddenPrimitiveComponents.Contains(TWeakObjectPtr<UPrimitiveComponent>(C)));};
         Shown|=Visible(SkinnedComponents.FindRef(Id)) || Visible(GeometryComponents.FindRef(Id));
         Row->SetBoolField(TEXT("submitted_visible"),Live && Shown);Row->SetBoolField(TEXT("current_pose_visible"),VisibleInstances.Contains(Id));
+        Row->SetStringField(TEXT("resource_expected_asset"),ResourceBindings.FindRef(Id));
+        Row->SetStringField(TEXT("near_asset"),ViewLaneAssets.FindRef(Id));
         if(const auto* C=SkinnedComponents.FindRef(Id))if(!C->UseNativeBounds) {
             const FVector P=C->GetComponentLocation(),Scale=C->GetComponentScale();
             Row->SetArrayField(TEXT("first_person_visual_position"),{MakeShared<FJsonValueNumber>(P.Y),MakeShared<FJsonValueNumber>(P.X),MakeShared<FJsonValueNumber>(P.Z)});
@@ -450,6 +453,11 @@ void AMWLive::PublishStateWitness() {
         SetVisualReference(Profile==TEXT("reference"));
     }
     auto Witness=BuildStateWitness(Ids,Now);Witness->SetStringField(TEXT("request_id"),Token);
+    if(Request->HasField(TEXT("memory_trim"))) {
+        bool Trim=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("memory_trim"),Trim) || !Trim)return;
+        const double Began=FPlatformTime::Seconds();FMemory::Trim();
+        Witness->SetNumberField(TEXT("memory_trim_cpu_ms"),(FPlatformTime::Seconds()-Began)*1000);
+    }
     if(Request->HasField(TEXT("record_seconds"))) {
         double Seconds=0;
         if(!DiagnosticScreenshots || !Request->TryGetNumberField(TEXT("record_seconds"),Seconds) || Seconds<1 || Seconds>10 || Seconds!=FMath::TruncToDouble(Seconds))return;

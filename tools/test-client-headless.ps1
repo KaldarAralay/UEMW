@@ -8,6 +8,7 @@ if(!(Test-Path -LiteralPath $Client)){throw 'Package the client first.'}
 if($LASTEXITCODE){throw 'Could not create own synthetic test fixture.'}
 $TestLog=Join-Path $ProjectRoot 'logs\client-headless-tests.log'
 $ArgsList=@('/Engine/Maps/Entry','-nullrhi','-unattended','-nosound','-nosplash',"`"-UEMWRoot=$ProjectRoot`"",'"-ExecCmds=Automation RunTests UEMW.Renderer"','"-TestExit=Automation Test Queue Empty"',"`"-abslog=$TestLog`"")
+$ArgsList+=Get-UEMWAllocatorArgument
 $Token=[guid]::NewGuid().ToString('D')
 $Fixture=Start-UEMWPythonProcess -Script (Join-Path $PSScriptRoot 'shared_channel_fixture.py') -ScriptArguments @($Token) -StandardError (Join-Path $ProjectRoot 'logs\shared-fixture.stderr.log')
 try {
@@ -26,6 +27,8 @@ try {
 }finally{if(!$Fixture.HasExited -and !$Fixture.WaitForExit(1000)){$Fixture.Kill();$Fixture.WaitForExit()}}
 if(!(Test-Path -LiteralPath $TestLog) -or (Get-Item -LiteralPath $TestLog).LastWriteTimeUtc -lt $TestStarted){throw 'UE did not produce a fresh test log; an old result cannot pass this run.'}
 $Contents=Get-Content -LiteralPath $TestLog -Raw
+$ExpectedAllocator=(Get-UEMWAllocatorArgument).Replace('-binnedmalloc','binned')
+if($Contents -notmatch "LogInit: Allocator: $ExpectedAllocator"){throw 'Headless test did not confirm the requested allocator.'}
 if($Contents -notmatch 'NativeTopology'){throw 'Native topology test was not executed'}
 if($Contents -notmatch 'DistantScenery'){throw 'Distant scenery test was not executed'}
 if($Contents -notmatch 'NativeUI'){throw 'Native UI test was not executed'}

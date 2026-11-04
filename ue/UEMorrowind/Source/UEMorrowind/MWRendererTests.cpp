@@ -844,8 +844,31 @@ bool FMWCameraLaneTest::RunTest(const FString&) {
     View->EnsureGeometryResources(DrawStates);View->AdvanceGeometryResources(1,32);
     TestEqual(TEXT("Late scenery catalog cannot retire a newer fenced weapon"),View->ResourceBindings.FindRef(TEXT("redrawn-id")),FString(TEXT("blade")));
     TestTrue(TEXT("Near component remains submitted across unrelated reconciliation"),View->InstanceSubmitted(TEXT("redrawn-id")));
-    NearPose.ViewStates.Empty();NearPose.ViewStamp=202.05;View->ApplyFirstPersonLane(NearPose,202.06);
+    // Same native id, older world layout: resource preparation must respect
+    // the independently fenced current near binding as well as pose apply.
+    View->MeshData.Add(TEXT("late-world-blade"),Blade);View->GeometryMaterials.Add(TEXT("late-world-blade"),ViewMID);
+    View->GeometryBindings={{TEXT("redrawn-id"),TEXT("late-world-blade")}};View->ResourceCatalog=TEXT("older-world-layout");
+    auto* CurrentBlade=View->SkinnedComponents.FindRef(TEXT("redrawn-id"));
+    View->EnsureGeometryResources(DrawStates);
+    TestTrue(TEXT("Older same-id world resources cannot hide a fresh drawn weapon"),View->InstanceSubmitted(TEXT("redrawn-id")));
+    TestFalse(TEXT("Older same-id world resources do not enqueue competing near components"),View->ResourceJobs.ContainsByPredicate([](const FMWResourceJob& J){return J.Id==TEXT("redrawn-id") && J.Asset==TEXT("late-world-blade") && J.Kind!=4;}));
+    // Also fence a job that was queued before that newer near binding arrived.
+    View->QueueGeometryResource(5,TEXT("redrawn-id"),TEXT("late-world-blade"),FVector4f(0,0,0,1));
+    View->AdvanceGeometryResources(1,32);
+    TestTrue(TEXT("Obsolete queued near work cannot replace the current component"),View->SkinnedComponents.FindRef(TEXT("redrawn-id"))==CurrentBlade && View->InstanceSubmitted(TEXT("redrawn-id")));
+    TestEqual(TEXT("Obsolete queued near work preserves the current asset"),View->InstanceAssets.FindRef(TEXT("redrawn-id")),FString(TEXT("blade")));
+    View->ViewLaneStamp-=1;View->ResourceCatalog=TEXT("expired-near-world-layout");View->EnsureGeometryResources(DrawStates);
+    TestFalse(TEXT("Expired near ownership cannot preserve a replaced world binding"),View->InstanceSubmitted(TEXT("redrawn-id")));
+    NearPose.ViewStamp=202.05;View->ApplyFirstPersonLane(NearPose,202.06);
+    TestTrue(TEXT("Fresh exact native near state recovers after expiry"),View->InstanceSubmitted(TEXT("redrawn-id")));
+    NearPose.ViewStates.Empty();NearPose.ViewStamp=202.07;View->ApplyFirstPersonLane(NearPose,202.08);
     TestFalse(TEXT("Missing native near objects hide without waiting for a catalog"),View->InstanceSubmitted(TEXT("redrawn-id")));
+    View->ViewLaneStamp=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds();View->ResourceCatalog=TEXT("world-before-native-removal");
+    auto OlderWorld=MakeShared<FJsonObject>();OlderWorld->SetStringField(TEXT("scene_epoch"),View->SceneEpoch);OlderWorld->SetStringField(TEXT("scene_catalog"),View->Catalog);OlderWorld->SetNumberField(TEXT("geometry_version"),5);
+    View->EnsureGeometryResources(DrawStates);View->AdvanceGeometryResources(1,32);
+    TestFalse(TEXT("Empty fresh native lane removes obsolete world resource demand"),View->ResourceBindings.Contains(TEXT("redrawn-id")));
+    TestTrue(TEXT("Older world pose is accepted after native near removal"),View->UpdateGeometry(OlderWorld,&DrawStates));
+    TestFalse(TEXT("Older world pose cannot resurrect a natively removed near part"),View->InstanceSubmitted(TEXT("redrawn-id")));
     auto Apply=[&](double Stamp,double X){return View->ApplyNativeCamera(FVector(X,0,0),FVector::ForwardVector,FVector::UpVector,75,Stamp);};
     TestTrue(TEXT("Full snapshot commits a shared camera timestamp"),Apply(100,10));
     TestFalse(TEXT("Delayed lane sample cannot rewind a newer full camera"),Apply(99.99,20));

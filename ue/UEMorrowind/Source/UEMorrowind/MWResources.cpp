@@ -229,13 +229,19 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
     auto Queue=[&](uint8 Kind,const FString& Id,const FString& Asset,const FVector4f& Bound) {
         QueueGeometryResource(Kind,Id,Asset,Bound);
     };
+    const double Now=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds();
+    const bool FreshNear=ViewLaneStamp>0 && Now>=ViewLaneStamp && Now-ViewLaneStamp<.15;
+    const bool NearTraits=BindingTraitsCatalog==Catalog && BindingTraits.Num()==GeometryBindings.Num();
     if(NewCatalog) {
         if(PreparedResourceCatalog==Catalog && PreparedResourceBindings.Num()==GeometryBindings.Num())ResourceBindings=MoveTemp(PreparedResourceBindings);
         else for(const auto& B:GeometryBindings)ResourceBindings.Add(B.Id,B.Asset);
-        const double Now=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds();
-        if(Now>=ViewLaneStamp && Now-ViewLaneStamp<.15)for(const auto& Pair:ViewLaneAssets) {
-            const auto* D=MeshData.Find(Pair.Value);
-            if(D && D->FirstPerson && ViewCachedAssets.Contains(Pair.Value))ResourceBindings.Add(Pair.Key,Pair.Value);
+        if(FreshNear) {
+            // An empty current near lane is authoritative removal too.
+            for(int32 I=0;I<GeometryBindings.Num();++I)if(NearTraits?(BindingTraits[I]&1)!=0:MeshData[GeometryBindings[I].Asset].FirstPerson)ResourceBindings.Remove(GeometryBindings[I].Id);
+            for(const auto& Pair:ViewLaneAssets) {
+                const auto* D=MeshData.Find(Pair.Value);
+                if(D && D->FirstPerson && ViewCachedAssets.Contains(Pair.Value))ResourceBindings.Add(Pair.Key,Pair.Value);
+            }
         }
         for(const auto& Pair:InstanceAssets){const auto* Desired=ResourceBindings.Find(Pair.Key);if(!Desired || *Desired!=Pair.Value){if(Desired && InstanceSubmitted(Pair.Key))++PerfResourceRebindHides;HideInstance(Pair.Key);Queue(4,Pair.Key,Pair.Value,FVector4f(0,0,0,1));}}
     }
@@ -243,6 +249,20 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         const auto& S=States[i];if(!S.Visible)continue;
         if(Unchanged && (*Unchanged)[i]){++Ready;continue;}
         const auto& B=GeometryBindings[i];
+        if(FreshNear && (NearTraits?(BindingTraits[i]&1)!=0:MeshData[B.Asset].FirstPerson)) {
+            const auto* Near=ViewLaneAssets.Find(B.Id);
+            if(!Near){ResourceBindings.Remove(B.Id);HideInstance(B.Id);++Ready;continue;}
+            const auto* NearData=MeshData.Find(*Near);
+            if(NearData && NearData->FirstPerson && ViewCachedAssets.Contains(*Near)) {
+                // The older world layout must not hide or allocate a competing
+                // component for an id already owned by this fresh native lane.
+                // Its actual pose/visibility still comes only from that lane.
+                const auto* Current=InstanceAssets.Find(B.Id);
+                if(!ViewLaneVisibleIds.Contains(B.Id) || (Current && *Current==*Near && SharedMeshes.Contains(*Near) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && (!NearData->SkinBones || PaletteTextures.Contains(B.Id))))++Ready;
+                else ++PendingGeometryInstances;
+                continue;
+            }
+        }
         if(GeometryResourceReady(B,S)){++Ready;continue;}
         // A currently displayed rigid node may acquire real native shear.
         // Prepare its CPU capacity in this same apply, before hiding the rigid
@@ -289,8 +309,13 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
     while(ResourceJobIndex<ResourceJobs.Num()) {
         const auto& Job=ResourceJobs[ResourceJobIndex];const auto* D=MeshData.Find(Job.Asset);
         auto* Material=GeometryMaterials.FindRef(Job.Asset);
-        if(!Job.Id.IsEmpty())NativeResourceInvalidations.Add(Job.Id);
-        if(Job.Kind==4) {
+        const auto* Desired=ResourceBindings.Find(Job.Id);
+        const bool Obsolete=(Job.Kind==2 || Job.Kind==3 || Job.Kind==5) && (!Desired || *Desired!=Job.Asset);
+        if(!Obsolete && !Job.Id.IsEmpty())NativeResourceInvalidations.Add(Job.Id);
+        // A newer near discovery can change the desired id/asset while world
+        // jobs wait. Capacity work has no authority to restore the old binding.
+        if(Obsolete) {}
+        else if(Job.Kind==4) {
             if(InstanceAssets.FindRef(Job.Id)==Job.Asset && ResourceBindings.FindRef(Job.Id)!=Job.Asset) {
                 RemoveRigid(Job.Id);
                 if(auto** Old=SkinnedComponents.Find(Job.Id))ReleaseGeometryPrimitive((*Old));
@@ -336,7 +361,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
         }else if(Job.Kind==3) {
             if(!PrepareMutableResource(Job.Id,Job.Asset)){ResourceError=TEXT("Invalid native mutable capacity");return;}
         }else {ResourceError=TEXT("Unknown native resource job");return;}
-        QueuedResources.Remove(Job.Key);++ResourceJobIndex;++PerfResourceBuilds;++Jobs;
+        QueuedResources.Remove(Job.Key);++ResourceJobIndex;if(!Obsolete)++PerfResourceBuilds;++Jobs;
         if(Jobs>=FMath::Clamp(MaxJobs,1,256) || FPlatformTime::Seconds()-Began>=FMath::Max(0.,Budget))break;
     }
     if(ResourceJobIndex==ResourceJobs.Num()){ResourceJobs.Empty();QueuedResources.Empty();ResourceJobIndex=0;}
