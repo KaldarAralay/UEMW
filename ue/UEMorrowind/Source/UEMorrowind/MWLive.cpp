@@ -75,7 +75,6 @@
 #include <Windows.h>
 #include "Windows/HideWindowsPlatformTypes.h"
 #endif
-
 IMPLEMENT_PRIMARY_GAME_MODULE(FDefaultGameModuleImpl,UEMorrowind,"UEMorrowind");
 
 static FVector Vec(const TSharedPtr<FJsonObject>& Obj,const TCHAR* Key) {
@@ -376,6 +375,7 @@ struct FMWFrameReader {
 };
 
 AMWLive::AMWLive() {
+    MutableScratchEnabled=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_MUTABLE_SCRATCH"))!=TEXT("0");
     PrimaryActorTick.bCanEverTick=true;
     Camera=CreateDefaultSubobject<UCameraComponent>(TEXT("AuthoritativeCamera"));
     RootComponent=Camera;
@@ -571,6 +571,7 @@ void AMWLive::ResetScene() {
     if(DistantGeometry)DistantGeometry->HideScene();
     NativeMenuOpen=true;HavePlayerStats=false;
     NativePoseValid=false;AppliedNativeStates.Empty();AppliedNativeBindings.Empty();AppliedNativeCatalog.Empty();NativeResourceInvalidations.Empty();
+    MutableWorldScratch.Empty();MutableNormalScratch.Empty();MutableColorScratch.Empty();MutableUVScratch.Empty();
     SourceBindingSnapshot.Reset();CatalogBindingSnapshot.Reset();AppliedBindingSnapshot.Reset();SourceBindingCatalog.Empty();
     BindingTraits.Empty();BindingTraitsCatalog.Empty();PreparedPoseRemap.Empty();PreparedPoseSourceCatalog.Empty();PreparedPoseSourceCount=0;
     RetainedGeometryIndices.Empty();RetainedGeometryScratch.Empty();RetainedIncomingCatalog.Empty();RetainedIncomingDigest.Empty();RetainedTargetCatalog.Empty();RetainedIncomingCount=0;
@@ -1227,9 +1228,9 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         const FMWGeometryState* Typed=Native?&(*Native)[Index]:nullptr;
         const FString& Id=Compact?GeometryBindings[Index].Id:Instance->GetStringField(TEXT("id"));
         const FString& Asset=Compact?GeometryBindings[Index].Asset:Instance->GetStringField(TEXT("asset"));
-        FString CellKey;
-        if(Compact)CellKey=GeometryBindings[Index].Cell;else Instance->TryGetStringField(TEXT("cell_key"),CellKey);
-        if(!CellKey.IsEmpty()) {if(InstanceCells.FindRef(Id)!=CellKey)InstanceCells.Add(Id,CellKey);}
+        FString ParsedCell;if(!Compact)Instance->TryGetStringField(TEXT("cell_key"),ParsedCell);
+        const FString& CellKey=Compact?GeometryBindings[Index].Cell:ParsedCell;
+        if(!CellKey.IsEmpty()) {const auto* ExistingCell=InstanceCells.Find(Id);if(!ExistingCell || *ExistingCell!=CellKey)InstanceCells.Add(Id,CellKey);}
         else InstanceCells.Remove(Id);
         const auto* Data=MeshData.Find(Asset);
         if(!Data) return false;
@@ -1242,7 +1243,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         if(Typed && Visible && !GeometryResourceReady(GeometryBindings[Index],*Typed)){if(DiagnosticVisibility && SkinnedComponents.Contains(Id) && InstanceSubmitted(Id))UE_LOG(LogTemp,Display,TEXT("UEMW resource hide seq=%lld id=%s asset=%s"),Sequence,*Id,*Asset);HideInstance(Id);continue;}
         if(Visible)VisibleInstances.Add(Id);else VisibleInstances.Remove(Id);
         if(auto* Slot=RigidSlots.Find(Id))if(Slot->Asset!=Asset)RemoveRigid(Id);
-        const bool AssetChanged=InstanceAssets.FindRef(Id)!=Asset;
+        const auto* ExistingAsset=InstanceAssets.Find(Id);const bool AssetChanged=!ExistingAsset || *ExistingAsset!=Asset;
         if(AssetChanged) {
             RainPoses.Remove(Id);
             SetInstanceAsset(Id,Asset);LastRigidTransforms.Remove(Id);
@@ -1263,6 +1264,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             for(int32 i=0;i<13;++i)RigidMatrix[i]=Typed?Typed->Transform[i]:Transform[i]->AsNumber();
         }
         if(Typed && Typed->Palette.Num()) {
+            TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_SubmitSkinPose);
             if(Data->FirstPerson)ViewPoseBounds.Add(Id,Typed->Bound);
             UploadedVertexPoses.Remove(Id);
             if(Data->SkinBones*12!=Typed->Palette.Num() || Data->SkinUVs.Num()!=Data->Vertices.Num())return false;
@@ -1298,7 +1300,8 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             SetPrimitiveShown(C,true);TArray<double> Saved;Saved.Append(RigidMatrix,13);LastRigidTransforms.Add(Id,MoveTemp(Saved));
             continue;
         }
-        if(!IsDeformed && UseRigidResource({Id,Asset,CellKey},*Data,RigidMatrix)) {
+        if(!IsDeformed && (Compact?UseRigidResource(GeometryBindings[Index],*Data,RigidMatrix):UseRigidResource({Id,Asset,CellKey},*Data,RigidMatrix))) {
+            TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_SubmitRigidPose);
             SetPrimitiveShown(GeometryComponents.FindRef(Id),false);
             const auto& Transform=Typed?Empty:Compact?(*Row)[1]->AsArray():Instance->GetArrayField(TEXT("transform"));
             double M[13];for(int32 i=0;i<13;++i)M[i]=Typed?Typed->Transform[i]:Transform[i]->AsNumber();
@@ -1323,6 +1326,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             continue;
         }
         HideRigid(Id);
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_SubmitMutablePose);
         // Native morph vertices use the bounded CPU vertex path, including
         // morphs attached to a weighted shape. Do not leave an older GPU
         // component drawing another copy if that source path changes.
@@ -1370,8 +1374,18 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             if(Same)for(int32 i=0;i<13;++i)if((*Previous)[i]!=M[i]){Same=false;break;}
             if(Same)continue;
         }
-        TArray<FVector> World;
-        World.SetNumUninitialized(Data->Vertices.Num());
+        TArray<FVector> LocalWorld,LocalNormals;
+        TArray<FLinearColor> LocalColors;
+        TArray<FVector2D> LocalUVs;
+        auto& World=MutableScratchEnabled?MutableWorldScratch:LocalWorld;
+        auto& Normals=MutableScratchEnabled?MutableNormalScratch:LocalNormals;
+        auto& DynamicColors=MutableScratchEnabled?MutableColorScratch:LocalColors;
+        auto& DynamicUVs=MutableScratchEnabled?MutableUVScratch:LocalUVs;
+        const uint64 ScratchBefore=MutableScratchBytes();
+        ON_SCOPE_EXIT {if(MutableScratchEnabled){++MutableScratchPreparations;if(MutableScratchBytes()!=ScratchBefore)++MutableScratchGrowths;}};
+        // Keep capacity when the next native shape has fewer vertices. Every
+        // element is overwritten; this workspace is never a retained pose.
+        World.SetNumUninitialized(Data->Vertices.Num(),false);
         for(int32 i=0;i<World.Num();++i) {
             double X,Y,Z;
             if((Typed && IsDeformed) || Deformed) {
@@ -1385,17 +1399,18 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             if(!FMath::IsFinite(X)||!FMath::IsFinite(Y)||!FMath::IsFinite(Z)) return false;
             World[i]=FVector(Y,X,Z);
         }
-        TArray<FVector> Normals;Normals.Init(FVector::ZeroVector,World.Num());
+        Normals.SetNumUninitialized(World.Num(),false);
         if(!IsDeformed && Data->Normals.Num()==World.Num()) {
             const double Scale=M[12];
             const FMatrix Affine(FPlane(M[4]*Scale,M[1]*Scale,M[7]*Scale,0),FPlane(M[3]*Scale,M[0]*Scale,M[6]*Scale,0),FPlane(M[5]*Scale,M[2]*Scale,M[8]*Scale,0),FPlane(0,0,0,1));
             const FMatrix NormalMatrix=Affine.Inverse().GetTransposed();
             for(int32 i=0;i<World.Num();++i){const auto& N=Data->Normals[i];Normals[i]=NormalMatrix.TransformVector(FVector(N.Y,N.X,N.Z)).GetSafeNormal();}
         } else {
+            for(auto& N:Normals)N=FVector::ZeroVector;
             for(int32 i=0;i<Data->Triangles.Num();i+=3){const int32 A=Data->Triangles[i],B=Data->Triangles[i+1],C=Data->Triangles[i+2];const FVector N=FVector::CrossProduct(World[B]-World[A],World[C]-World[A]);Normals[A]+=N;Normals[B]+=N;Normals[C]+=N;}
             for(auto& N:Normals)N.Normalize();
         }
-        TArray<FLinearColor> DynamicColors;
+        DynamicColors.Reset();
         if(Typed && Typed->Colors.Num()) {
             if(Typed->Colors.Num()!=World.Num()*4)return false;
             for(int32 i=0;i<World.Num();++i)DynamicColors.Emplace(Typed->Colors[i*4],Typed->Colors[i*4+1],Typed->Colors[i*4+2],Typed->Colors[i*4+3]);
@@ -1406,7 +1421,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             for(int32 i=0;i<World.Num();++i)DynamicColors.Emplace(Values[i*4]->AsNumber(),Values[i*4+1]->AsNumber(),Values[i*4+2]->AsNumber(),Values[i*4+3]->AsNumber());
         }
         const TArray<FLinearColor>& Colors=DynamicColors.Num()?DynamicColors:Data->Colors;
-        TArray<FVector2D> DynamicUVs;
+        DynamicUVs.Reset();
         if(Typed && Typed->UVs.Num())for(int32 i=0;i<World.Num();++i)DynamicUVs.Emplace(Typed->UVs[i*2],Typed->UVs[i*2+1]);
         const auto& UVs=DynamicUVs.Num()?DynamicUVs:Data->UVs;
         TArray<FProcMeshTangent> Tangents;
@@ -1460,8 +1475,18 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         AppliedNativeStates.SetNum(StateCount);
         for(int32 I=0;I<StateCount;++I)if(!Reuse || !Unchanged[I]){AppliedNativeStates[I]=(*Native)[I];if(AppliedNativeStates[I].Visible && !VisibleInstances.Contains(GeometryBindings[I].Id))AppliedNativeStates[I].Visible=false;}
         if(AppliedNativeCatalog!=Catalog || (!AppliedBindingSnapshot.IsValid() && AppliedNativeBindings.Num()!=GeometryBindings.Num())) {
+            // The catalog worker may already have released its old reference.
+            // Dropping the last applied snapshot here otherwise destroys every
+            // binding/string on the game thread during catalog handoff.
+            auto RetiredSnapshot=MoveTemp(AppliedBindingSnapshot);auto RetiredBindings=MoveTemp(AppliedNativeBindings);
             AppliedBindingSnapshot=CatalogBindingSnapshot;
-            if(AppliedBindingSnapshot.IsValid())AppliedNativeBindings.Empty();else AppliedNativeBindings=GeometryBindings;
+            if(!AppliedBindingSnapshot.IsValid())AppliedNativeBindings=GeometryBindings;
+            if(RetiredSnapshot.IsValid() || RetiredBindings.Num())Async(EAsyncExecution::ThreadPool,[RetiredSnapshot=MoveTemp(RetiredSnapshot),RetiredBindings=MoveTemp(RetiredBindings)]()mutable{
+                TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RetireAppliedBindings);
+                const double Began=FPlatformTime::Seconds();const int32 Count=(RetiredSnapshot.IsValid()?RetiredSnapshot->Num():0)+RetiredBindings.Num();
+                RetiredSnapshot.Reset();RetiredBindings.Empty();
+                UE_LOG(LogTemp,Display,TEXT("UEMW retired applied bindings: count=%d game_thread=%d ms=%.3f"),Count,IsInGameThread(),(FPlatformTime::Seconds()-Began)*1000);
+            });
         }
         AppliedNativeCatalog=Catalog;NativePoseValid=true;NativeResourceInvalidations.Empty();
     }

@@ -901,6 +901,18 @@ bool FMWCameraLaneTest::RunTest(const FString&) {
     TestTrue(TEXT("CPU bounds follow the actual foreground placement"),BladeComponent->Bounds.Origin.Equals(BladeComponent->CalcBounds(BladeComponent->GetComponentTransform()).Origin,.001));
     NearPose.ViewStamp=200.02;NearPose.ViewStates[0].Pose.Visible=false;View->ApplyFirstPersonLane(NearPose,200.03);TestFalse(TEXT("Native sheath hides the near component"),View->VisibleInstances.Contains(TEXT("blade-id")));
     NearPose.ViewStamp=200.04;NearPose.ViewStates[0].Pose.Visible=true;View->ApplyFirstPersonLane(NearPose,200.05);TestTrue(TEXT("Identical transform reappears after hide/show"),View->VisibleInstances.Contains(TEXT("blade-id")));
+    // Morrowind can reuse a native node address for a DIFFERENT cached rigid
+    // weapon section on redraw. Its new geometry must be applied immediately,
+    // rather than hiding the old component until a later capacity job/pose.
+    auto OtherBlade=Blade;OtherBlade.Vertices[1].X=17;
+    auto* OtherMesh=MWBuildMesh(View,OtherBlade,ViewMID);
+    View->MeshData.Add(TEXT("cached-other-blade"),OtherBlade);View->GeometryMaterials.Add(TEXT("cached-other-blade"),ViewMID);View->SharedMeshes.Add(TEXT("cached-other-blade"),OtherMesh);View->ViewCachedAssets.Add(TEXT("cached-other-blade"));View->ViewCachedAssets.Add(TEXT("blade"));
+    NearPose.ViewStates[0].Asset=TEXT("cached-other-blade");NearPose.ViewStamp=200.06;View->ApplyFirstPersonLane(NearPose,200.07);
+    TestTrue(TEXT("Fresh cached replacement never loses a drawable near section"),View->InstanceSubmitted(TEXT("blade-id")));
+    TestTrue(TEXT("Replacement uses the actual new geometry on the retained component"),View->SkinnedComponents.FindRef(TEXT("blade-id"))==BladeComponent && BladeComponent->GetStaticMesh()==OtherMesh);
+    TestEqual(TEXT("Replacement commits the current native binding immediately"),View->InstanceAssets.FindRef(TEXT("blade-id")),FString(TEXT("cached-other-blade")));
+    NearPose.ViewStates[0].Asset=TEXT("blade");NearPose.ViewStamp=200.08;View->ApplyFirstPersonLane(NearPose,200.09);
+    TestTrue(TEXT("Returning native binding restores its own geometry without a queued gap"),View->InstanceSubmitted(TEXT("blade-id")) && BladeComponent->GetStaticMesh()==BladeMesh);
     const int32 NearUpdates=View->ViewLaneUpdates;NearPose.ViewStamp=201;NearPose.ViewStates[0].Asset=TEXT("replaced");View->ApplyFirstPersonLane(NearPose,201.01);TestEqual(TEXT("Replaced equipment cannot consume an old near binding"),View->ViewLaneUpdates,NearUpdates);
     NearPose.ViewStates[0].Asset=TEXT("blade");View->ApplyFirstPersonLane(NearPose,202);TestEqual(TEXT("Fresh camera cannot renew a stale near pose"),View->ViewLaneUpdates,NearUpdates);
     View->ResourceCatalog=View->Catalog;View->MeshData.Add(TEXT("fresh-blade"),Blade);View->GeometryMaterials.Add(TEXT("fresh-blade"),ViewMID);
@@ -1512,6 +1524,46 @@ bool FMWVertexAttributeTest::RunTest(const FString&) {
             TestFalse(TEXT("Unknown binary UV flags rejected"),MWReadBinary(Invalid,MWFixtureRoot(),States));
             TestEqual(TEXT("Rejected binary decode cannot overwrite committed vertex state"),States[0].UVs[0],-.5f);
         }else AddError(TEXT("Invalid UFB2 fixture missing"));
+    }
+    // The serial workspace must not alias a previous component, retain an
+    // earlier shape's normals/channels, or shrink between unlike shapes.
+    if(Component && States.Num()==1) {
+        const FString Asset=TEXT("scratch-large"),Id=TEXT("scratch-large-instance");
+        auto Large=View->MeshData[TEXT("mutable")];
+        Large.Vertices.Add(FVector(4,5,6));Large.UVs.Add(FVector2D(.2,.4));Large.Colors.Add(FLinearColor(.1,.2,.3,.4));
+        if(Large.Normals.Num())Large.Normals.Add(FVector::UpVector);
+        if(Large.StageUV1.Num())Large.StageUV1.Add(FVector2D(.3,.5));
+        if(Large.StageUV2.Num())Large.StageUV2.Add(FVector2D(.6,.7));
+        Large.Triangles.Append({3,1,2});
+        View->MeshData.Add(Asset,MoveTemp(Large));View->GeometryMaterials.Add(Asset,View->GeometryMaterials[TEXT("mutable")]);
+        View->GeometryBindings.Add({Id,Asset,View->GeometryBindings[0].Cell});View->ResourceBindings.Add(Id,Asset);View->RenderSelectionDirty=true;
+        auto PairStates=States;auto Other=States[0];Other.Visible=true;
+        Other.Points.Append({41,52,63});Other.Colors.Append({.1f,.2f,.3f,.4f});Other.UVs.Append({.2f,.4f});
+        Other.Points[0]=21;Other.Colors[0]=.8f;Other.UVs[0]=.9f;PairStates.Add(MoveTemp(Other));
+        View->NativePoseReuseEnabled=false;View->MutableScratchEnabled=false;
+        View->UpdateGeometry(Packet,&PairStates,&Frames);View->AdvanceGeometryResources(1,32);
+        TestTrue(TEXT("Unlike mutable shapes resolve through allocation reference"),View->UpdateGeometry(Packet,&PairStates,&Frames));
+        auto* OtherComponent=View->GeometryComponents.FindRef(Id);
+        if(OtherComponent && Component->GetProcMeshSection(0) && OtherComponent->GetProcMeshSection(0)) {
+            const auto ExpectedSmall=Component->GetProcMeshSection(0)->ProcVertexBuffer,ExpectedLarge=OtherComponent->GetProcMeshSection(0)->ProcVertexBuffer;
+            View->MutableWorldScratch.Init(FVector(-100),128);View->MutableNormalScratch.Init(FVector(71,83,97),128);
+            View->MutableColorScratch.Init(FLinearColor::Red,128);View->MutableUVScratch.Init(FVector2D(27,39),128);
+            const uint64 Capacity=View->MutableScratchBytes(),Growths=View->MutableScratchGrowths;
+            View->MutableScratchEnabled=true;
+            auto Exact=[](const TArray<FProcMeshVertex>& A,const TArray<FProcMeshVertex>& B) {
+                if(A.Num()!=B.Num())return false;
+                for(int32 I=0;I<A.Num();++I)if(A[I].Position!=B[I].Position || A[I].Normal!=B[I].Normal || A[I].UV0!=B[I].UV0 || A[I].UV1!=B[I].UV1 || A[I].UV2!=B[I].UV2 || A[I].UV3!=B[I].UV3 || A[I].Color!=B[I].Color || A[I].Tangent.TangentX!=B[I].Tangent.TangentX || A[I].Tangent.bFlipTangentY!=B[I].Tangent.bFlipTangentY)return false;
+                return true;
+            };
+            for(int32 Repeat=0;Repeat<8;++Repeat) {
+                TestTrue(TEXT("Fresh two-shape state accepted with reused workspace"),View->UpdateGeometry(Packet,&PairStates,&Frames));
+                TestTrue(TEXT("Later larger shape cannot overwrite earlier mesh channels"),Exact(ExpectedSmall,Component->GetProcMeshSection(0)->ProcVertexBuffer));
+                TestTrue(TEXT("Poisoned workspace reproduces allocation reference exactly"),Exact(ExpectedLarge,OtherComponent->GetProcMeshSection(0)->ProcVertexBuffer));
+            }
+            TestEqual(TEXT("Alternating vertex counts retain workspace capacity"),View->MutableScratchBytes(),Capacity);
+            TestEqual(TEXT("Warm mutable workspace performs no capacity growth"),View->MutableScratchGrowths,Growths);
+            View->ResetScene();TestEqual(TEXT("Scene reset releases all temporary workspace bytes"),View->MutableScratchBytes(),uint64(0));
+        }else AddError(TEXT("Larger mutable workspace fixture did not create its own section"));
     }
     View->Destroy();return true;
 }

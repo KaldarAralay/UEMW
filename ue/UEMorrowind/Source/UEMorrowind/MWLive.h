@@ -303,6 +303,14 @@ private:
     TMap<FString,FString> InstanceCells;
     FString ActiveCellKey;
     TMap<FString,TArray<double>> LastRigidTransforms;
+    // Serial game-thread workspace only. Mesh sections/render commands copy
+    // their inputs before the next binding overwrites these arrays.
+    bool MutableScratchEnabled=true;
+    TArray<FVector> MutableWorldScratch,MutableNormalScratch;
+    TArray<FLinearColor> MutableColorScratch;
+    TArray<FVector2D> MutableUVScratch;
+    uint64 MutableScratchPreparations=0,MutableScratchGrowths=0;
+    uint64 MutableScratchBytes() const {return MutableWorldScratch.GetAllocatedSize()+MutableNormalScratch.GetAllocatedSize()+MutableColorScratch.GetAllocatedSize()+MutableUVScratch.GetAllocatedSize();}
     TMap<FString,FMWRigidSlot> RigidSlots;
     TMap<FString,TMap<int32,FTransform>> RigidRows;
     TSet<FString> DirtyRigidAssets;

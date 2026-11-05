@@ -74,6 +74,10 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("rigid_component_batches"),RigidComponentSlots.Num());
     Out->SetNumberField(TEXT("rigid_component_pose_updates"),(double)RigidComponentPoseUpdates);
     Out->SetNumberField(TEXT("rigid_buffer_updates"),(double)RigidBufferUpdates);
+    Out->SetBoolField(TEXT("mutable_scratch"),MutableScratchEnabled);
+    Out->SetNumberField(TEXT("mutable_scratch_preparations"),(double)MutableScratchPreparations);
+    Out->SetNumberField(TEXT("mutable_scratch_growths"),(double)MutableScratchGrowths);
+    Out->SetNumberField(TEXT("mutable_scratch_bytes"),(double)MutableScratchBytes());
     Out->SetBoolField(TEXT("rain_interpolation"),RainInterpolationEnabled);
     Out->SetNumberField(TEXT("rain_pose_histories"),RainPoses.Num());
     Out->SetNumberField(TEXT("rain_native_camera_stamp"),LastCameraStamp);

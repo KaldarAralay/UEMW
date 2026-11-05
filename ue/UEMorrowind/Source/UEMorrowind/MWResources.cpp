@@ -227,6 +227,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
     if((!NewCatalog && !ResourceError.IsEmpty()) || States.Num()!=GeometryBindings.Num())return false;
     // Validate the whole typed pose before enqueueing any work. Resource jobs
     // retain identities/bounds only, never a pose that could be replayed later.
+    {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ResourcePoseValidation);
     for(int32 i=0;i<States.Num();++i) {
         if(Unchanged && (*Unchanged)[i])continue; // exact match to a validated, complete applied pose
         const auto& S=States[i];const auto* D=MeshData.Find(GeometryBindings[i].Asset);
@@ -238,6 +239,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         if(S.Palette.Num() && (S.Points.Num() || S.Colors.Num() || S.UVs.Num() || S.Palette.Num()!=D->SkinBones*12 || D->SkinUVs.Num()!=D->Vertices.Num()))return false;
         if(D->SkinBones && S.Palette.Num()==0)return false;
     }
+    }
     if(NewCatalog){ResourceJobs.Empty();QueuedResources.Empty();ResourceBindings.Empty();ResourceJobIndex=0;ResourceCatalog=Catalog;ResourceError.Empty();}
     PendingGeometryInstances=0;int32 Ready=0;
     auto Queue=[&](uint8 Kind,const FString& Id,const FString& Asset,const FVector4f& Bound) {
@@ -247,6 +249,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
     const bool FreshNear=ViewLaneStamp>0 && Now>=ViewLaneStamp && Now-ViewLaneStamp<.15;
     const bool NearTraits=BindingTraitsCatalog==Catalog && BindingTraits.Num()==GeometryBindings.Num();
     if(NewCatalog) {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ResourceOwnership);
         if(PreparedResourceCatalog==Catalog && PreparedResourceBindings.Num()==GeometryBindings.Num())ResourceBindings=MoveTemp(PreparedResourceBindings);
         else for(const auto& B:GeometryBindings)ResourceBindings.Add(B.Id,B.Asset);
         if(FreshNear) {
@@ -259,6 +262,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         }
         for(const auto& Pair:InstanceAssets){const auto* Desired=ResourceBindings.Find(Pair.Key);if(!Desired || *Desired!=Pair.Value){if(Desired && InstanceSubmitted(Pair.Key))++PerfResourceRebindHides;HideInstance(Pair.Key);Queue(4,Pair.Key,Pair.Value,FVector4f(0,0,0,1));}}
     }
+    {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ResourceReadiness);
     for(int32 i=0;i<States.Num();++i) {
         const auto& S=States[i];if(!S.Visible)continue;
         if(Unchanged && (*Unchanged)[i]){++Ready;continue;}
@@ -303,6 +307,7 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
         else if(Rigid) {if(!RigidBatches.Contains(B.Asset))Queue(1,TEXT(""),B.Asset,S.Bound);}
         else if(Skin) {if(!SameAsset || !SkinnedComponents.Contains(B.Id))Queue(2,B.Id,B.Asset,S.Bound);}
         else if(!SameAsset || !GeometryComponents.Contains(B.Id) || GeometryComponents[B.Id]->GetNumSections()==0)Queue(3,B.Id,B.Asset,S.Bound);
+    }
     }
     GeometryPartial=PendingGeometryInstances>0;GeometryLoading=GeometryPartial;
     PerfPendingGeometryMax=FMath::Max(PerfPendingGeometryMax,PendingGeometryInstances);

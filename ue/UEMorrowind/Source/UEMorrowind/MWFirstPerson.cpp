@@ -27,6 +27,19 @@ void AMWLive::ApplyFirstPersonLane(const FMWCameraSample& Sample,double Now) {
         if(Row.Pose.Visible)ViewLaneVisibleIds.Add(Row.Id);
         ViewLaneIds.Add(Row.Id);ViewLaneAssets.Add(Row.Id,Row.Asset);const auto* D=MeshData.Find(Row.Asset);
         ResourceBindings.Add(Row.Id,Row.Asset);
+        // Redraw can reuse a native node address for another already cached
+        // rigid section. Adopt its real mesh/material before applying THIS
+        // pose, without retiring the drawable component behind a queued job.
+        const auto* Previous=MeshData.Find(InstanceAssets.FindRef(Row.Id));
+        auto* Existing=SkinnedComponents.FindRef(Row.Id);auto* MID=SkinMaterials.FindRef(Row.Id);
+        auto* Mesh=SharedMeshes.FindRef(Row.Asset);auto* Template=GeometryMaterials.FindRef(Row.Asset);
+        if(InstanceAssets.FindRef(Row.Id)!=Row.Asset && Previous && Previous->FirstPerson &&
+            Existing && !Existing->UseNativeBounds && MID && Mesh && Template && MID->GetMaterial()==Template->GetMaterial() && ViewCachedAssets.Contains(Row.Asset) &&
+            !D->SkinBones && !D->NativeVertices && !D->Transparent && !D->Lines && !Row.Pose.Palette.Num()) {
+            MID->ClearParameterValues();MID->CopyInterpParameters(Template);MID->SetScalarParameterValue(TEXT("NativeViewActive"),0);
+            Existing->SetStaticMesh(Mesh);Existing->SetMaterial(0,MID);MWNativeDrawLayer(Existing,*D);SetNativeCastShadow(Existing,*D);
+            SetInstanceAsset(Row.Id,Row.Asset);LastRigidTransforms.Remove(Row.Id);NativeResourceInvalidations.Add(Row.Id);
+        }
         const bool Ready=GeometryResourceReady({Row.Id,Row.Asset,TEXT("")},Row.Pose);
         if(Row.Pose.Visible && !Ready && ResourceCatalog==Catalog && ResourceError.IsEmpty()) {
             if(!SharedMeshes.Contains(Row.Asset))QueueGeometryResource(0,TEXT(""),Row.Asset,Row.Pose.Bound);
