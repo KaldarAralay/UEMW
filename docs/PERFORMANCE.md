@@ -1,5 +1,36 @@
 # Rendering hitches and transient visibility
 
+## Temporary-page cleanup and allocator selection (hitch05)
+
+The earlier light08 normal walk recorded a 96.389 ms CPU frame interval without a detailed trace. Its exact composition is unknown. A new engine trace reproduces **43.001 ms in automatic `FMemory::Trim`**, inside incremental GC cleanup and outside the live-scene actor tick. That frame spends 59.527 ms in the engine tick, 49.418 ms in the world tick and 6.05 ms in the live actor. The allocator's task-graph broadcast is only 0.471 ms at most. This identifies a real cleanup bottleneck, without proving it explains every millisecond of the earlier 96 ms interval.
+
+Installed UE 5.2.1 source shows that memory trim first broadcasts registered cleanup callbacks, including draining the temporary-page free pool, and then calls the selected heap allocator's trim. Normal launcher and packaged checks now select UE's existing **mimalloc** implementation. Binned3 and Binned2 remain explicit comparison choices through `UEMW_ALLOCATOR`; invalid values fail before launch and runtime logs/witnesses verify the actual allocator. No engine patch, GC suppression, deferred cleanup, visual reduction or native-game change is involved.
+
+An opt-in diagnostic times that same cleanup order separately, while the original is paused. It acquires owned 64 KiB temporary pages, returns them, and measures cleanup; page allocation/preparation is excluded. Pool bytes reach zero afterwards. Both allocators use the same diagnostic binary, with the order reversed for the large comparison. These are explicit stress measurements, not ordinary frame times or identical allocation histories.
+
+| Returned temporary pool | Binned3 cleanup, two repeats | mimalloc cleanup, two repeats |
+|---|---:|---:|
+| 64 MiB | 12.228 / 10.951 ms | 3.057 / 3.527 ms |
+| 256 MiB | 53.740 / 51.186 ms | 20.979 / 19.466 ms |
+
+Registered callbacks dominate these samples: at 256 MiB, Binned3 spends 53.073/50.729 ms there and mimalloc 20.683/19.198 ms. The subsequent allocator trim is 0.671/0.461 and 0.303/0.273 ms respectively. Cleanup cost is reduced, not eliminated, and the larger stress still exceeds a 60 Hz frame budget. Reproduce with the bounded paused diagnostic in DEVELOPMENT.md; stress requests never run at normal startup.
+
+Sequential 24-second traced walks have similar CPU median/p95/max: Binned3 16.667/17.724/32.439 ms; mimalloc 16.667/17.621/32.113 ms. They do **not** establish a general pacing speedup. Native time and allocation history differ, and tracing adds overhead. The mimalloc trace's maximum incremental-GC scope is 1.397 ms, but that one run cannot bound future cleanup.
+
+The final **normal launch**, with heavy trace/capture/presentation diagnostics disabled, retains D3D12/SM5, the RHI thread, VSync, the 60 FPS cap, original rendering and the preceding lighting/material features. Actual fitted viewport is **1024x768**. A 60-second walking collection reports:
+
+| CPU/GPU scope | Median | p95 | Maximum |
+|---|---:|---:|---:|
+| UE game-thread frame interval | 16.667 ms | 19.388 ms | 47.883 ms |
+| Live-scene actor tick | 7.998 ms | 15.161 ms | 33.394 ms |
+| GPU timestamps | 1.785 ms | 2.939 ms | 4.127 ms |
+
+Catalog staging peaks at 7.698 ms, with zero resource-rebind hides. Exact first-person checks pass 39 observations of all eighteen native-visible sections, plus four draws taking 437/579/458/464 ms including native animation and polling. The native sword fixture also contains a hidden shadow helper; the diagnostic now checks that helper stays hidden instead of incorrectly requiring all nineteen native shapes visible. Production pose/visibility checks are unchanged. All **411 source tests, 37 packaged renderer tests and eight GPU runs** pass with the selected allocator, including both lighting backends, mutable attributes, skin, rigid transforms, terrain, reflections and alpha boundaries.
+
+No 96 ms interval appears in the final minute, but **47.883 ms remains a hitch**. Cold tracing also records an 81.194 ms engine tick with 34.075 ms in distant scenery, including 15.765 ms resource preparation; this precedes the measured warm walk and is a separate unresolved cost. Other material/resource work, longer sessions, other scenes and actual display pacing remain open. These CPU intervals/GPU scopes are not displayed FPS or proof of locked 60. Final process working set is about 1.54 GiB and private bytes 2.45 GiB; there is no matched memory-reduction or long-session stability claim.
+
+Evidence is retained under ignored `logs/hitch05-*`: baseline and allocator traces/exports, pool comparisons, normal walk/weapon results, tests, build identity and final audit. The first baseline weapon-readiness attempt was rejected because of the native-hidden helper. A mistakenly requested 75-second collection was rejected by the benchmark's 60-second limit and contributes no timing evidence; the accepted collection was rerun for 60 seconds. Saves/executable integrity and current source/archive hashes are verified separately in `hitch05-results.json`. No video or saves were written. Earlier sections below describe their own historical builds and defaults.
+
 ## Original shadow footprint and material response (light08)
 
 The previous native-diffuse adapter calculated source light energy, then multiplied both ambient and direct terms by texture-derived cavity. Inferred normals also changed the original diffuse calculation, and inferred metallic/specular finishes changed the UE response used to reproduce it. These additions could darken or brighten surfaces independently of the original light state. The matching path now uses source normals for native irradiance, omits the extra cavity multiplier and inferred metallic/specular BRDF for that path, and retains authored glow/gloss/environment stages. Inferred normal relief remains in the UE receiver/compensation path; the older non-native material paths remain available.

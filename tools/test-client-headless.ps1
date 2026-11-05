@@ -27,7 +27,7 @@ try {
 }finally{if(!$Fixture.HasExited -and !$Fixture.WaitForExit(1000)){$Fixture.Kill();$Fixture.WaitForExit()}}
 if(!(Test-Path -LiteralPath $TestLog) -or (Get-Item -LiteralPath $TestLog).LastWriteTimeUtc -lt $TestStarted){throw 'UE did not produce a fresh test log; an old result cannot pass this run.'}
 $Contents=Get-Content -LiteralPath $TestLog -Raw
-$ExpectedAllocator=(Get-UEMWAllocatorArgument).Replace('-binnedmalloc','binned')
+$ExpectedAllocator=(Get-UEMWAllocatorArgument).TrimStart('-').Replace('binnedmalloc','binned')
 if($Contents -notmatch "LogInit: Allocator: $ExpectedAllocator"){throw 'Headless test did not confirm the requested allocator.'}
 if($Contents -notmatch 'NativeTopology'){throw 'Native topology test was not executed'}
 if($Contents -notmatch 'DistantScenery'){throw 'Distant scenery test was not executed'}

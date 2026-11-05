@@ -27,6 +27,9 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Misc/SecureHash.h"
+#include "Misc/MemStack.h"
+#include "Misc/CoreDelegates.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
 #include "Serialization/JsonSerializer.h"
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -517,8 +520,26 @@ void AMWLive::PublishStateWitness() {
     auto Witness=BuildStateWitness(Ids,Now);Witness->SetStringField(TEXT("request_id"),Token);
     if(Request->HasField(TEXT("memory_trim"))) {
         bool Trim=false;if(!DiagnosticScreenshots || !Request->TryGetBoolField(TEXT("memory_trim"),Trim) || !Trim)return;
-        const double Began=FPlatformTime::Seconds();FMemory::Trim();
+        double Pages=0;
+        if(Request->HasField(TEXT("memory_trim_pages")) && (!Request->TryGetNumberField(TEXT("memory_trim_pages"),Pages) || !FMath::IsFinite(Pages) || Pages<0 || Pages>4096 || Pages!=FMath::TruncToDouble(Pages) || !NativeMenuOpen))return;
+        // Explicit, paused diagnostic only: fill the same public temporary
+        // page pool that the engine trims. No live allocation is reclaimed.
+        const double Prepare=FPlatformTime::Seconds();TArray<void*> Owned;Owned.Reserve(int32(Pages));
+        for(int32 I=0;I<int32(Pages);++I){void* P=FPageAllocator::Get().Alloc();*static_cast<uint8*>(P)=0;Owned.Add(P);}
+        for(void* P:Owned)FPageAllocator::Get().Free(P);
+        Witness->SetNumberField(TEXT("memory_trim_prepare_ms"),(FPlatformTime::Seconds()-Prepare)*1000);
+        Witness->SetNumberField(TEXT("memory_trim_owned_pages"),Pages);
+        Witness->SetNumberField(TEXT("memory_trim_free_bytes_before"),(double)FPageAllocator::Get().BytesFree());
+        // Preserve FMemory::Trim's cleanup order, with separate measurements
+        // for its registered cleanup callbacks and the allocator itself.
+        const double Began=FPlatformTime::Seconds();
+        {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_TrimCallbacks);FCoreDelegates::GetMemoryTrimDelegate().Broadcast();}
+        const double AllocatorBegan=FPlatformTime::Seconds();
+        {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_TrimAllocator);GMalloc->Trim(true);}
         Witness->SetNumberField(TEXT("memory_trim_cpu_ms"),(FPlatformTime::Seconds()-Began)*1000);
+        Witness->SetNumberField(TEXT("memory_trim_callbacks_ms"),(AllocatorBegan-Began)*1000);
+        Witness->SetNumberField(TEXT("memory_trim_allocator_ms"),(FPlatformTime::Seconds()-AllocatorBegan)*1000);
+        Witness->SetNumberField(TEXT("memory_trim_free_bytes_after"),(double)FPageAllocator::Get().BytesFree());
     }
     if(Request->HasField(TEXT("record_seconds"))) {
         double Seconds=0;

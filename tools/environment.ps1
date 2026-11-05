@@ -3,11 +3,14 @@
 function Get-UEMWRoot { Split-Path -Parent $PSScriptRoot }
 
 function Get-UEMWAllocatorArgument {
-    $Allocator=if($env:UEMW_ALLOCATOR){$env:UEMW_ALLOCATOR}else{'binned3'}
+    # UE 5.2.1's built-in mimalloc reduces the measured temporary-page cleanup
+    # stall. Garbage collection and memory-trim callbacks remain enabled.
+    $Allocator=if($env:UEMW_ALLOCATOR){$env:UEMW_ALLOCATOR}else{'mimalloc'}
     switch($Allocator){
         'binned3' {return '-binnedmalloc3'}
         'binned2' {return '-binnedmalloc2'}
-        default {throw 'UEMW_ALLOCATOR must be binned2 or binned3. Nothing was started.'}
+        'mimalloc' {return '-mimalloc'}
+        default {throw 'UEMW_ALLOCATOR must be binned2, binned3 or mimalloc. Nothing was started.'}
     }
 }
 

@@ -43,8 +43,16 @@ def run(reader,seconds=12,screenshots=False,draw_cycles=4):
         if not reader.player_state(world)['weapon_ready']:pulse(reader,'key',0x21,.12)
         def ready():
             p=quick_json(ROOT/'local/bridge/camera.json',256*1024);v=p.get('view')
-            return v if v and len(v['states'])>=18 and all(s['visible']for s in v['states']) else None
-        v=wait(ready,8);ids=[s['id']for s in v['states']];time.sleep(.3)
+            return v if v and sum(s['visible']for s in v['states'])>=18 else None
+        v=wait(ready,8);ids=[s['id']for s in v['states']if s['visible']];time.sleep(.3)
+        # Original shadow-helper geometry can remain in the near graph while
+        # hidden. Check its suppression separately; keep exact pose/visibility
+        # checks on every actually visible hand and weapon section below.
+        hidden=[s['id']for s in v['states']if not s['visible']]
+        if hidden:
+            h=witness(hidden,poll=.01)
+            if len(h['instances'])!=len(hidden)or any(s['submitted_visible']for s in h['instances']):raise RuntimeError('A native-hidden near section was rendered')
+        report['native_hidden_sections']=hidden
         w=wait(lambda:live(reader),8)
         if not w.get('first_person_lane_updates'):raise RuntimeError('Renderer is not consuming independent near poses')
         report['feet_before']=feet(reader);source=[]
@@ -88,8 +96,8 @@ def run(reader,seconds=12,screenshots=False,draw_cycles=4):
             start=time.perf_counter();pulse(reader,'key',0x21,.12)
             def drawn():
                 p=quick_json(ROOT/'local/bridge/camera.json',256*1024);v=p.get('view')
-                if not v or len(v['states'])<expected_count or not all(s['visible']for s in v['states']):return None
-                ids=[s['id']for s in v['states']];w=witness(ids,poll=.01)
+                if not v or sum(s['visible']for s in v['states'])<expected_count:return None
+                ids=[s['id']for s in v['states']if s['visible']];w=witness(ids,poll=.01)
                 return w if w['first_person_lane_updates']and len(w['instances'])==len(ids)and all(s['submitted_visible']for s in w['instances'])else None
             w=wait(drawn,5);report['draws'].append(dict(ue_ms=(time.perf_counter()-start)*1000,near_updates=w['first_person_lane_updates'],pose_stamp=w['first_person_pose_unix_ns'],sections=len(w['instances']),post_draw=[]))
             new_ids=[s['id']for s in w['instances']]
