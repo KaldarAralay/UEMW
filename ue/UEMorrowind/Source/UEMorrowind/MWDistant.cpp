@@ -51,6 +51,8 @@ FMWDistantPtr MWReadDistant(const FString& Root,FMWDistantPtr Previous) {
     else if(!MWReadCatalogBindings(Out->Catalog,Out->Digest,Folder,Out->Bindings))return Out;
     if(Out->Bindings.Num()!=int32(Count))return Out;
     for(const auto& B:Out->Bindings){FIntPoint G;if(!B.Id.StartsWith(TEXT("distant:")) || !MWDistantCell(B.Cell,G) || FMath::Abs(G.X-Out->Center.X)>3 || FMath::Abs(G.Y-Out->Center.Y)>3)return Out;}
+    if(Previous.IsValid() && Previous->Valid && Previous->Catalog==Out->Catalog && Previous->Digest==Out->Digest && Previous->BindingSnapshot.IsValid())Out->BindingSnapshot=Previous->BindingSnapshot;
+    else Out->BindingSnapshot=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>(Out->Bindings);
     if(Previous.IsValid() && Previous->Valid && Previous->Poses==Out->Poses && Previous->PoseDigest==Out->PoseDigest && Previous->States.Num()==int32(Count))Out->States=Previous->States;
     else {
         TArray<uint8> Bytes;const FString File=Folder/Out->Poses;const int64 Size=8+int64(Count)*56;
@@ -70,7 +72,10 @@ void FMWDistantView::Update(AMWLive& O) {
     const double Now=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds(),Tick=FPlatformTime::Seconds();FIntPoint Center;
     auto Hide=[&](const TCHAR* Why){O.DistantStatus=Why;O.DistantVisible=0;if(O.DistantGeometry)O.DistantGeometry->HideScene();};
     if(!O.DistantEnabled || !O.SceneShown || !O.SourcePid || !O.Status.StartsWith(TEXT("LIVE /")) || O.NativeMenuOpen || !MWDistantCell(O.ActiveCellKey,Center) || Now-O.SourcePacketStamp>.5){Hide(TEXT("inactive original exterior"));return;}
-    if(Future.IsValid() && Future.IsReady()){State=Future.Get();Future=TFuture<FMWDistantPtr>();}
+    if(Future.IsValid() && Future.IsReady()){
+        auto Retired=MoveTemp(State);State=Future.Get();Future.Reset();
+        if(Retired.IsValid())Async(EAsyncExecution::ThreadPool,[Retired=MoveTemp(Retired)]()mutable{Retired.Reset();});
+    }
     if(!Future.IsValid() && Tick>=NextRead){const FString Root=O.DataRoot;const auto Previous=State;Future=Async(EAsyncExecution::ThreadPool,[Root,Previous](){return MWReadDistant(Root,Previous);});NextRead=Tick+.1;}
     if(!State.IsValid() || !MWDistantMatches(*State,O.SourcePid,O.Session,O.SceneEpoch,Now)){Hide(TEXT("waiting for fresh native static state"));return;}
     if(!O.DistantGeometry) {
@@ -93,6 +98,16 @@ void FMWDistantView::Update(AMWLive& O) {
     // This is conservative and avoids thousands of component lookups per tick.
     TArray<FString> Cells;for(const auto& G:NativeCells)Cells.Add(FString::Printf(TEXT("%d,%d"),G.X,G.Y));for(const auto& G:State->Excluded)Cells.Add(FString::Printf(TEXT("%d,%d"),G.X,G.Y));Cells.Sort();
     FString Key=State->Catalog+State->Poses+O.ActiveCellKey;for(const auto& C:Cells)Key+=TEXT("|")+C;
+    // Native camera/actors/UI have priority over speculative distant capacity.
+    // Do not stack a second cold scene apply onto an expensive native frame.
+    // Current identity/residency gates above still run; changed membership is
+    // hidden immediately, and a later fresh state must authorize its redraw.
+    if(O.SceneTickBegan>0 && FPlatformTime::Seconds()-O.SceneTickBegan>.012) {
+        ++O.DistantWorkDeferred;
+        if(Key!=GateKey){Hide(TEXT("distant preparation yielding to native frame"));return;}
+        V.ShowScene();
+        O.DistantVisible=V.SceneShown?V.VisibleInstances.Num():0;O.DistantNativeStamp=State->NativeStamp;return;
+    }
     // Resource creation keeps its per-tick budget. Revalidating all 4096
     // unchanged static bindings on every incomplete tick was substantially
     // more expensive than the resource work itself. Changed source poses,
@@ -113,7 +128,7 @@ void FMWDistantView::Update(AMWLive& O) {
     auto States=State->States;int32 Eligible=0;
     for(int32 I=0;I<States.Num();++I){States[I].Visible&=MWDistantEligible(*State,State->Bindings[I].Cell,Center,NativeCells);Eligible+=States[I].Visible?1:0;}
     auto Packet=MakeShared<FJsonObject>();Packet->SetStringField(TEXT("scene_epoch"),O.SceneEpoch);Packet->SetStringField(TEXT("scene_catalog"),State->Catalog);Packet->SetStringField(TEXT("scene_catalog_md5"),State->Digest);Packet->SetNumberField(TEXT("geometry_version"),5);Packet->SetNumberField(TEXT("sample_unix_ns"),State->NativeStamp*1e9);
-    V.SourceBindingSnapshot=MakeShared<TArray<FMWBinding>,ESPMode::ThreadSafe>(State->Bindings);V.SourceBindingCatalog=State->Catalog;
+    V.SourceBindingSnapshot=State->BindingSnapshot;V.SourceBindingCatalog=State->Catalog;
     const bool Applied=V.UpdateGeometry(Packet,&States,nullptr,nullptr,&State->Bindings);
     V.FlushRigidBatches();
     if(Applied){V.ShowScene();GateKey=Key;}else V.HideScene();

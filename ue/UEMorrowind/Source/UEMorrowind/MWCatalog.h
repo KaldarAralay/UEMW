@@ -6,6 +6,7 @@
 #include "MWFrame.h"
 #include "MWTextureUpgrade.h"
 #include "MWTerrain.h"
+#include "MWMesh.h"
 // Only plain arrays/images cross the worker boundary. UObjects are created on
 // the game thread in bounded batches, then the catalog commits as one binding set.
 struct FMWTextureImages {TArray<FImage> Color,Masked,Detail,Blend;};
@@ -28,6 +29,7 @@ struct FMWCatalogData {
     int32 PoseSourceCount=0;
     TArray<int32> PoseRemap;
     TMap<FString,FMWMeshData> Meshes;
+    TMap<FString,FMWPreparedMeshPtr> PreparedMeshes;
     TArray<FString> MeshKeys,TextureKeys,AliasKeys;
     TMap<FString,FString> AlphaModes;
     TMap<FString,FMWTextureImages> Images;

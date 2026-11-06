@@ -39,6 +39,7 @@
 #include "Components/SceneCaptureComponent2D.h"
 #include "MaterialDomain.h"
 #include "Engine/StaticMesh.h"
+#include "StaticMeshResources.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -125,6 +126,7 @@ bool FMWDistantTest::RunTest(const FString&) {
     S->Excluded.Add(FIntPoint(3,0));TestFalse(TEXT("Captured residency wins after asynchronous boundary release"),MWDistantEligible(*S,TEXT("distant:3,0"),FIntPoint(0,0),{}));S->Excluded.Remove(FIntPoint(3,0));
     for(const TCHAR* Label:{TEXT("nan"),TEXT("visible"),TEXT("trailing"),TEXT("path"),TEXT("hash"),TEXT("count")})TestFalse(TEXT("Malformed/foreign scenery fails closed"),MWReadDistant(MWFixtureRoot()/(FString(TEXT("distant-"))+Label))->Valid);
     auto Cached=MWReadDistant(Root,S);TestTrue(TEXT("Unchanged immutable poses remain exact under a new lease"),Cached->Valid && MWGeometryStateEqual(Cached->States[0],S->States[0]));
+    TestTrue(TEXT("Distant binding snapshots are decoder-owned and reused on identical catalog identity"),S->BindingSnapshot.IsValid() && S->BindingSnapshot==Cached->BindingSnapshot && MWEqualBindingTables(*S->BindingSnapshot,S->Bindings));
     auto* World=GEngine->GetWorldContexts()[0].World();if(!World)return false;
     auto* V=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);if(!V)return false;
     V->AuxiliaryGeometry=true;V->DataRoot=Root;V->AssetsPath=Root/TEXT("local/distant-assets");V->EnvironmentTexture=MWFloatTexture(8,33,{});V->ActiveCellKey=TEXT("exterior:0,0");V->FinishSpawning(FTransform::Identity);
@@ -1115,6 +1117,27 @@ bool FMWRuntimeMeshTest::RunTest(const FString&) {
     TestTrue(TEXT("UV metadata initialized"),Mesh->GetStaticMaterials()[0].UVChannelData.bInitialized);
     TestTrue(TEXT("Nonstreaming runtime mesh"),Mesh->NeverStream);
     TestTrue(TEXT("Swapped local bounds"),Mesh->GetBounds().BoxExtent.Equals(FVector(2,1.5,0),1e-5));
+    Data.Normals.Init(FVector(1,2,3).GetSafeNormal(),3);
+    Data.Colors={FLinearColor(.2,.4,.6,.8),FLinearColor(.8,.6,.4,.2),FLinearColor::White};
+    Data.SkinUVs=Data.UVs;Data.StageUV1={FVector2D(.1,.2),FVector2D(.3,.4),FVector2D(.5,.6)};Data.StageUV2=Data.StageUV1;
+    auto Work=Async(EAsyncExecution::ThreadPool,[Data](){return MWPrepareMesh(Data);});
+    auto Prepared=Work.Get();Work.Reset();TestTrue(TEXT("Plain description prepares on worker"),Prepared.IsValid());
+    auto* PreparedMesh=MWBuildMesh(GetTransientPackage(),Data,nullptr,MoveTemp(Prepared),true);
+    auto* Reference=MWBuildMesh(GetTransientPackage(),Data,nullptr,nullptr,true);
+    if(PreparedMesh && Reference) {
+        const auto& A=PreparedMesh->GetRenderData()->LODResources[0];const auto& B=Reference->GetRenderData()->LODResources[0];
+        TestEqual(TEXT("Prepared mesh preserves index count"),A.IndexBuffer.GetNumIndices(),B.IndexBuffer.GetNumIndices());
+        TestEqual(TEXT("Prepared mesh preserves vertex count"),A.GetNumVertices(),B.GetNumVertices());
+        TestEqual(TEXT("Prepared mesh preserves all four UV channels"),A.VertexBuffers.StaticMeshVertexBuffer.GetNumTexCoords(),uint32(4));
+        for(int32 I=0;I<A.GetNumVertices();++I) {
+            TestEqual(TEXT("Prepared local positions equal synchronous reference"),A.VertexBuffers.PositionVertexBuffer.VertexPosition(I),B.VertexBuffers.PositionVertexBuffer.VertexPosition(I));
+            TestEqual(TEXT("Prepared normals equal synchronous reference"),A.VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ(I),B.VertexBuffers.StaticMeshVertexBuffer.VertexTangentZ(I));
+            TestEqual(TEXT("Prepared display colour bytes equal synchronous reference"),A.VertexBuffers.ColorVertexBuffer.VertexColor(I),B.VertexBuffers.ColorVertexBuffer.VertexColor(I));
+            for(uint32 UV=0;UV<4;++UV)TestEqual(TEXT("Prepared UV channels equal synchronous reference"),A.VertexBuffers.StaticMeshVertexBuffer.GetVertexUV(I,UV),B.VertexBuffers.StaticMeshVertexBuffer.GetVertexUV(I,UV));
+        }
+        for(int32 I=0;I<A.IndexBuffer.GetNumIndices();++I)TestEqual(TEXT("Prepared winding/indices equal synchronous reference"),A.IndexBuffer.GetIndex(I),B.IndexBuffer.GetIndex(I));
+    }else AddError(TEXT("Prepared/reference runtime mesh unavailable"));
+    FThreadSafeBool Cancelled=true;TestFalse(TEXT("Cancelled preparation produces no publishable mesh"),MWPrepareMesh(Data,&Cancelled).IsValid());
     return true;
 }
 static FString MWFixtureRoot() {
@@ -1635,6 +1658,13 @@ bool FMWResourceProgressTest::RunTest(const FString&) {
     View->PrepareRigidBatch(TEXT("rigid"));Pose(1300);States[0].Transform[1]=.2f;View->UpdateGeometry(Packet,&States,&Frames);
     TestTrue(TEXT("Repeated native shear changes retain component identity and visibility"),View->GeometryComponents.FindRef(TEXT("resource-0"))==AffinePart && View->InstanceSubmitted(TEXT("resource-0")));
     const int32 Built=View->SharedMeshes.Num();
+    View->MeshData[TEXT("rigid")].HaveNativeActor=true;View->MeshData[TEXT("rigid")].NativeActor=false;View->ColdSceneryBatchLimit=1;
+    View->HideInstance(TEXT("resource-3"));View->HideInstance(TEXT("resource-6"));View->NativePoseValid=false;
+    Pose(1400);TestTrue(TEXT("Cold scenery submits a bounded current subset"),View->UpdateGeometry(Packet,&States,&Frames) && View->GeometryPartial);
+    TestTrue(TEXT("Only one hidden scenery node becomes drawable within one-job budget"),View->InstanceSubmitted(TEXT("resource-3")) && !View->InstanceSubmitted(TEXT("resource-6")));
+    Pose(1500);TestTrue(TEXT("Next fresh packet finishes remaining cold scenery"),View->UpdateGeometry(Packet,&States,&Frames));
+    TestTrue(TEXT("Deferred scenery receives current pose, not saved coordinates"),View->InstanceSubmitted(TEXT("resource-6")) && View->LastRigidTransforms[TEXT("resource-6")][9]==1506.f);
+    View->ColdSceneryBatchLimit=128;
     if(!Load(TEXT("catalog-resources-1.json"))){AddError(TEXT("Second resource catalog failed"));View->Destroy();return false;}
     Pose(2000);View->UpdateGeometry(Packet,&States,&Frames);TestTrue(TEXT("Membership change queues retirement and replacement resources"),View->ResourceJobs.Num()>0);
     const double NextDeadline=FPlatformTime::Seconds()+4;int32 Iteration=0;bool Applied=false;
@@ -1650,7 +1680,27 @@ bool FMWResourceProgressTest::RunTest(const FString&) {
     View->SourcePacketStamp=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds()-1;View->Status=TEXT("LOADING ORIGINAL GEOMETRY");View->Tick(.016f);
     TestTrue(TEXT("Source loss during staging becomes an explicit disconnect"),View->Status.StartsWith(TEXT("DISCONNECTED:")));
     TestEqual(TEXT("Stale source does not keep allocating resources"),View->ResourceJobs.Num()-View->ResourceJobIndex,Pending);
+    const FString HiddenId=TEXT("never-created-hidden");
+    View->GeometryBindings.Add({HiddenId,TEXT("rigid"),TEXT("exterior:0,0")});View->CatalogBindingSnapshot.Reset();
+    View->ResourceBindings.Add(HiddenId,TEXT("rigid"));
+    auto Extended=States;FMWGeometryState Hidden;Hidden.Visible=false;Hidden.Transform[0]=Hidden.Transform[4]=Hidden.Transform[8]=Hidden.Transform[12]=1;Hidden.Transform[9]=1777;Extended.Add(Hidden);
+    View->UpdateGeometry(Packet,&Extended,&Frames);
+    TestTrue(TEXT("Never-created hidden node retains its cell owner without allocating an instance"),!View->InstanceAssets.Contains(HiddenId) && View->InstanceCells.FindRef(HiddenId)==TEXT("exterior:0,0"));
+    Extended.Last().Visible=true;View->UpdateGeometry(Packet,&Extended,&Frames);
+    TestTrue(TEXT("A later native appearance still creates and submits actual current geometry"),View->InstanceSubmitted(HiddenId) && View->LastRigidTransforms[HiddenId][9]==1777.0);
+    Extended.Last().Visible=false;View->UpdateGeometry(Packet,&Extended,&Frames);
+    TestFalse(TEXT("Already-created native node still obeys immediate hide"),View->InstanceSubmitted(HiddenId));
+    UPrimitiveComponent* Retired=View->GeometryComponents.Num()?View->GeometryComponents.CreateConstIterator().Value():nullptr;
     View->ResetScene();TestEqual(TEXT("Epoch reset cancels queued resources"),View->ResourceJobs.Num(),0);TestEqual(TEXT("Epoch reset clears pending membership"),View->ResourceBindings.Num(),0);
+    const int32 RetirementCount=View->RetiredScenePrimitives.Num();TestTrue(TEXT("Reset queues old component destruction"),RetirementCount>1);
+    TestTrue(TEXT("Old registered proxies are hidden immediately"),Retired && !Retired->GetVisibleFlag() && !Retired->CastShadow);
+    auto* NewEpochComponent=NewObject<UProceduralMeshComponent>(View);NewEpochComponent->RegisterComponent();View->GeometryComponents.Add(TEXT("new-epoch"),NewEpochComponent);
+    View->ShowScene();TestTrue(TEXT("Showing a new epoch cannot revive old primitives"),Retired && !Retired->GetVisibleFlag());
+    View->AdvanceSceneRetirement(0,1);TestEqual(TEXT("One-job retirement budget destroys exactly one old primitive"),View->RetiredScenePrimitives.Num(),RetirementCount-1);
+    TestTrue(TEXT("Retirement cannot destroy new scene resources"),NewEpochComponent->IsRegistered());
+    while(View->RetiredScenePrimitives.Num())View->AdvanceSceneRetirement(1,256);
+    TestTrue(TEXT("All old primitives unregister even with stale source"),Retired && !Retired->IsRegistered());
+    TestTrue(TEXT("Retirement requests normal GC after draining"),!View->SceneRetirementGC);
     View->Destroy();return true;
 }
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWStreamingTest,"UEMW.Renderer.FreshStreamingPoses",EAutomationTestFlags::ApplicationContextMask|EAutomationTestFlags::EngineFilter)
@@ -1726,7 +1776,9 @@ bool FMWRigidComponentTransformTest::RunTest(const FString&) {
     auto* M=UMaterialInstanceDynamic::Create(LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/UEMW/Materials/MW_Opaque.MW_Opaque")),V);
     TArray<FVector4f> Lighting;Lighting.SetNumZeroed(8*33);Lighting[0]=FVector4f(.05,.05,.05,1);Lighting[1]=FVector4f(.8,.6,.4,0);Lighting[2]=FVector4f(-.3,.1,-1,0);
     M->SetTextureParameterValue(TEXT("NativeEnvironment"),MWFloatTexture(8,33,Lighting));M->SetScalarParameterValue(TEXT("NativeLit"),1);M->SetScalarParameterValue(TEXT("NativeFog"),0);M->SetScalarParameterValue(TEXT("NativeEffectQuality"),0);M->SetScalarParameterValue(TEXT("NativeModernLighting"),0);
-    auto* Mesh=MWBuildMesh(V,D,M);if(!Mesh)return false;
+    auto Preparation=Async(EAsyncExecution::ThreadPool,[D](){return MWPrepareMesh(D);});
+    auto Prepared=Preparation.Get();Preparation.Reset();TestTrue(TEXT("GPU fixture uses worker-prepared mesh data"),Prepared.IsValid());
+    auto* Mesh=MWBuildMesh(V,D,M,MoveTemp(Prepared));if(!Mesh)return false;
     for(auto* Owner:{V,R}){Owner->MeshData.Add(TEXT("owned-single"),D);Owner->GeometryMaterials.Add(TEXT("owned-single"),M);Owner->SharedMeshes.Add(TEXT("owned-single"),Mesh);if(!Owner->PrepareRigidBatch(TEXT("owned-single")))return false;}
     auto* Batch=V->RigidBatches[TEXT("owned-single")];auto* Reference=R->RigidBatches[TEXT("owned-single")];
     TestTrue(TEXT("Component placement adds no gameplay simulation"),Batch->GetCollisionEnabled()==ECollisionEnabled::NoCollision && !Batch->IsSimulatingPhysics());

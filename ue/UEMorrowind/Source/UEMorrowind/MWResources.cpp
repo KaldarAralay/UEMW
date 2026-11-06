@@ -13,6 +13,13 @@
 #include "Misc/ScopeExit.h"
 #include "GameFramework/PlayerController.h"
 
+UStaticMesh* AMWLive::BuildSharedMesh(const FString& Asset) {
+    const auto* D=MeshData.Find(Asset);if(!D)return nullptr;
+    FMWPreparedMeshPtr Prepared;PreparedSharedMeshes.RemoveAndCopyValue(Asset,Prepared);
+    if(Prepared.IsValid())++PreparedMeshBuilds;else ++ReferenceMeshBuilds;
+    return MWBuildMesh(this,*D,GeometryMaterials.FindRef(Asset),MoveTemp(Prepared));
+}
+
 void AMWLive::SetNativeCastShadow(UPrimitiveComponent* Component,const FMWMeshData& Data) {
     if(!Component)return;
     static const FName Tag(TEXT("UEMWShadowCaster"));
@@ -357,7 +364,7 @@ void AMWLive::AdvanceGeometryResources(double Budget,int32 MaxJobs) {
         }
         else if(Job.Kind==0) {
             if(!SharedMeshes.Contains(Job.Asset)) {
-                auto* Mesh=MWBuildMesh(this,*D,Material);
+                auto* Mesh=BuildSharedMesh(Job.Asset);
                 if(!Mesh){ResourceError=TEXT("Native shared mesh construction failed");return;}
                 SharedMeshes.Add(Job.Asset,Mesh);
             }

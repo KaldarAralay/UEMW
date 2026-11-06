@@ -31,6 +31,7 @@ struct FMWPresentationWriter;
 struct FMWCameraSample;
 struct FMWGeometryState;
 struct FMWCatalogLoader;
+struct FMWPreparedMesh;
 class FMWBackgroundView;
 class UDirectionalLightComponent;
 class UMWNativeSkyComponent;
@@ -298,6 +299,13 @@ private:
     FString AssetsPath, Catalog, SceneEpoch;
     FName GeometryTextureParameter;
     TMap<FString,FMWMeshData> MeshData;
+    TMap<FString,TSharedPtr<const FMWPreparedMesh,ESPMode::ThreadSafe>> PreparedSharedMeshes;
+    UStaticMesh* BuildSharedMesh(const FString& Asset);
+    uint64 PreparedMeshBuilds=0,ReferenceMeshBuilds=0;
+    int32 ColdSceneryBatchLimit=128;
+    uint64 ColdSceneryDeferred=0;
+    double SceneTickBegan=0;
+    uint64 DistantWorkDeferred=0;
     TArray<FMWBinding> GeometryBindings;
     TMap<FString,FString> InstanceAssets;
     TMap<FString,FString> InstanceCells;
@@ -331,6 +339,13 @@ private:
     bool GeometryPartial=false;
     int32 PendingGeometryInstances=0,PerfPendingGeometryMax=0;
     TArray<double> PerfResourceMs;
+    // Retired components cannot reappear when this actor shows its new epoch.
+    // Strong ownership keeps them alive until bounded game-thread destruction.
+    UPROPERTY() TArray<UPrimitiveComponent*> RetiredScenePrimitives;
+    bool SceneRetirementGC=false;
+    uint64 ScenePrimitivesRetired=0;
+    TArray<double> PerfSceneResetMs,PerfSceneRetirementMs;
+    void AdvanceSceneRetirement(double Budget=.001,int32 MaxComponents=32);
     bool EnsureGeometryResources(const TArray<FMWGeometryState>& States,const TBitArray<>* Unchanged=nullptr);
     void QueueGeometryResource(uint8 Kind,const FString& Id,const FString& Asset,const FVector4f& Bound);
     TSet<FString> ViewCachedAssets;

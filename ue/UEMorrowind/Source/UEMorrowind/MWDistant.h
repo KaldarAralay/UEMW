@@ -11,6 +11,7 @@ struct FMWDistantState {
     FIntPoint Center=FIntPoint::ZeroValue;
     TSet<FIntPoint> Excluded;
     TArray<FMWBinding> Bindings;
+    TSharedPtr<const TArray<FMWBinding>,ESPMode::ThreadSafe> BindingSnapshot;
     TArray<FMWGeometryState> States;
 };
 using FMWDistantPtr=TSharedPtr<FMWDistantState,ESPMode::ThreadSafe>;

@@ -75,6 +75,12 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("rigid_component_pose_updates"),(double)RigidComponentPoseUpdates);
     Out->SetNumberField(TEXT("rigid_buffer_updates"),(double)RigidBufferUpdates);
     Out->SetBoolField(TEXT("mutable_scratch"),MutableScratchEnabled);
+    Out->SetNumberField(TEXT("scene_primitives_retiring"),RetiredScenePrimitives.Num());
+    Out->SetNumberField(TEXT("scene_primitives_retired"),(double)ScenePrimitivesRetired);
+    Out->SetNumberField(TEXT("prepared_mesh_builds"),(double)PreparedMeshBuilds);
+    Out->SetNumberField(TEXT("reference_mesh_builds"),(double)ReferenceMeshBuilds);
+    Out->SetNumberField(TEXT("cold_scenery_deferred"),(double)ColdSceneryDeferred);
+    Out->SetNumberField(TEXT("distant_work_deferred"),(double)DistantWorkDeferred);
     Out->SetNumberField(TEXT("mutable_scratch_preparations"),(double)MutableScratchPreparations);
     Out->SetNumberField(TEXT("mutable_scratch_growths"),(double)MutableScratchGrowths);
     Out->SetNumberField(TEXT("mutable_scratch_bytes"),(double)MutableScratchBytes());

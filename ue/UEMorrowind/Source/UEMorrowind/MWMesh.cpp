@@ -7,6 +7,11 @@
 #include "StaticMeshAttributes.h"
 #include "Materials/MaterialInterface.h"
 #include "Components/PrimitiveComponent.h"
+#include "Async/Async.h"
+#include "HAL/ThreadSafeBool.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+
+struct FMWPreparedMesh {FMeshDescription Description;};
 
 bool MWNativeCastsShadow(const FMWMeshData& Data,bool ActorPolicy) {
     // Vanilla real-time shadows are actor-owned. Older/owned definitions
@@ -42,8 +47,9 @@ bool MWCanInstance(const double* M) {
     return AB>1e-12 && AC>1e-12 && BC>1e-12 && FMath::Abs(A.Dot(B))/AB<1e-5 && FMath::Abs(A.Dot(C))/AC<1e-5 && FMath::Abs(B.Dot(C))/BC<1e-5;
 }
 
-UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterface* Material) {
-    FMeshDescription Description;
+FMWPreparedMeshPtr MWPrepareMesh(const FMWMeshData& Data,const FThreadSafeBool* Cancelled) {
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_PrepareMeshDescription);
+    auto Prepared=MakeShared<FMWPreparedMesh,ESPMode::ThreadSafe>();auto& Description=Prepared->Description;
     FStaticMeshAttributes Attributes(Description);Attributes.Register();
     auto Positions=Attributes.GetVertexPositions();
     auto Normals=Attributes.GetVertexInstanceNormals();
@@ -55,10 +61,12 @@ UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterfa
     Attributes.GetPolygonGroupMaterialSlotNames()[Group]=TEXT("Native");
     TArray<FVertexID> Vertices;Vertices.Reserve(Data.Vertices.Num());
     for(const FVector& P:Data.Vertices) {
+        if(Cancelled && *Cancelled)return nullptr;
         const auto Id=Description.CreateVertex();Vertices.Add(Id);
         Positions[Id]=FVector3f(P.Y,P.X,P.Z);
     }
     for(int32 i=0;i<Data.Triangles.Num();i+=3) {
+        if(Cancelled && *Cancelled)return nullptr;
         TArray<FVertexInstanceID> Corners;
         const FVector3f A=Positions[Vertices[Data.Triangles[i]]];
         const FVector3f B=Positions[Vertices[Data.Triangles[i+1]]];
@@ -82,6 +90,13 @@ UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterfa
         }
         Description.CreateTriangle(Group,Corners);
     }
+    return Prepared;
+}
+
+UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterface* Material,FMWPreparedMeshPtr Prepared,bool KeepCPU) {
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_BuildSharedMesh);
+    if(!Prepared.IsValid())Prepared=MWPrepareMesh(Data);
+    if(!Prepared.IsValid())return nullptr;
     auto* Mesh=NewObject<UStaticMesh>(Owner);
     Mesh->NeverStream=true;
     Mesh->GetStaticMaterials().Add(FStaticMaterial(Material,TEXT("Native")));
@@ -91,8 +106,12 @@ UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterfa
     Mesh->GetStaticMaterials()[0].UVChannelData=FMeshUVChannelInfo(1.f);
     UStaticMesh::FBuildMeshDescriptionsParams Params;
     Params.bFastBuild=true;Params.bMarkPackageDirty=false;Params.bCommitMeshDescription=false;
-    Params.bBuildSimpleCollision=false;Params.bAllowCpuAccess=false;
+    Params.bBuildSimpleCollision=false;Params.bAllowCpuAccess=KeepCPU;
     Params.PerLODOverrides.SetNum(1);Params.PerLODOverrides[0].bUseFullPrecisionUVs=true;
-    if(!Mesh->BuildFromMeshDescriptions({&Description},Params))return nullptr;
+    const bool Built=Mesh->BuildFromMeshDescriptions({&Prepared->Description},Params);
+    // BuildFromMeshDescriptions copied the description into owned UE buffers.
+    // Its arrays are plain data; releasing them need not block this frame.
+    Async(EAsyncExecution::ThreadPool,[Prepared=MoveTemp(Prepared)]()mutable{Prepared.Reset();});
+    if(!Built)return nullptr;
     return Mesh;
 }

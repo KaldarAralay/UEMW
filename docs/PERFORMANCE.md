@@ -1,5 +1,41 @@
 # Rendering hitches and transient visibility
 
+## Scene retirement and cold streaming (stream04)
+
+A real tradehouse door round trip exposed a separate loading cost from warm walking. The baseline trace contains a **101.013 ms engine tick**, including **53.901 ms in forced full collection** and 26.747 ms of incremental-destroy work called without a time limit. The live actor takes 30.516 ms, including 17.597 ms in geometry/reset. CPU-interval health samples and engine scopes have different boundaries: baseline door-in peaks at 85.870 ms, door-out at 54.911 ms. Its reload observer stopped before cold resources settled and is not a complete reload control.
+
+Reset now moves heavy plain mesh/pose/binding containers to worker destruction. The abandoned decoder is cancelled and its loader kept alive through completion, with the wait/destruction off-thread. Old components immediately lose visibility and shadow eligibility, then destroy on the game thread in batches of at most 32 or about 1 ms per owner. The main actor drains its inactive distant owner's retirement too. Normal GC is requested after draining, without a forced full purge. Automatic collection, incremental purge, memory poisoning, source expiry and engine checks remain enabled; no engine patch is involved.
+
+The decoder prepares up to 128 plain mesh descriptions within a conservative 64 MiB estimate; native mutable/line shapes and planned aliases are excluded. UE objects/resources still use the game thread; consumed plain descriptions retire on a worker. Unprepared shapes retain synchronous construction. Known scenery's first submissions yield after 128 shapes or about 2 ms of their work. Existing drawables, actors, near geometry and effects bypass this allowance; deferred shapes stay partial and require fresh packets. Distant binding snapshots are prepared/reused by its reader, and old distant CPU states retire off-thread.
+
+Those first corrections were insufficient: candidates reached **72.415 and 74.072 ms** during door-out. Native and distant cold applies still stacked. Distant capacity/pose work now yields after 12 ms of native-frame work while lease/epoch/residency checks still run. Changed membership stays hidden until fresh application; an unchanged valid set remains drawable. Never-created hidden nodes keep their cell ownership and exact cached hidden state without allocating instance/material-selection bookkeeping. Existing resources still hide immediately; later appearance uses normal preparation and current poses.
+
+Tests caught an early optimization skipping hidden cell ownership, and a new appearance fixture carrying deforming data into its rigid binding. Cell ownership remains updated, and the corrected fixture independently describes rigid pose/demand. Regressions cover never-created hide, later creation/current placement, subsequent hide, fresh submission after a scenery yield, hidden retired components, bounded destruction and protection of new resources. Prepared/reference positions, normals, colours, four UV channels and indices match, with CPU access enabled only for those test meshes. The rigid GPU fixture uses worker preparation. The first headless buffer comparison incorrectly accessed a non-CPU-readable index buffer and is preserved as a rejected test attempt.
+
+The corrected normal package retains D3D12/SM5, the RHI thread, mimalloc, VSync/60 cap, original rendering and the existing visuals. Actual viewport is 1024x768:
+
+| Bounded normal collection | CPU interval median | p95 | Maximum | Live actor maximum |
+|---|---:|---:|---:|---:|
+| Staging into tradehouse | 16.667 ms | 16.667 ms | 16.963 ms | 10.258 ms |
+| Native door to exterior | 16.667 ms | 16.837 ms | 42.763 ms | 41.449 ms |
+| Native door into tradehouse | 16.667 ms | 16.667 ms | 30.778 ms | 9.158 ms |
+| Checkpoint reload and settling | 16.667 ms | 19.076 ms | 50.051 ms | 47.290 ms |
+| Native silt-strider fare to Balmora and settling | 16.667 ms | 30.717 ms | 173.239 ms | 49.965 ms |
+
+The first four collections peak at 2.215 ms for reset and 0.222 ms for component-retirement batches. All source/distant owners finish in the same renderer. The main witness records 219 deferred scenery submissions and 126 distant-work yields over staging/doors/reload, with no remaining retired components. Actual native travel arrives in 3.983 seconds and both UE owners settle in 28.925 seconds from fare activation; those endpoints exclude display completion. This is successful recovery, not fast cold loading.
+
+A final normal restart/reload returns to the same disposable weapon checkpoint. That cold reload/settling repeat peaks at 39.973 ms, with 2.896 ms reset and 0.058 ms retirement batches. The subsequent **60-second warm walk** measures CPU interval median/p95/max **16.667/16.670/26.701 ms**, GPU **2.474/3.560/5.966 ms**, and zero resource-rebind hides. All **41 exact eighteen-section weapon observations and four draws** pass; draw observations take 458–524 ms including original animation/polling. Mutable workspace grows zero times during that walking/weapon check. These are CPU/GPU scopes, not scanout FPS. All **411 source tests, 37 packaged renderer tests and nine GPU checks** pass on the final package, including both lighting backends and actual distant scenery. Source-only packaging and protected-file hashes are verified separately.
+
+Eight weapon observations also carry the global partial-geometry flag. All eighteen near sections match in those observations; they establish scoped weapon correctness, not complete-world submission in every sampled frame.
+
+These sequential observations have different native time/allocation histories; they are not isolated general speedups. Baseline tracing adds overhead; accepted normal collections have tracing off. Door/reload windows include original menu/console staging, settling and pauses, so they are not click latency. Whole one-second CPU records can straddle boundaries. CPU intervals are not displayed FPS.
+
+Cold streaming remains **hitch-prone**: accepted reload reaches 50.051 ms and cold travel 173.239 ms. Whole-frame validation, indivisible resource creation, native lighting, submission/reconciliation, original loading and bridge conversion remain costs. Distant yielding can extend preparation. Foreign epochs still clear scene caches; this is bounded preparation/cleanup, not persistent whole-world GPU caching or predicted gameplay. No stale pose is renewed/replayed and no rendering features or native simulation are reduced.
+
+A separate traced travel attempt exposes a **327.255 ms engine frame**: a worker spends **332.989 ms in `FD3D12DynamicRHI::RHICreateGraphicsPipelineState`**, the RHI thread waits 332.769 ms, the render thread waits about 331 ms and the game thread waits 311.148 ms. Its live actor is only 10.849 ms. This proves a distinct first-use graphics-pipeline bottleneck; it does not retrospectively assign the untraced 173.239 ms interval to that exact call. The diagnostic observer stopped after native arrival on a busy shared-channel copy and paused the game; its trace remains useful, but it is not a passed complete travel repeat. Pipeline prewarming/readiness and the remaining 24–28 ms distant applies are follow-up work, not fixed by these lifecycle budgets. No pipeline/driver cache was deleted or reset for these checks.
+
+Evidence is retained under `logs/stream04-*`: baseline/candidate traces, failed candidates/owned fixtures, corrected normal transitions/travel, tests and final integrity report. `observe_streaming` provides passive, recording-free source-epoch/current-renderer observations with 20 ms polling; its exclusions are documented in DEVELOPMENT.md.
+
 ## Mutable geometry workspace (hitch06)
 
 The remaining 47.883 ms interval from hitch05 was untraced, so its exact composition is unknown. A fresh one-minute traced walk on that preserved build measured CPU median/p95/max 16.667/16.855/34.205 ms and passed 41 exact weapon witnesses/four draws. A second, shorter trace with targeted scopes measured 16.667/16.667/22.872 ms before the workspace optimization. These varying maxima show why the historical 48 ms sample cannot by itself establish a particular bottleneck or a before/after speedup.

@@ -471,6 +471,8 @@ void AMWLive::EndPlay(const EEndPlayReason::Type Reason) {
     delete DistantView;DistantView=nullptr;
     if(DistantGeometry){DistantGeometry->Destroy();DistantGeometry=nullptr;}
     BackgroundView.Reset();
+    for(auto* Component:RetiredScenePrimitives)if(Component)Component->DestroyComponent();
+    RetiredScenePrimitives.Empty();
     ClearPrimitiveFilters();
     delete PresentationWriter;PresentationWriter=nullptr;
     delete CameraReader;CameraReader=nullptr;delete FrameReader;FrameReader=nullptr;delete CatalogLoader;CatalogLoader=nullptr;
@@ -568,7 +570,24 @@ void AMWLive::RejectGeometry() {
 }
 
 void AMWLive::ResetScene() {
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ResetScene);
+    const double Began=FPlatformTime::Seconds();
+    ON_SCOPE_EXIT {if(PerfSceneResetMs.Num()<120)PerfSceneResetMs.Add((FPlatformTime::Seconds()-Began)*1000);};
     if(DistantGeometry)DistantGeometry->HideScene();
+    // These containers contain only CPU data. Move their last owners out
+    // before clearing scene state; destruction must not stall the new epoch.
+    const bool HadAssets=GeometryComponents.Num()>0 || MeshData.Num()>0;
+    auto OldCPU=MakeTuple(MoveTemp(MeshData),MoveTemp(PreparedSharedMeshes),MoveTemp(GeometryBindings),MoveTemp(AppliedNativeStates),MoveTemp(AppliedNativeBindings),
+        MoveTemp(SourceBindingSnapshot),MoveTemp(CatalogBindingSnapshot),MoveTemp(AppliedBindingSnapshot),
+        MoveTemp(InstanceAssets),MoveTemp(InstanceCells),MoveTemp(LastRigidTransforms),MoveTemp(RigidSlots),MoveTemp(RigidRows),
+        MoveTemp(ResourceJobs),MoveTemp(QueuedResources),MoveTemp(ResourceBindings),MoveTemp(PreparedResourceBindings),
+        MoveTemp(UploadedBonePalettes),MoveTemp(UploadedVertexPoses),MoveTemp(RetainedGeometryScratch));
+    auto RetiredCPU=MakeUnique<decltype(OldCPU)>(MoveTemp(OldCPU));
+    Async(EAsyncExecution::ThreadPool,[RetiredCPU=MoveTemp(RetiredCPU)]()mutable {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RetireSceneCPU);
+        const double Start=FPlatformTime::Seconds();RetiredCPU.Reset();
+        UE_LOG(LogTemp,Display,TEXT("UEMW retired scene CPU: game_thread=%d ms=%.3f"),IsInGameThread()?1:0,(FPlatformTime::Seconds()-Start)*1000);
+    });
     NativeMenuOpen=true;HavePlayerStats=false;
     NativePoseValid=false;AppliedNativeStates.Empty();AppliedNativeBindings.Empty();AppliedNativeCatalog.Empty();NativeResourceInvalidations.Empty();
     MutableWorldScratch.Empty();MutableNormalScratch.Empty();MutableColorScratch.Empty();MutableUVScratch.Empty();
@@ -581,12 +600,18 @@ void AMWLive::ResetScene() {
     ResourceJobs.Empty();QueuedResources.Empty();ResourceBindings.Empty();ResourceJobIndex=0;ResourceCatalog.Empty();ResourceError.Empty();
     PreparedResourceBindings.Empty();PreparedResourceCatalog.Empty();
     RequestedCatalog.Empty();GeometryPartial=false;PendingGeometryInstances=0;
-    delete CatalogLoader;CatalogLoader=nullptr;
-    const bool HadAssets=GeometryComponents.Num()>0 || MeshData.Num()>0;
-    for(auto& Pair:GeometryComponents)ReleaseGeometryPrimitive(Pair.Value);
-    for(auto& Pair:RigidBatches)ReleaseGeometryPrimitive(Pair.Value);
-    for(auto& Pair:SkinnedComponents)ReleaseGeometryPrimitive(Pair.Value);
-    for(auto& Pair:Markers)ReleaseGeometryPrimitive(Pair.Value);
+    // Its decoder borrows Cancelled from the loader. Keep that allocation
+    // alive through completion, but never wait for it on the game thread.
+    if(CatalogLoader) {
+        auto* Abandoned=CatalogLoader;CatalogLoader=nullptr;Abandoned->Cancelled=true;
+        Async(EAsyncExecution::ThreadPool,[Abandoned](){TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RetireCatalogLoader);delete Abandoned;});
+    }
+    auto Retire=[&](auto& Components) {for(auto& Pair:Components)if(auto* C=Pair.Value) {
+        // Actor view filters will be removed for the new scene. Old proxies
+        // must remain invisible and ineligible for shadows in every view.
+        C->SetVisibility(false);C->SetCastShadow(false);RetiredScenePrimitives.Add(C);
+    }};
+    Retire(GeometryComponents);Retire(RigidBatches);Retire(SkinnedComponents);Retire(Markers);
     GeometryComponents.Empty();Markers.Empty();InstanceAssets.Empty();InstanceCells.Empty();LastRigidTransforms.Empty();GeometryBindings.Empty();
     MeshData.Empty();GeometryMaterials.Empty();GeometryTextures.Empty();MaskedTextures.Empty();BlendTextures.Empty();DetailTextures.Empty();UpgradedTextureKeys.Empty();Catalog.Empty();SceneEpoch.Empty();
     ViewAssets.Empty();FrameAssets.Empty();ValueAssets.Empty();ViewInstances.Empty();FrameInstances.Empty();ValueInstances.Empty();AssetInstances.Empty();RenderSelectionDirty=true;
@@ -606,10 +631,25 @@ void AMWLive::ResetScene() {
     CameraSession.Empty();CameraEpoch.Empty();CameraSequence=-1;LastCameraStamp=0;
     ViewPoseCameraValid=false;ViewPoseStamp=0;ViewPoseBounds.Empty();ViewCorrection=FTransform::Identity;ViewCorrectedMaterials=BackgroundAnchoredMaterials=0;
     ViewLaneCatalog.Empty();ViewLaneStamp=0;ViewLaneIds.Empty();ViewLaneAssets.Empty();ViewLaneVisibleIds.Empty();BackgroundPoseValid=false;
-    // Release old cell resources at the end of this UE frame, after reconciliation.
-    // The original game keeps running; no original assets or process memory change.
-    if(HadAssets && GEngine)GEngine->ForceGarbageCollection(true);
+    // Request normal collection after old component destruction drains. UE's
+    // incremental purge remains enabled; no forced full-purge frame here.
+    SceneRetirementGC|=HadAssets || RetiredScenePrimitives.Num()>0;
     UE_LOG(LogTemp,Display,TEXT("UEMW scene reset: components=0 meshes=0 textures=0"));
+}
+
+void AMWLive::AdvanceSceneRetirement(double Budget,int32 MaxComponents) {
+    if(RetiredScenePrimitives.Num()==0 && !SceneRetirementGC)return;
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_AdvanceSceneRetirement);
+    const double Began=FPlatformTime::Seconds();int32 Count=0;
+    while(RetiredScenePrimitives.Num()) {
+        auto* C=RetiredScenePrimitives.Pop(false);if(C)C->DestroyComponent();++ScenePrimitivesRetired;
+        if(++Count>=FMath::Max(1,MaxComponents) || FPlatformTime::Seconds()-Began>=FMath::Max(0.,Budget))break;
+    }
+    if(PerfSceneRetirementMs.Num()<120)PerfSceneRetirementMs.Add((FPlatformTime::Seconds()-Began)*1000);
+    if(RetiredScenePrimitives.Num()==0 && SceneRetirementGC) {
+        RetiredScenePrimitives.Empty();SceneRetirementGC=false;
+        if(GEngine)GEngine->ForceGarbageCollection(false);
+    }
 }
 
 void AMWLive::CreateGeometryMaterial() {
@@ -767,6 +807,20 @@ bool AMWLive::LoadCatalog(const FString& Name) {
                     const bool NearA=Data->Meshes[A].FirstPerson,NearB=Data->Meshes[B].FirstPerson;
                     return NearA!=NearB?NearA:A<B;
                 });
+                // Prepare likely shared meshes before the binding set commits.
+                // This is CPU data only; UE objects/buffers still use the game
+                // thread resource queue. Conservative bounds limit speculation.
+                if(FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_PREPARED_MESHES"))!=TEXT("0")) {
+                    int64 EstimatedBytes=0;const double Start=FPlatformTime::Seconds();
+                    for(const auto& Key:Data->MeshKeys) {
+                        if(*Cancel)return FMWCatalogPtr();
+                        const auto& D=Data->Meshes[Key];
+                        const int64 Estimate=int64(D.Vertices.Num())*256+int64(D.Triangles.Num())*512;
+                        if(D.NativeVertices || D.Lines || Data->ResourceAliases.Contains(Key) || Data->PreparedMeshes.Num()>=128 || EstimatedBytes+Estimate>64*1024*1024)continue;
+                        if(auto Prepared=MWPrepareMesh(D,Cancel)){Data->PreparedMeshes.Add(Key,MoveTemp(Prepared));EstimatedBytes+=Estimate;}
+                    }
+                    UE_LOG(LogTemp,Display,TEXT("UEMW prepared catalog meshes: count=%d estimated_bytes=%lld game_thread=%d ms=%.3f"),Data->PreparedMeshes.Num(),EstimatedBytes,IsInGameThread()?1:0,(FPlatformTime::Seconds()-Start)*1000);
+                }
             }
             return Data;
         });
@@ -817,6 +871,7 @@ bool AMWLive::LoadCatalog(const FString& Name) {
             // Superseding unfinished material work can replace an incomplete
             // entry. Its old plain arrays must not be freed in this frame.
             if(auto* Old=MeshData.Find(Key))Data.RetiredMeshes.Add(MoveTemp(*Old));
+            if(auto* Prepared=Data.PreparedMeshes.Find(Key))PreparedSharedMeshes.Add(Key,MoveTemp(*Prepared));
             MeshData.Add(Key,MoveTemp(D));++Adopted;
             if(CatalogDefinitionBatches && (Adopted>=FMath::Max(1,CatalogDefinitionBatchLimit) || FPlatformTime::Seconds()-DefinitionBegan>=.002))break;
         }
@@ -980,7 +1035,10 @@ bool AMWLive::LoadCatalog(const FString& Name) {
     StagePart=TEXT("retarget_retire_bind");
     {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_CatalogRetarget);RetargetCompatibleResources(Data.Bindings);}
     {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_CatalogRetire);
-        for(const auto& Key:Data.Retirement.Keys[0])if(!ViewCachedAssets.Contains(Key))if(auto* D=MeshData.Find(Key)){SetRenderAssetTraits(Key,0);Data.RetiredMeshes.Add(MoveTemp(*D));MeshData.Remove(Key);WaterReflectionMembershipDirty=true;}
+        for(const auto& Key:Data.Retirement.Keys[0])if(!ViewCachedAssets.Contains(Key))if(auto* D=MeshData.Find(Key)){
+            SetRenderAssetTraits(Key,0);Data.RetiredMeshes.Add(MoveTemp(*D));MeshData.Remove(Key);WaterReflectionMembershipDirty=true;
+            FMWPreparedMeshPtr Unused;if(PreparedSharedMeshes.RemoveAndCopyValue(Key,Unused))Data.PreparedMeshes.Add(Key,MoveTemp(Unused));
+        }
         for(const auto& Key:Data.Retirement.Keys[1])if(!ViewCachedAssets.Contains(Key))GeometryMaterials.Remove(Key);
         auto Retire=[&](auto& Map,int32 Index){for(const auto& Key:Data.Retirement.Keys[Index])Map.Remove(Key);};
         Retire(GeometryTextures,2);Retire(MaskedTextures,3);Retire(BlendTextures,4);Retire(DetailTextures,5);Retire(AppliedMaterialFrames,6);Retire(AppliedTextureEffects,7);Retire(AppliedMaterialValues,8);
@@ -1212,6 +1270,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     if(PreserveView)for(const auto& Id:ViewLaneIds)if(InstanceSubmitted(Id))VisibleInstances.Add(Id);
     ON_SCOPE_EXIT {const double T=FPlatformTime::Seconds();FlushRigidBatches();GeometryCpuMs.Add(TEXT("rigid_flush"),(FPlatformTime::Seconds()-T)*1000);};
     double RainStamp=0;Packet->TryGetNumberField(TEXT("sample_unix_ns"),RainStamp);RainStamp/=1e9;
+    double NewScenerySeconds=0;int32 NewScenery=0;
     for(int32 Index=0;Index<StateCount;++Index) {
         if(Native && (*Native)[Index].Visible && (!DenseTraits || (BindingTraits[Index]&2))) {
             const auto& B=GeometryBindings[Index];const auto* D=MeshData.Find(B.Asset);
@@ -1237,10 +1296,29 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         if(Reconcile && !Native)Present.Add(Id);
         if(PreserveView && Data->FirstPerson){if(!ViewLaneIds.Contains(Id))HideInstance(Id);continue;}
         const bool Visible=(Typed?Typed->Visible:Compact?(*Row)[0]->AsBool():Instance->GetBoolField(TEXT("visible"))) && (!Data->Background || BackgroundGeometryVisible);
+        // A never-created hidden native node needs no instance bookkeeping.
+        // Its binding and exact hidden state remain in the validated catalog/
+        // pose cache. Existing resources still take the ordinary hide path.
+        if(Typed && !Visible && !InstanceAssets.Contains(Id) && !GeometryComponents.Contains(Id) && !SkinnedComponents.Contains(Id) && !RigidSlots.Contains(Id))continue;
         if(DiagnosticVisibility && !Visible && SkinnedComponents.Contains(Id) && InstanceSubmitted(Id))UE_LOG(LogTemp,Display,TEXT("UEMW source hide seq=%lld id=%s asset=%s"),Sequence,*Id,*Asset);
         if(Visible && Data->NativeVertices && (!Typed || Typed->Points.Num()!=Data->Vertices.Num()*3 ||
             (Typed->Colors.Num()>0)!=Data->NativeColors || (Typed->UVs.Num()>0)!=Data->NativeUVs))return false;
         if(Typed && Visible && !GeometryResourceReady(GeometryBindings[Index],*Typed)){if(DiagnosticVisibility && SkinnedComponents.Contains(Id) && InstanceSubmitted(Id))UE_LOG(LogTemp,Display,TEXT("UEMW resource hide seq=%lld id=%s asset=%s"),Sequence,*Id,*Asset);HideInstance(Id);continue;}
+        // First submissions of cold scenery can otherwise fill a whole frame
+        // after the allocation queue has yielded. Keep only the cursor/work
+        // budget implicit in submitted membership: every retry uses THIS new
+        // packet, never a saved transform. Current drawables and actor/near
+        // poses are not delayed by unrelated new scenery.
+        const bool ColdScenery=Typed && Visible && !Data->FirstPerson && !Data->Background && !Data->Water && !Data->Rain && !Data->EffectKind &&
+            (AuxiliaryGeometry || (Data->HaveNativeActor && !Data->NativeActor)) && !InstanceSubmitted(Id);
+        if(ColdScenery) {
+            if(NewScenery>0 && (NewScenery>=FMath::Max(1,ColdSceneryBatchLimit) || NewScenerySeconds>=.002)) {
+                GeometryPartial=GeometryLoading=true;++PendingGeometryInstances;++ColdSceneryDeferred;HideInstance(Id);continue;
+            }
+            ++NewScenery;
+        }
+        const double SceneryStart=ColdScenery?FPlatformTime::Seconds():0;
+        ON_SCOPE_EXIT {if(ColdScenery)NewScenerySeconds+=FPlatformTime::Seconds()-SceneryStart;};
         if(Visible)VisibleInstances.Add(Id);else VisibleInstances.Remove(Id);
         if(auto* Slot=RigidSlots.Find(Id))if(Slot->Asset!=Asset)RemoveRigid(Id);
         const auto* ExistingAsset=InstanceAssets.Find(Id);const bool AssetChanged=!ExistingAsset || *ExistingAsset!=Asset;
@@ -1274,7 +1352,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             if(Component && AssetChanged){ReleaseGeometryPrimitive(Component);SkinnedComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);Component=nullptr;}
             if(!Component) {
                 auto* Mesh=SharedMeshes.FindRef(Asset);
-                if(!Mesh){Mesh=MWBuildMesh(this,*Data,GeometryMaterials.FindRef(Asset));if(!Mesh)return false;SharedMeshes.Add(Asset,Mesh);++NewResources;}
+                if(!Mesh){Mesh=BuildSharedMesh(Asset);if(!Mesh)return false;SharedMeshes.Add(Asset,Mesh);++NewResources;}
                 auto* Palette=MWFloatTexture(4,Data->SkinBones,{});if(!Palette)return false;PaletteTextures.Add(Id,Palette);
                 auto* Material=MWMakeSkinMaterial(this,GeometryMaterials.FindRef(Asset),Palette);if(!Material)return false;
                 SkinMaterials.Add(Id,Material);
@@ -1311,7 +1389,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             UInstancedStaticMeshComponent* Batch=RigidBatches.FindRef(Asset);
             if(!Batch) {
                 UStaticMesh* Mesh=SharedMeshes.FindRef(Asset);
-                if(!Mesh){Mesh=MWBuildMesh(this,*Data,GeometryMaterials.FindRef(Asset));if(!Mesh)return false;SharedMeshes.Add(Asset,Mesh);++NewResources;}
+                if(!Mesh){Mesh=BuildSharedMesh(Asset);if(!Mesh)return false;SharedMeshes.Add(Asset,Mesh);++NewResources;}
                 Batch=NewObject<UInstancedStaticMeshComponent>(this);Batch->SetMobility(EComponentMobility::Movable);
                 MWNativeDrawLayer(Batch,*Data);
                 Batch->SetStaticMesh(Mesh);Batch->SetCollisionEnabled(ECollisionEnabled::NoCollision);Batch->SetSimulatePhysics(false);
@@ -1468,6 +1546,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     for(auto It=UploadedVertexPoses.CreateIterator();It;++It)if(!GeometryComponents.Contains(It.Key()))It.RemoveCurrent();
     for(auto It=NativeHiddenPrimitives.CreateIterator();It;++It)if(!It->IsValid())It.RemoveCurrent();
     if(Retained){GeometryPartial=true;PendingGeometryInstances+=RetainedMissing;}
+    PerfPendingGeometryMax=FMath::Max(PerfPendingGeometryMax,PendingGeometryInstances);
     if(BonePoseChanged)++PerfBonePoseUpdates;
     if(VertexPoseChanged)++PerfVertexPoseUpdates;
     if(NativePoseReuseEnabled && Native && ResourceError.IsEmpty()) {
@@ -1697,6 +1776,7 @@ void AMWLive::ApplyCameraLane() {
 
 void AMWLive::Tick(float Delta) {
     const double TickBegan=FPlatformTime::Seconds();
+    SceneTickBegan=TickBegan;
     ON_SCOPE_EXIT {if(PerfTickMs.Num()<120)PerfTickMs.Add((FPlatformTime::Seconds()-TickBegan)*1000);};
     Super::Tick(Delta);
     if(DiagnosticColourRamp && FPlatformTime::Seconds()>=DiagnosticColourRampUntil)SetDiagnosticColourRamp(false);
@@ -1707,6 +1787,8 @@ void AMWLive::Tick(float Delta) {
     ConfigurePresentation();
     UpdateDisplayPacing();
     ON_SCOPE_EXIT {FlushRigidBatches();ApplyCameraLane();UpdateViewCorrection();UpdateRainInterpolation();UpdateOutdoorLighting();UpdateCelestialShafts();UpdateWaterReflection();if(DistantView)DistantView->Update(*this);if(UIView)UIView->Update(*this);PublishPresentationState();PublishStateWitness();};
+    // Destruction is safe even when source state is stale or disconnected.
+    AdvanceSceneRetirement();if(DistantGeometry)DistantGeometry->AdvanceSceneRetirement();
     // Only current-source work may allocate; no queued pose is replayed.
     const double SourceAge=(FDateTime::UtcNow()-FDateTime(1970,1,1)).GetTotalSeconds()-SourcePacketStamp;
     if(SourcePacketStamp<=0 || (SourceAge>=-1 && SourceAge<=.5)) {
@@ -1790,7 +1872,9 @@ void AMWLive::Tick(float Delta) {
                            TPair<const TCHAR*,TArray<double>*>(TEXT("camera_age_ms"),&PerfCameraAgeMs),
                            TPair<const TCHAR*,TArray<double>*>(TEXT("catalog_bind_ms"),&PerfCatalogBindMs),
                            TPair<const TCHAR*,TArray<double>*>(TEXT("rigid_membership_scan_ms"),&PerfRigidMembershipScanMs),
-                           TPair<const TCHAR*,TArray<double>*>(TEXT("resource_stage_ms"),&PerfResourceMs)}) {
+                           TPair<const TCHAR*,TArray<double>*>(TEXT("resource_stage_ms"),&PerfResourceMs),
+                           TPair<const TCHAR*,TArray<double>*>(TEXT("scene_reset_ms"),&PerfSceneResetMs),
+                           TPair<const TCHAR*,TArray<double>*>(TEXT("scene_retirement_ms"),&PerfSceneRetirementMs)}) {
                 TArray<TSharedPtr<FJsonValue>> Values;
                 for(double V:*Entry.Value)Values.Add(MakeShared<FJsonValueNumber>(V));
                 Perf->SetArrayField(Entry.Key,Values);Entry.Value->Reset();
