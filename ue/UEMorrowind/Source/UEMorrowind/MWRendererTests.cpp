@@ -834,7 +834,7 @@ bool FMWCameraLaneTest::RunTest(const FString&) {
     auto HiddenHand=MakeShared<FJsonObject>();HiddenHand->SetStringField(TEXT("id"),TEXT("hand"));HiddenHand->SetStringField(TEXT("asset"),TEXT("view"));HiddenHand->SetBoolField(TEXT("visible"),false);
     Near->SetArrayField(TEXT("states"),{MakeShared<FJsonValueObject>(HiddenHand)});Packet->SetNumberField(TEXT("version"),2);Packet->SetObjectField(TEXT("view"),Near);
     TestTrue(TEXT("Independent near pass decodes with the same source identity"),MWDecodeCamera(Encode(),Sample));TestEqual(TEXT("Native hidden near state is retained"),Sample.ViewStates.Num(),1);
-    Near->SetNumberField(TEXT("version"),2);TestFalse(TEXT("Unknown near-pass revision rejects the entire camera tuple"),MWDecodeCamera(Encode(),Sample));Near->SetNumberField(TEXT("version"),1);
+    Near->SetNumberField(TEXT("version"),2);TestTrue(TEXT("Near v2 retains ordinary hidden states"),MWDecodeCamera(Encode(),Sample));Near->SetNumberField(TEXT("version"),3);TestFalse(TEXT("Unknown near-pass revision rejects the entire camera tuple"),MWDecodeCamera(Encode(),Sample));Near->SetNumberField(TEXT("version"),1);
     Packet->RemoveField(TEXT("view"));Packet->SetNumberField(TEXT("version"),1);TestTrue(TEXT("Legacy camera remains supported"),MWDecodeCamera(Encode(),Sample));
     TestTrue(TEXT("Native coordinate conversion"),Sample.Position.Equals(FVector(456,123,789)));
     TestTrue(TEXT("Fresh geometry permits the camera"),MWCameraMatches(Sample,Session,Epoch,42,Now+.01,Now-.1));
@@ -897,7 +897,7 @@ bool FMWCameraLaneTest::RunTest(const FString&) {
     FMWCameraSample NearPose;NearPose.ViewCatalog=TEXT("new-unrelated-world-catalog");NearPose.ViewStamp=200;NearPose.ViewCamera=PoseCamera;FMWViewState Part;Part.Id=TEXT("blade-id");Part.Asset=TEXT("blade");Part.Pose.Visible=true;const float NativeBlade[13]={1,0,0,0,1,0,0,0,1,100,200,300,1};FMemory::Memcpy(Part.Pose.Transform,NativeBlade,52);NearPose.ViewStates.Add(Part);
     View->ApplyFirstPersonLane(NearPose,200.01);View->UpdateViewCorrection();
     TestEqual(TEXT("Unrelated world catalog does not delay a strictly matched near binding"),View->ViewLaneUpdates,1);
-    const FVector Uncompressed=Delta.TransformPosition(FVector(200,100,300)),Compressed=BladeComponent->GetComponentLocation(),Eye=DisplayCamera.GetLocation();
+    const FVector Uncompressed=Delta.TransformPosition(FVector(200,100,300)),Compressed=BladeComponent->GetNativeMatrix().GetOrigin(),Eye=DisplayCamera.GetLocation();
     TestTrue(TEXT("CPU weapon placement preserves the native projected ray"),(Compressed-Eye).Equals((Uncompressed-Eye)*MWFirstPersonDepthScale,.001));
     TestEqual(TEXT("Rigid foreground uses CPU placement rather than WPO-only bounds"),BladeMID->K2_GetScalarParameterValue(TEXT("NativeViewActive")),0.f);
     TestTrue(TEXT("CPU bounds follow the actual foreground placement"),BladeComponent->Bounds.Origin.Equals(BladeComponent->CalcBounds(BladeComponent->GetComponentTransform()).Origin,.001));

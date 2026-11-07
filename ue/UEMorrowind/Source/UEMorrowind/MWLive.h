@@ -293,6 +293,7 @@ private:
     friend class FMWWitnessTest;
     friend class FMWNativePoseReuseTest;
     friend class FMWCameraLaneTest;
+    friend class FMWFirstPersonPresentationTest;
     friend class FMWCatalogTest;
     FString DataRoot;
     FString SnapshotPath;
@@ -421,6 +422,8 @@ private:
     double ViewLaneStamp=0,ViewLaneReadMs=0;
     int32 ViewLaneUpdates=0;
     TSet<FString> ViewLaneIds;
+    TSet<FString> ViewMutableIds;
+    bool ApplyFirstPersonMutable(const FString& Id,const FMWMeshData& Data,const FMWGeometryState& Pose,const FVector& Origin);
     TMap<FString,FString> ViewLaneAssets;
     FVector BackgroundPoseOrigin=FVector::ZeroVector;
     bool BackgroundPoseValid=false;

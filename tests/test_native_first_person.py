@@ -1,12 +1,58 @@
 import hashlib,json,struct,tempfile,unittest
 from pathlib import Path
 from unittest.mock import patch
-from native_first_person import NearPass,Discovery,DefinitionCache,surface_key,discovery_matches
+from native_first_person import NearPass,Discovery,DefinitionCache,surface_key,discovery_matches,export
 from live_probe import ROOT,SceneReadChanged
 from test_pose_frame import header
 
 
 class NearPassLaneTests(unittest.TestCase):
+    def test_live_morph_buffers_share_the_near_pose_capture_and_reject_replacement(self):
+        from native_attributes import identity
+        from types import SimpleNamespace
+        def check(lane,r,base):
+            model=bytearray(0x48);struct.pack_into('<H',model,8,3);struct.pack_into('<4I',model,0x1c,0x80000,0,0,0x90000);struct.pack_into('<I',model,0x2c,7);struct.pack_into('<H',model,0x34,1);struct.pack_into('<I',model,0x3c,0xa0000)
+            mutable=dict(shape=0x20000,model=3,identity=identity(model),colors=False,uvs=True,morph=True,count=3,topology='triangles',header_size=0x48)
+            # The model identity itself is a valid native read address.
+            mutable['model']=0x50000;d=lane.definition;d['version']=2;d['rows'][0]['identity']=[0x50000,0];d['rows'][0]['mutable']=mutable
+            from native_first_person import publish_layout
+            name=publish_layout(d,__import__('native_first_person').ROOT/'local/assets');morph=NearPass(name)
+            r.shape=header((0x50000,0));original=r.capture_many;r.coordinate=2.;r.replaced=False
+            def capture(plan):
+                values=original(plan);raw=bytearray(model)
+                if r.replaced:struct.pack_into('<I',raw,0x1c,0xb0000)
+                values.update({0x50000:bytes(raw),0x80000:struct.pack('<9f',r.coordinate,0,0,1,0,0,0,1,0),0x90000:struct.pack('<6f',0,0,1,0,0,1)})
+                return values
+            r.capture_many=capture;first=morph.capture(r,base);r.coordinate=3.;second=morph.capture(r,base)
+            self.assertEqual(first['version'],2);self.assertEqual(first['states'][0]['points'][0],2);self.assertEqual(second['states'][0]['points'][0],3);self.assertEqual(len(second['states'][0]['uvs']),6)
+            r.replaced=True
+            with self.assertRaisesRegex(SceneReadChanged,'identity changed'):morph.capture(r,base)
+        self.run_fixture(check)
+
+    def test_mutable_layouts_are_versioned_and_budgeted_before_process_reads(self):
+        def check(lane,r,base):
+            d=lane.definition;d['rows'][0]['mutable']=dict(shape=0x20000,model=3,identity=[1025,0,0x80000,0,0,0,1,0xa0000],colors=False,uvs=False,morph=True,count=1025)
+            from native_first_person import publish_layout
+            for version in(1,2):
+                d['version']=version;name=publish_layout(d,__import__('native_first_person').ROOT/'local/assets')
+                with self.assertRaisesRegex(ValueError,'budget exceeded'):NearPass(name)
+        self.run_fixture(check)
+
+    def test_masked_weapon_sections_remain_owned_by_the_independent_near_lane(self):
+        from types import SimpleNamespace
+        def check(lane,r,base):
+            surface=dict(asset='owned-cutout',texture='',alpha_mode='masked',shading=dict(lit=True))
+            shape=dict(id='0x20000',model='0x3',skin='0x0',parents=[0x70000],alpha_mode='masked',render_id='cutout',asset='mask',prepared=(surface,None,None,None))
+            geometry=SimpleNamespace(shapes=[shape],records=[(0x20000,(3,0),(),None,None)],view_pointers={0x20000},native_attributes={},native_switches={},catalog='owned-mask',assets=SimpleNamespace(out=__import__('native_first_person').ROOT/'local/assets'),node_identities={0x20000:(0,0)})
+            name=export(geometry,dict(view_roots=['0x60000'],first_person_model_root='0x70000'))
+            self.assertIsNotNone(name,'A cutout cannot be omitted and then interpreted as native removal')
+            masked=NearPass(name);value=masked.capture(r,base)
+            self.assertEqual(value['states'][0]['id'],'cutout');self.assertTrue(value['states'][0]['visible'])
+            with patch('scene_reader.SceneReader'):
+                d=Discovery(r);d.scene.collect.return_value=dict(shapes=[shape])
+                self.assertIsNone(d.poll(base,masked.definition),'An unchanged cutout is part of the owned near topology')
+        self.run_fixture(check)
+
     def test_cached_rebinding_checks_real_converted_surface_and_never_substitutes_a_different_mesh(self):
         def check(lane,r,base):
             surface=dict(asset='geometry-content',texture='textures/owned.png',alpha_mode='opaque',shading=dict(lit=True,fog=True,sky=False,emissive=[0,0,0]))

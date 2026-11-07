@@ -14,5 +14,6 @@ bool MWNativeCastsShadow(const FMWMeshData& Data,bool ActorPolicy);
 // Builds one reusable GPU mesh from native local vertices. No collision data.
 UStaticMesh* MWBuildMesh(UObject* Owner,const FMWMeshData& Data,UMaterialInterface* Material,FMWPreparedMeshPtr Prepared=nullptr,bool KeepCPU=false);
 FTransform MWNativeTransform(const double* M);
+FMatrix MWNativeMatrix(const double* M);
 bool MWCanInstance(const double* M);
 void MWNativeDrawLayer(UPrimitiveComponent* Component,const FMWMeshData& Data);

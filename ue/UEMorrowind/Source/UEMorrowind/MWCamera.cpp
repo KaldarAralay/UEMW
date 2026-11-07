@@ -34,7 +34,7 @@ bool DecodeView(const TSharedPtr<FJsonObject>& Obj,FMWCameraSample& Result) {
     FString Protocol;double Version=0,Stamp=0;const TSharedPtr<FJsonObject>* Cam=nullptr;const TArray<TSharedPtr<FJsonValue>>* States=nullptr;
     FVector P,F,U;
     if(!Obj->TryGetStringField(TEXT("protocol"),Protocol) || Protocol!=TEXT("uemw.view") ||
-        !Obj->TryGetNumberField(TEXT("version"),Version) || Version!=1 ||
+        !Obj->TryGetNumberField(TEXT("version"),Version) || (Version!=1 && Version!=2) ||
         !Obj->TryGetStringField(TEXT("catalog"),Result.ViewCatalog) || Result.ViewCatalog.Len()>96 ||
         !Obj->TryGetNumberField(TEXT("sample_unix_ns"),Stamp) || !FMath::IsFinite(Stamp) || Stamp<Result.Stamp*1e9 || Stamp-Result.Stamp*1e9>150000000. ||
         !Obj->TryGetObjectField(TEXT("camera"),Cam) || !Cam->IsValid() ||
@@ -42,7 +42,7 @@ bool DecodeView(const TSharedPtr<FJsonObject>& Obj,FMWCameraSample& Result) {
         !Obj->TryGetArrayField(TEXT("states"),States) || States->Num()>128)return false;
     Result.ViewStamp=Stamp/1e9;Result.ViewCamera=FTransform(FRotationMatrix::MakeFromXZ(F,U).ToQuat(),P);
     Obj->TryGetNumberField(TEXT("read_ms"),Result.ViewReadMs);if(!FMath::IsFinite(Result.ViewReadMs) || Result.ViewReadMs<0)return false;
-    TSet<FString> Ids;
+    TSet<FString> Ids;int32 MutableVertices=0;
     for(const auto& Value:*States) {
         const TSharedPtr<FJsonObject>* Row=nullptr;FMWViewState State;
         if(!Value->TryGetObject(Row) || !Row->IsValid() || !(*Row)->TryGetStringField(TEXT("id"),State.Id) || State.Id.IsEmpty() || State.Id.Len()>96 || Ids.Contains(State.Id) ||
@@ -54,6 +54,12 @@ bool DecodeView(const TSharedPtr<FJsonObject>& Obj,FMWCameraSample& Result) {
                 TArray<float> B;if(!Floats(*Row,TEXT("palette"),State.Pose.Palette,12,257*12) || State.Pose.Palette.Num()%12 || !Floats(*Row,TEXT("bound"),B,4,4) || B[3]<0)return false;
                 State.Pose.Bound=FVector4f(B[0],B[1],B[2],B[3]);
             }
+            if((*Row)->HasField(TEXT("points"))) {
+                if(Version!=2 || State.Pose.Palette.Num() || !Floats(*Row,TEXT("points"),State.Pose.Points,3,1024*3) || State.Pose.Points.Num()%3)return false;
+                const int32 Count=State.Pose.Points.Num()/3;MutableVertices+=Count;if(MutableVertices>1024)return false;
+                if((*Row)->HasField(TEXT("colors")) && !Floats(*Row,TEXT("colors"),State.Pose.Colors,Count*4,Count*4))return false;
+                if((*Row)->HasField(TEXT("uvs")) && !Floats(*Row,TEXT("uvs"),State.Pose.UVs,Count*2,Count*2))return false;
+            }else if((*Row)->HasField(TEXT("colors")) || (*Row)->HasField(TEXT("uvs")))return false;
         }
         Result.ViewStates.Add(MoveTemp(State));
     }

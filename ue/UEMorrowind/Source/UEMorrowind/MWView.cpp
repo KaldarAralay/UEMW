@@ -59,6 +59,7 @@ void AMWLive::SetInstanceAsset(const FString& Id,const FString& Asset) {
 }
 
 void AMWLive::RemoveInstanceAsset(const FString& Id) {
+    ViewMutableIds.Remove(Id);
     const bool Warm=!RenderSelectionDirty && RenderSelectionCatalog==Catalog && RenderSelectionMeshes==MeshData.Num() && RenderSelectionInstances==InstanceAssets.Num();
     if(Warm)if(const auto* Previous=InstanceAssets.Find(Id))if(auto* Ids=AssetInstances.Find(*Previous)){Ids->Remove(Id);if(!Ids->Num())AssetInstances.Remove(*Previous);}
     if(!InstanceAssets.Remove(Id))return;
@@ -73,6 +74,8 @@ void AMWLive::UpdateViewCorrection() {
     EnsureRenderSelection();
     ViewCorrectedMaterials=0;
     BackgroundAnchoredMaterials=0;
+    static const FName AffineRows[]={TEXT("NativeAffineRow0"),TEXT("NativeAffineRow1"),TEXT("NativeAffineRow2")};
+    static const FName AffineNormals[]={TEXT("NativeAffineNormalRow0"),TEXT("NativeAffineNormalRow1"),TEXT("NativeAffineNormalRow2")};
     for(auto It=ViewPoseBounds.CreateIterator();It;++It)if(!InstanceAssets.Contains(It.Key()))It.RemoveCurrent();
     const FTransform Target(Camera->GetComponentQuat(),Camera->GetComponentLocation());
     ViewCorrection=ViewPoseCameraValid?MWCameraPoseDelta(ViewPoseCamera,Target):FTransform::Identity;
@@ -109,12 +112,37 @@ void AMWLive::UpdateViewCorrection() {
         if(!D->FirstPerson)continue;
         auto* Skin=SkinnedComponents.FindRef(Pair.Key);
         const bool Rigid=Skin && !Skin->UseNativeBounds;
-        Bind(SkinMaterials.FindRef(Pair.Key),!Rigid);
+        const bool RelativeSkin=Active && Skin && Skin->UseNativeBounds && D->SkinBones>0;
+        const bool RelativeMutable=ViewMutableIds.Contains(Pair.Key) && GeometryComponents.Contains(Pair.Key);
+        Bind(SkinMaterials.FindRef(Pair.Key),!Rigid && !RelativeSkin && !RelativeMutable);
+        if(RelativeMutable) {
+            auto* C=GeometryComponents[Pair.Key];C->SetWorldTransform(Active?FTransform(Q,Target.GetLocation(),FVector(MWFirstPersonDepthScale)):FTransform(FQuat::Identity,ViewPoseCamera.GetLocation()));
+            continue;
+        }
+        if(Skin && Skin->UseNativeBounds) {
+            Skin->SetWorldTransform(RelativeSkin?FTransform(Q,Target.GetLocation(),FVector(MWFirstPersonDepthScale)):FTransform::Identity);
+            if(auto* M=SkinMaterials.FindRef(Pair.Key)) {
+                M->SetScalarParameterValue(TEXT("NativeSkinRelative"),RelativeSkin?1:0);
+                M->SetVectorParameterValue(TEXT("NativeSkinOrigin"),FLinearColor(ViewPoseCamera.GetLocation()));
+            }
+        }
         if(Rigid) {
             if(const auto* Pose=LastRigidTransforms.Find(Pair.Key))if(Pose->Num()==13) {
-                FTransform Placement=MWNativeTransform(Pose->GetData())*(Active?ViewCorrection:FTransform::Identity);
-                if(Active){Placement.SetLocation(Target.GetLocation()+(Placement.GetLocation()-Target.GetLocation())*MWFirstPersonDepthScale);Placement.SetScale3D(Placement.GetScale3D()*MWFirstPersonDepthScale);}
-                Skin->SetWorldTransform(Placement);
+                FMatrix Placement=MWNativeMatrix(Pose->GetData())*(Active?ViewCorrection.ToMatrixWithScale():FMatrix::Identity);
+                if(Active){Placement.SetOrigin(Target.GetLocation()+(Placement.GetOrigin()-Target.GetLocation())*MWFirstPersonDepthScale);for(int32 R=0;R<3;++R)for(int32 C=0;C<3;++C)Placement.M[R][C]*=MWFirstPersonDepthScale;}
+                Skin->SetNativeMatrix(Placement,Target.GetLocation(),Active?MWFirstPersonDepthScale:1.f);
+                if(auto* M=SkinMaterials.FindRef(Pair.Key)) {
+                    // GPU-scene transform packing also discards shear. Supply
+                    // the exact residual in local vertex coordinates instead
+                    // of subtracting nearly equal absolute-world positions.
+                    const FMatrix Base=Skin->GetRenderMatrix(),Normal=Placement.Inverse().GetTransposed();
+                    M->SetScalarParameterValue(TEXT("NativeAffineActive"),1);
+                    M->SetVectorParameterValue(TEXT("NativeAffineOffset"),FLinearColor(Placement.GetOrigin()-Base.GetOrigin()));
+                    for(int32 R=0;R<3;++R) {
+                        M->SetVectorParameterValue(AffineRows[R],FLinearColor(Placement.M[0][R]-Base.M[0][R],Placement.M[1][R]-Base.M[1][R],Placement.M[2][R]-Base.M[2][R],0));
+                        M->SetVectorParameterValue(AffineNormals[R],FLinearColor(Normal.M[0][R],Normal.M[1][R],Normal.M[2][R],0));
+                    }
+                }
             }
             continue;
         }

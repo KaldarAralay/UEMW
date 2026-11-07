@@ -178,7 +178,11 @@ bool AMWLive::UseRigidResource(const FMWBinding& B,const FMWMeshData& D,const do
     // Native animated rigid nodes can alternate between decomposable and
     // sheared affine matrices. Once a CPU section exists, keep using it for
     // that exact asset instead of hiding it behind another resource queue.
-    if(D.Lines || D.Transparent || !MWCanInstance(M))return false;
+    if(D.Lines || D.Transparent)return false;
+    // Foreground has its own exact-affine component. Crossing the instancing
+    // orthogonality threshold must never switch or hide a live weapon part.
+    if(D.FirstPerson)return true;
+    if(!MWCanInstance(M))return false;
     if(D.FirstPerson || !GeometryComponents.Contains(B.Id))return true;
     const auto* Current=InstanceAssets.Find(B.Id);
     return !Current || *Current!=B.Asset;
@@ -207,7 +211,7 @@ bool AMWLive::GeometryResourceReady(const FMWBinding& B,const FMWGeometryState& 
     const auto* ExistingAsset=InstanceAssets.Find(B.Id);const bool Same=ExistingAsset && *ExistingAsset==B.Asset;
     if(S.Palette.Num())return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && PaletteTextures.Contains(B.Id);
     double M[13];for(int32 J=0;J<13;++J)M[J]=S.Transform[J];
-    if(!Definition->Lines && Definition->FirstPerson && S.Points.Num()==0 && !Definition->Transparent && MWCanInstance(M))return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && !SkinnedComponents[B.Id]->UseNativeBounds && SkinMaterials.Contains(B.Id);
+    if(!Definition->Lines && Definition->FirstPerson && S.Points.Num()==0 && !Definition->Transparent)return Same && SharedMeshes.Contains(B.Asset) && SkinnedComponents.Contains(B.Id) && !SkinnedComponents[B.Id]->UseNativeBounds && SkinMaterials.Contains(B.Id);
     if(S.Points.Num()==0 && UseRigidResource(B,*Definition,M))return SharedMeshes.Contains(B.Asset) && RigidBatches.Contains(B.Asset);
     auto* C=GeometryComponents.FindRef(B.Id);return Same && C && C->GetNumSections()>0;
 }
@@ -283,7 +287,9 @@ bool AMWLive::EnsureGeometryResources(const TArray<FMWGeometryState>& States,con
                 // component for an id already owned by this fresh native lane.
                 // Its actual pose/visibility still comes only from that lane.
                 const auto* Current=InstanceAssets.Find(B.Id);
-                if(!ViewLaneVisibleIds.Contains(B.Id) || (Current && *Current==*Near && SharedMeshes.Contains(*Near) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && (!NearData->SkinBones || PaletteTextures.Contains(B.Id))))++Ready;
+                const bool MutableReady=NearData->NativeVertices && GeometryComponents.Contains(B.Id) && GeometryComponents[B.Id]->GetNumSections()>0 && ViewMutableIds.Contains(B.Id);
+                const bool SharedReady=!NearData->NativeVertices && SharedMeshes.Contains(*Near) && SkinnedComponents.Contains(B.Id) && SkinMaterials.Contains(B.Id) && (!NearData->SkinBones || PaletteTextures.Contains(B.Id));
+                if(!ViewLaneVisibleIds.Contains(B.Id) || (Current && *Current==*Near && (MutableReady || SharedReady)))++Ready;
                 else ++PendingGeometryInstances;
                 continue;
             }

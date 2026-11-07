@@ -18,6 +18,8 @@ from skin_math import Skin
 from live_probe import ROOT,SceneReadChanged
 
 NAME=re.compile(r'view-[0-9a-f]{64}\.json\Z')
+NEAR_ALPHA=('opaque','masked')
+MAX_MUTABLE_VERTICES=1024
 
 
 def surface_key(definition,weights=None):
@@ -26,7 +28,7 @@ def surface_key(definition,weights=None):
     # ownership annotation, but independent raw conversion does not; it must
     # not invalidate reuse of otherwise identical native geometry/materials.
     shading.pop('native_actor',None)
-    return json.dumps([definition['asset'],definition['texture'],definition.get('alpha_mode','opaque'),definition.get('blend_native_opacity',True),definition.get('alpha_test'),shading,weights,definition.get('texture_stages'),definition.get('environment_map')],sort_keys=True,separators=(',',':'))
+    return json.dumps([definition['asset'],definition['texture'],definition.get('alpha_mode','opaque'),definition.get('blend_native_opacity',True),definition.get('alpha_test'),shading,weights,definition.get('texture_stages'),definition.get('environment_map'),definition.get('dynamic_attributes')],sort_keys=True,separators=(',',':'))
 
 
 def publish_layout(value,folder):
@@ -53,17 +55,24 @@ class DefinitionCache:
         if not visual['first_person']or not visual.get('items_active')or visual.get('reference')!=base['player_ref']or visual.get('item_root')!=definition.get('item_root'):return None
         if hex(r.u32(world+0x158))!=definition['root']:return None
         model=int(visual['item_root'],16);shapes=[s for s in graph['shapes']if model in s['parents']]
-        if not shapes or len(shapes)>128 or any(s.get('particles')or s.get('alpha_mode','opaque')!='opaque'for s in shapes):return None
+        if not shapes or len(shapes)>128 or any(s.get('particles')or s.get('alpha_mode','opaque')not in NEAR_ALPHA for s in shapes):return None
         if self.assets is None:self.assets=Assets(r)
         # Native allocators reuse model addresses between draws. Verify actual
         # geometry/material bytes again rather than trusting an address cache.
         self.assets.meshes.clear();self.assets.begin_refresh();rows=[];nodes=set()
         prefix=definition['rows'][0]['id'].rsplit(':',1)[0]+':'if':'in definition['rows'][0]['id']else''
+        mutable_vertices=0
         for shape in shapes:
             shape=dict(shape,generation=prefix[:-1],cell_key='view:first-person')
             if shape.get('native_environment_effect'):return None
-            if discover(r,shape)or material(r,shape)or flip(r,int(shape.get('texture_property','0x0'),16),shape['generation']):return None
+            mutable=discover(r,shape)
+            if mutable:
+                mutable_vertices+=mutable['count']
+                if shape['skin']!='0x0'or mutable_vertices>MAX_MUTABLE_VERTICES:return None
+                shape['dynamic_attributes']=dict(positions=True,colors=mutable['colors'],uvs=mutable['uvs'],morph=mutable['morph'])
+            if material(r,shape)or flip(r,int(shape.get('texture_property','0x0'),16),shape['generation']):return None
             converted=self.assets.mesh(shape);skin=Skin(r,shape)if shape['skin']!='0x0'else None
+            if mutable:converted={**converted,'dynamic_attributes':shape['dynamic_attributes']}
             from native_texture_stages import read as read_stages,convert as convert_stages
             if not hasattr(self.assets,'used_textures'):self.assets.used_textures=set()
             stages,flips=convert_stages(self.assets,shape,read_stages(r,int(shape.get('texture_property','0x0'),16),shape['generation']))
@@ -76,6 +85,7 @@ class DefinitionCache:
             if asset is None:return None
             p=int(shape['id'],16);parents=(*shape['parents'],p);nodes.update(parents)
             row=dict(id=prefix+shape['id'],asset=asset,ptr=p,identity=[int(shape['model'],16),int(shape['skin'],16)],parents=parents,reuse=key)
+            if mutable:row['mutable']=mutable
             if skin:
                 nodes.update((skin.root,*skin.bones));row['skin']=dict(root=skin.root,bones=skin.bones,skin_transform=skin.skin_transform.tolist(),binds=[v.tolist()for v in skin.binds])
             rows.append(row)
@@ -84,7 +94,7 @@ class DefinitionCache:
             header=r.read(p,0x1c);identities[str(p)]=(struct.unpack_from('<I',header)[0],struct.unpack_from('<I',header,0x18)[0])
         if r.player_render_state(world)!=visual:return None
         switches=SwitchLayout(shapes,graph.get('switches',{}))
-        value=dict(protocol='uemw.view.layout',version=1,catalog=definition['catalog'],root=definition['root'],item_root=definition['item_root'],rows=rows,
+        value=dict(protocol='uemw.view.layout',version=2 if mutable_vertices else 1,catalog=definition['catalog'],root=definition['root'],item_root=definition['item_root'],rows=rows,
             node_identities=identities,switches=list(switches.definitions),shape_gates=[s.get('switch_gates',())for s in shapes])
         rebound=NearPass(publish_layout(value,self.assets.out));rebound.rebound=True;return rebound
     def close(self):
@@ -107,7 +117,7 @@ class Discovery:
         model=int(visual.get('item_root')or'0x0',16);root=r.u32(world+0x158)
         if not model or not root:return None
         graph=self.scene.collect(roots=[],view_roots=[hex(root)]);self.graph=graph
-        observed=sorted((int(s['id'],16),int(s['model'],16),int(s['skin'],16))for s in graph['shapes']if model in s['parents']and not s.get('particles')and s.get('alpha_mode','opaque')=='opaque')
+        observed=sorted((int(s['id'],16),int(s['model'],16),int(s['skin'],16))for s in graph['shapes']if model in s['parents']and not s.get('particles')and s.get('alpha_mode','opaque')in NEAR_ALPHA)
         expected=sorted((s['ptr'],*s['identity'])for s in definition['rows'])if definition else[]
         if definition and observed==expected and definition.get('item_root')==visual.get('item_root'):
             self.reported=None;return None
@@ -119,14 +129,17 @@ class Discovery:
 
 
 def export(geometry,base):
-    rows=[];nodes=set();shapes=[]
+    rows=[];nodes=set();shapes=[];mutable_vertices=0
     for shape,record in zip(geometry.shapes,geometry.records):
         p,identity,parents,skin,owner=record
-        if p not in geometry.view_pointers or p in geometry.native_attributes or shape.get('particles'):continue
+        if p not in geometry.view_pointers or shape.get('particles'):continue
+        mutable=geometry.native_attributes.get(p)
+        if mutable and (skin is not None or mutable_vertices+mutable['count']>MAX_MUTABLE_VERTICES):continue
         definition=shape['prepared'][0]
-        if definition.get('alpha_mode','opaque')!='opaque':continue
+        if definition.get('alpha_mode','opaque')not in NEAR_ALPHA:continue
         row=dict(id=shape['render_id'],asset=shape['asset'],ptr=p,identity=identity,parents=parents)
-        if not any(shape['prepared'][1:]):row['reuse']=surface_key(definition,definition.get('skin_file'))
+        if not any((*shape['prepared'][1:3],*shape['prepared'][4:])):row['reuse']=surface_key(definition,definition.get('skin_file'))
+        if mutable:row['mutable']=mutable;mutable_vertices+=mutable['count']
         nodes.update((*parents,p));shapes.append(shape)
         if skin is not None:
             nodes.update((skin.root,*skin.bones))
@@ -134,7 +147,7 @@ def export(geometry,base):
         rows.append(row)
     if not rows:return None
     switches=SwitchLayout(shapes,geometry.native_switches)
-    value=dict(protocol='uemw.view.layout',version=1,catalog=geometry.catalog,root=base['view_roots'][0],item_root=base.get('first_person_model_root'),
+    value=dict(protocol='uemw.view.layout',version=2 if mutable_vertices else 1,catalog=geometry.catalog,root=base['view_roots'][0],item_root=base.get('first_person_model_root'),
         rows=rows,node_identities={str(p):geometry.node_identities[p]for p in nodes if p in geometry.node_identities},
         switches=list(switches.definitions),shape_gates=[s.get('switch_gates',())for s in shapes])
     return publish_layout(value,geometry.assets.out)
@@ -148,8 +161,15 @@ class NearPass:
         data=path.read_bytes()
         if 'view-'+hashlib.sha256(data).hexdigest()+'.json'!=name:raise ValueError('Near-pass layout digest mismatch')
         d=json.loads(data)
-        if d.get('protocol')!='uemw.view.layout'or d.get('version')!=1 or not 0<len(d['rows'])<=128:raise ValueError('Invalid near-pass layout')
+        if d.get('protocol')!='uemw.view.layout'or d.get('version')not in(1,2) or not 0<len(d['rows'])<=128:raise ValueError('Invalid near-pass layout')
         self.definition=d;self.rows=d['rows'];self.records=[];self.plan=None;self.camera=None
+        self.mutable=[row['mutable']for row in self.rows if row.get('mutable')]
+        for item in self.mutable:item['identity']=tuple(item['identity'])
+        if self.mutable and(d['version']!=2 or any(type(m.get('count'))is not int or not 0<m['count']<=MAX_MUTABLE_VERTICES for m in self.mutable)or sum(m['count']for m in self.mutable)>MAX_MUTABLE_VERTICES):raise ValueError('Near-pass mutable vertex budget exceeded')
+        for row in self.rows:
+            if row.get('mutable')and(row.get('skin')or row['mutable']['shape']!=row['ptr']or row['mutable']['model']!=row['identity'][0]):raise ValueError('Invalid near-pass mutable identity')
+        from native_attributes import AttributeCapture
+        self.attributes=AttributeCapture(self.mutable)
         for row in self.rows:
             skin=None;s=row.get('skin')
             if s:
@@ -170,6 +190,7 @@ class NearPass:
         if len(nodes)>2048:raise ValueError('Near-pass node budget exceeded')
         switches=SwitchLayout(shapes,self.switches);requests={p:0xac for p in nodes}
         for p,n in switches.requests():requests[p]=max(requests.get(p,0),n)
+        for p,n in self.attributes.plan:requests[p]=max(requests.get(p,0),n)
         requests[camera]=0x128;self.plan=ReadPlan(sorted(requests.items()));self.camera=camera
         self.layout=PoseLayout(self.records,{r[0]for r in self.records},read_plan=self.plan,switches=switches,node_identities=self.identities,near_pass_camera=True)
         self.nodes=tuple(sorted(nodes))
@@ -188,7 +209,7 @@ class NearPass:
         previous=None;raw=None;stamp=0
         for attempt in range(4):
             stamp=time.time_ns();current=reader.capture_many(self.plan)
-            key=tuple(current[p][:4]+current[p][0x14:0x74]+(current[p][0x98:0xa0]if p in self.layout.shape_index else b'')for p in self.nodes)+(current[camera][0x40:0x128],)
+            key=tuple(current[p][:4]+current[p][0x14:0x74]+(current[p][0x98:0xa0]if p in self.layout.shape_index else b'')for p in self.nodes)+(current[camera][0x40:0x128],)+tuple(current[p][:n]for p,n in self.attributes.plan)
             if key==previous:raw=current;break
             previous=key;time.sleep(.0002)
         if raw is None:raise SceneReadChanged('Near-pass animation is still updating')
@@ -201,13 +222,19 @@ class NearPass:
             p,identity,parents,skin,owner=self.records[i]
             if skin:needed.update((p,skin.root,*skin.bones))
         worlds=frame.worlds(needed);states=[]
+        from native_attributes import capture as capture_attributes
+        attributes=capture_attributes(SimpleNamespace(read_many=lambda plan:{p:raw[p][:n]for p,n in plan}),self.attributes)
         for i,(row,record)in enumerate(zip(self.rows,self.records)):
             p,identity,parents,skin,owner=record;value=dict(id=row['id'],asset=row['asset'],visible=bool(frame.visible[i]))
             if value['visible']:
                 value['transform']=list(struct.unpack_from('<13f',raw[p],0x40))
                 if skin:value.update(palette=skin.palette(worlds).reshape(-1).tolist(),bound=list(struct.unpack_from('<4f',raw[p],0x1c)))
+                if p in attributes:
+                    points,colors,uvs=attributes[p];value['points']=points.reshape(-1).tolist()
+                    if colors is not None:value['colors']=colors.reshape(-1).tolist()
+                    if uvs is not None:value['uvs']=uvs.reshape(-1).tolist()
             states.append(value)
         after=reader.player_render_state(world)
         if (after.get('reference'),after['first_person'],after.get('items_active'),after.get('item_root'))!=(visual.get('reference'),visual['first_person'],visual.get('items_active'),visual.get('item_root'))or reader.u32(world+0x160)!=camera:raise SceneReadChanged('Near-pass changed during capture')
-        return dict(protocol='uemw.view',version=1,catalog=self.definition['catalog'],sample_unix_ns=stamp,camera=cam,states=states,
+        return dict(protocol='uemw.view',version=2 if self.mutable else 1,catalog=self.definition['catalog'],sample_unix_ns=stamp,camera=cam,states=states,
                     read_ms=(time.perf_counter()-started)*1000,attempts=attempt+1,verified_cached_definition=getattr(self,'rebound',False))

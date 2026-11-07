@@ -27,15 +27,17 @@ void MWNativeDrawLayer(UPrimitiveComponent* Component,const FMWMeshData& Data) {
     if(auto* Mutable=Cast<UMWMutableMeshComponent>(Component))Mutable->NativeBackground=Data.Background;
 }
 
-FTransform MWNativeTransform(const double* M) {
+FMatrix MWNativeMatrix(const double* M) {
     // S swaps X/Y. Native column-vector R becomes row-vector (S R S)^T.
     const double S=M[12];
-    if(S==0)return FTransform(FQuat::Identity,FVector(M[10],M[9],M[11]),FVector::ZeroVector);
-    const FMatrix Matrix(FPlane(M[4]*S,M[1]*S,M[7]*S,0),FPlane(M[3]*S,M[0]*S,M[6]*S,0),
+    return FMatrix(FPlane(M[4]*S,M[1]*S,M[7]*S,0),FPlane(M[3]*S,M[0]*S,M[6]*S,0),
         FPlane(M[5]*S,M[2]*S,M[8]*S,0),FPlane(M[10],M[9],M[11],1));
+}
+FTransform MWNativeTransform(const double* M) {
+    if(M[12]==0)return FTransform(FQuat::Identity,FVector(M[10],M[9],M[11]),FVector::ZeroVector);
     // Native body-part matrices include race proportions and mirrored limbs.
     // Matrix decomposition preserves their nonuniform and negative scale.
-    return FTransform(Matrix);
+    return FTransform(MWNativeMatrix(M));
 }
 
 bool MWCanInstance(const double* M) {

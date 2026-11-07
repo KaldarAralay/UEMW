@@ -294,9 +294,19 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
         Row->SetStringField(TEXT("resource_expected_asset"),ResourceBindings.FindRef(Id));
         Row->SetStringField(TEXT("near_asset"),ViewLaneAssets.FindRef(Id));
         if(const auto* C=SkinnedComponents.FindRef(Id))if(!C->UseNativeBounds) {
-            const FVector P=C->GetComponentLocation(),Scale=C->GetComponentScale();
+            FVector P=C->GetComponentLocation();const FVector Scale=C->GetComponentScale();
+            if(auto* Material=SkinMaterials.FindRef(Id))if(Material->K2_GetScalarParameterValue(TEXT("NativeAffineActive"))>.5f)P+=FVector(Material->K2_GetVectorParameterValue(TEXT("NativeAffineOffset")));
             Row->SetArrayField(TEXT("first_person_visual_position"),{MakeShared<FJsonValueNumber>(P.Y),MakeShared<FJsonValueNumber>(P.X),MakeShared<FJsonValueNumber>(P.Z)});
             Row->SetArrayField(TEXT("first_person_visual_scale"),{MakeShared<FJsonValueNumber>(Scale.Y),MakeShared<FJsonValueNumber>(Scale.X),MakeShared<FJsonValueNumber>(Scale.Z)});
+            const FMatrix Matrix=C->GetRenderMatrix();TArray<TSharedPtr<FJsonValue>> Axes;
+            for(const FVector Axis:{FVector::YAxisVector,FVector::XAxisVector,FVector::ZAxisVector}) {
+                FVector V=Matrix.TransformVector(Axis);
+                if(auto* Material=SkinMaterials.FindRef(Id))if(Material->K2_GetScalarParameterValue(TEXT("NativeAffineActive"))>.5f) {
+                    for(int32 R=0;R<3;++R){const FVector AffineRow(Material->K2_GetVectorParameterValue(FName(*FString::Printf(TEXT("NativeAffineRow%d"),R))));V[R]+=AffineRow.Dot(Axis);}
+                }
+                for(double N:{V.Y,V.X,V.Z})Axes.Add(MakeShared<FJsonValueNumber>(N));
+            }
+            Row->SetArrayField(TEXT("first_person_visual_axes"),Axes);
         }
         if(const auto* Data=MeshData.Find(InstanceAssets.FindRef(Id)))if(Data->HaveNativeLightSet) {
             TArray<TSharedPtr<FJsonValue>> Membership;for(const auto& Light:Data->NativeLightSet)Membership.Add(MakeShared<FJsonValueString>(Light));Row->SetArrayField(TEXT("native_object_light_ids"),Membership);
@@ -348,6 +358,10 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
         }else if(const auto* Pose=UploadedVertexPoses.Find(Id)) {
             Row->SetNumberField(TEXT("point_floats"),Pose->Points.Num());Row->SetStringField(TEXT("points_md5"),Hash(Pose->Points));
             Row->SetStringField(TEXT("colors_md5"),Hash(Pose->Colors));Row->SetStringField(TEXT("uvs_md5"),Hash(Pose->UVs));
+            if(ViewMutableIds.Contains(Id))if(auto* C=GeometryComponents.FindRef(Id))if(const auto* Section=C->GetProcMeshSection(0)) {
+                TArray<TSharedPtr<FJsonValue>> Points;for(const auto& Vertex:Section->ProcVertexBuffer){const FVector P=C->GetComponentTransform().TransformPosition(Vertex.Position);for(double N:{P.Y,P.X,P.Z})Points.Add(MakeShared<FJsonValueNumber>(N));}
+                Row->SetArrayField(TEXT("first_person_vertex_positions"),Points);
+            }
         }else if(const auto* Matrix=LastRigidTransforms.Find(Id)) {
             TArray<float> Values,Rotation;for(double V:*Matrix)Values.Add((float)V);for(int32 I=0;I<FMath::Min(9,Values.Num());++I)Rotation.Add(Values[I]);
             Row->SetStringField(TEXT("transform_md5"),Hash(Values));Row->SetStringField(TEXT("rotation_md5"),Hash(Rotation));

@@ -152,17 +152,35 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
         palette=expression(m,u.MaterialExpressionTextureObjectParameter,parameter_name='BonePalette',texture=u.load_asset('/Engine/EngineResources/WhiteSquareTexture'))
         uv=expression(m,u.MaterialExpressionTextureCoordinate,coordinate_index=1)
         pos=expression(m,u.MaterialExpressionWorldPosition,world_position_shader_offset=u.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS)
-        normal=expression(m,u.MaterialExpressionVertexNormalWS)
-        custom=custom_node(m,'native_skin.hlsl',('Weights','Palette','Index','Position','Normal'))
+        skin_position=expression(m,u.MaterialExpressionPreSkinnedPosition)
+        normal=expression(m,u.MaterialExpressionPreSkinnedNormal)
+        custom=custom_node(m,'native_skin.hlsl',('Weights','Palette','Index','Position','Normal','Origin','Relative'))
         additional=u.CustomOutput();additional.set_editor_property('output_name','NativeNormal');additional.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT3)
         custom.set_editor_property('additional_outputs',[additional])
-        for e,n in ((weights,'Weights'),(palette,'Palette'),(uv,'Index'),(pos,'Position'),(normal,'Normal')):link(e,'',custom,n)
+        skin_origin=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeSkinOrigin',default_value=u.LinearColor(0,0,0,0))
+        skin_relative=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeSkinRelative',default_value=0.)
+        for e,n in ((weights,'Weights'),(palette,'Palette'),(uv,'Index'),(skin_position,'Position'),(normal,'Normal'),(skin_origin,'Origin'),(skin_relative,'Relative')):link(e,'',custom,n)
+        skin_offset=expression(m,u.MaterialExpressionTransform,transform_source_type=u.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_LOCAL,transform_type=u.MaterialVectorCoordTransform.TRANSFORM_WORLD)
+        skin_normal=expression(m,u.MaterialExpressionTransform,transform_source_type=u.MaterialVectorCoordTransformSource.TRANSFORMSOURCE_LOCAL,transform_type=u.MaterialVectorCoordTransform.TRANSFORM_WORLD)
+        link(custom,'',skin_offset,'');link(custom,'NativeNormal',skin_normal,'')
+        skin_normal_unit=expression(m,u.MaterialExpressionNormalize);link(skin_normal,'',skin_normal_unit,'')
         world_position=expression(m,u.MaterialExpressionAdd)
-        link(pos,'',world_position,'A');link(custom,'',world_position,'B')
-        normal_node=custom;normal_pin='NativeNormal'
+        link(pos,'',world_position,'A');link(skin_offset,'',world_position,'B')
+        normal_node=skin_normal_unit;normal_pin=''
     else:
         world_position=expression(m,u.MaterialExpressionWorldPosition,world_position_shader_offset=u.WorldPositionIncludedOffsets.WPT_EXCLUDE_ALL_SHADER_OFFSETS)
         normal_node=expression(m,u.MaterialExpressionVertexNormalWS);normal_pin=''
+    affine=custom_node(m,'native_affine.hlsl',('LocalPosition','LocalNormal','Normal','Row0','Row1','Row2','NormalRow0','NormalRow1','NormalRow2','Offset','Active'))
+    affine_normal=u.CustomOutput();affine_normal.set_editor_property('output_name','NativeNormal');affine_normal.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT3)
+    affine.set_editor_property('additional_outputs',[affine_normal])
+    local_position=expression(m,u.MaterialExpressionPreSkinnedPosition)
+    local_normal=expression(m,u.MaterialExpressionPreSkinnedNormal)
+    link(local_position,'',affine,'LocalPosition');link(local_normal,'',affine,'LocalNormal');link(normal_node,normal_pin,affine,'Normal')
+    for name in ('Row0','Row1','Row2','NormalRow0','NormalRow1','NormalRow2','Offset'):
+        value=expression(m,u.MaterialExpressionVectorParameter,parameter_name='NativeAffine'+name,default_value=u.LinearColor(0,0,0,0));link(value,'',affine,name)
+    affine_active=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeAffineActive',default_value=0.);link(affine_active,'',affine,'Active')
+    affine_position=expression(m,u.MaterialExpressionAdd);link(world_position,'',affine_position,'A');link(affine,'',affine_position,'B')
+    world_position=affine_position;normal_node=affine;normal_pin='NativeNormal'
     original_world_position=world_position;original_normal=normal_node;original_normal_pin=normal_pin
     view=custom_node(m,'native_view.hlsl',('Position','Normal','Origin','Target','Row0','Row1','Row2','Active','DepthScale'))
     view_normal=u.CustomOutput();view_normal.set_editor_property('output_name','NativeNormal');view_normal.set_editor_property('output_type',u.CustomMaterialOutputType.CMOT_FLOAT3)
@@ -346,9 +364,10 @@ for label,blend,environment_map in [(label,blend,env)for label,blend in policies
     link(sky_origin,'',background,'Origin');link(sky_anchored,'',background,'Anchored')
     for e,n in ((world_position,'Position'),(camera_position,'CameraPosition'),(background_switch,'Background')):link(e,'',background,n)
     if skin:
-        combined_offset=expression(m,u.MaterialExpressionAdd);link(custom,'',combined_offset,'A');link(background,'',combined_offset,'B')
+        combined_offset=expression(m,u.MaterialExpressionAdd);link(skin_offset,'',combined_offset,'A');link(background,'',combined_offset,'B')
     else:combined_offset=background
-    corrected_offset=expression(m,u.MaterialExpressionAdd);link(combined_offset,'',corrected_offset,'A');link(view,'',corrected_offset,'B')
+    with_affine=expression(m,u.MaterialExpressionAdd);link(combined_offset,'',with_affine,'A');link(affine,'',with_affine,'B')
+    corrected_offset=expression(m,u.MaterialExpressionAdd);link(with_affine,'',corrected_offset,'A');link(view,'',corrected_offset,'B')
     if not u.MWBuildLibrary.connect_skin_offset(m,corrected_offset):raise RuntimeError('Native vertex offset connection failed')
     fog_switch=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeFog',default_value=1.)
     sky_switch=expression(m,u.MaterialExpressionScalarParameter,parameter_name='NativeSky',default_value=0.)

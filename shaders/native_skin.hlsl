@@ -18,4 +18,8 @@ uint count=(uint)round(Index.y);
 }
 float3 normalWorld=resultNormal.yxz;
 NativeNormal=normalWorld*rsqrt(max(dot(normalWorld,normalWorld),1e-12));
+// Subtract the captured eye BEFORE depth compression. The component can then
+// sit at the display camera rather than quantizing every hand vertex around
+// a large absolute world position. Subtract after weighting: sums need not be 1.
+if(Relative>.5)result-=Origin.yxz;
 return result.yxz-Position;

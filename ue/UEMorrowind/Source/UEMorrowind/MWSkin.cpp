@@ -3,8 +3,31 @@
 #include "Materials/Material.h"
 #include "MWLive.h"
 #include "Engine/Texture2D.h"
+#include "Engine/StaticMesh.h"
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
+
+FBoxSphereBounds UMWNativeSkinComponent::CalcBounds(const FTransform& LocalToWorld) const {
+    if(UseNativeBounds)return NativeBounds.TransformBy(GetComponentTransform().Inverse()*LocalToWorld);
+    if(HaveNativeMatrix && GetStaticMesh()) {
+        // CalcBounds(identity) is also used to obtain LOCAL culling bounds.
+        // Retain the affine residual there, then honor the caller's placement.
+        const FMatrix Residual=NativeMatrix*GetComponentTransform().ToInverseMatrixWithScale();
+        return GetStaticMesh()->GetBounds().TransformBy(Residual*LocalToWorld.ToMatrixWithScale());
+    }
+    return Super::CalcBounds(LocalToWorld);
+}
+void UMWNativeSkinComponent::SetNativeMatrix(const FMatrix& Matrix,const FVector& Anchor,float Scale) {
+    // FTransform drops affine shear. The original's animated foreground must
+    // keep its exact matrix through both GPU submission and CPU culling.
+    if(HaveNativeMatrix && NativeMatrix==Matrix && GetComponentLocation()==Anchor && GetComponentScale()==FVector(Scale))return;
+    NativeMatrix=Matrix;HaveNativeMatrix=true;
+    // Keep the primitive origin at the sampled display camera. Per-part
+    // compressed translations would quantize tiny near-depth weapon parts at
+    // large world coordinates; the shader carries their small relative offset.
+    SetWorldTransform(FTransform(FQuat::Identity,Anchor,FVector(Scale)));
+    UpdateBounds();MarkRenderTransformDirty();
+}
 
 void UMWNativeSkinComponent::SetNativeBounds(const FVector4f& B) {
     const float Radius=FMath::Max(1.f,B.W);

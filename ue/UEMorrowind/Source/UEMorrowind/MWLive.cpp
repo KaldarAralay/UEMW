@@ -630,7 +630,7 @@ void AMWLive::ResetScene() {
     AcceptedSnapshotStamp=0;AcceptedGeometrySequence=-1;AcceptedSnapshotText.Empty();
     CameraSession.Empty();CameraEpoch.Empty();CameraSequence=-1;LastCameraStamp=0;
     ViewPoseCameraValid=false;ViewPoseStamp=0;ViewPoseBounds.Empty();ViewCorrection=FTransform::Identity;ViewCorrectedMaterials=BackgroundAnchoredMaterials=0;
-    ViewLaneCatalog.Empty();ViewLaneStamp=0;ViewLaneIds.Empty();ViewLaneAssets.Empty();ViewLaneVisibleIds.Empty();BackgroundPoseValid=false;
+    ViewLaneCatalog.Empty();ViewLaneStamp=0;ViewLaneIds.Empty();ViewMutableIds.Empty();ViewLaneAssets.Empty();ViewLaneVisibleIds.Empty();BackgroundPoseValid=false;
     // Request normal collection after old component destruction drains. UE's
     // incremental purge remains enabled; no forced full-purge frame here.
     SceneRetirementGC|=HadAssets || RetiredScenePrimitives.Num()>0;
@@ -1295,6 +1295,10 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
         if(!Data) return false;
         if(Reconcile && !Native)Present.Add(Id);
         if(PreserveView && Data->FirstPerson){if(!ViewLaneIds.Contains(Id))HideInstance(Id);continue;}
+        if(Data->FirstPerson && ViewMutableIds.Remove(Id)) {
+            if(auto* C=GeometryComponents.FindRef(Id)){C->SetWorldTransform(FTransform::Identity);C->SetMaterial(0,GeometryMaterials.FindRef(Asset));}
+            SkinMaterials.Remove(Id);UploadedVertexPoses.Remove(Id);
+        }
         const bool Visible=(Typed?Typed->Visible:Compact?(*Row)[0]->AsBool():Instance->GetBoolField(TEXT("visible"))) && (!Data->Background || BackgroundGeometryVisible);
         // A never-created hidden native node needs no instance bookkeeping.
         // Its binding and exact hidden state remain in the validated catalog/
@@ -1371,7 +1375,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             }
             continue;
         }
-        if(!Data->Lines && !IsDeformed && Data->FirstPerson && !Data->Transparent && MWCanInstance(RigidMatrix)) {
+        if(!Data->Lines && !IsDeformed && Data->FirstPerson && !Data->Transparent) {
             // A separate component keeps CPU culling bounds at the corrected
             // camera pose. ISM per-instance culling cannot see material WPO.
             RemoveRigid(Id);auto* C=SkinnedComponents.FindRef(Id);if(!C)return false;

@@ -19,9 +19,16 @@ def projection(point,camera):
     return np.asarray([r,u,f])@(np.asarray(point)-np.asarray(camera['position']))
 
 
-def run(reader,seconds=12,screenshots=False,draw_cycles=4):
+def projected_axes(axes,camera):
+    """All three native local axes in the sampled camera, not just the origin."""
+    f=np.asarray(camera['forward'],dtype=float);f/=np.linalg.norm(f)
+    u=np.asarray(camera['up'],dtype=float);r=np.cross(f,u);r/=np.linalg.norm(r);u=np.cross(r,f)
+    return np.asarray(axes,dtype=float).reshape(3,3)@np.asarray([r,u,f]).T
+
+
+def run(reader,seconds=12,screenshots=False,draw_cycles=4,minimum_sections=18):
     require_foreground(reader);world=reader.u32(0x7c67dc)
-    report=dict(version=2,passed=False,recording=False,save_writes=False,draws=[],walk=[],shots=[],near_frames=[],errors=[],scope='Live native near-pass payloads versus UE submitted palette/transform hashes and actual rigid projected placement; not a displayed-FPS measurement.')
+    report=dict(version=3,passed=False,recording=False,save_writes=False,minimum_sections=minimum_sections,draws=[],walk=[],shots=[],near_frames=[],errors=[],scope='Live native near-pass payloads versus UE submitted palette/transform hashes and full rigid projected origins/axes; not a displayed-FPS measurement.')
     stop=threading.Event();frames={};packet_rows=[]
     def collect():
         last=None
@@ -43,7 +50,7 @@ def run(reader,seconds=12,screenshots=False,draw_cycles=4):
         if not reader.player_state(world)['weapon_ready']:pulse(reader,'key',0x21,.12)
         def ready():
             p=quick_json(ROOT/'local/bridge/camera.json',256*1024);v=p.get('view')
-            return v if v and sum(s['visible']for s in v['states'])>=18 else None
+            return v if v and sum(s['visible']for s in v['states'])>=minimum_sections else None
         v=wait(ready,8);ids=[s['id']for s in v['states']if s['visible']];time.sleep(.3)
         # Original shadow-helper geometry can remain in the near graph while
         # hidden. Check its suppression separately; keep exact pose/visibility
@@ -74,14 +81,27 @@ def run(reader,seconds=12,screenshots=False,draw_cycles=4):
                 for row in w['instances']:
                     native=expected[row['id']]
                     if not native['visible']or not row['submitted_visible']:raise RuntimeError('A native weapon/hand section disappeared during walking: '+row['id'])
-                    field='palette'if 'palette'in native else'transform';digest=hashlib.md5(np.asarray(native[field],dtype='<f4').tobytes()).hexdigest()
+                    field='palette'if 'palette'in native else'points'if 'points'in native else'transform';digest=hashlib.md5(np.asarray(native[field],dtype='<f4').tobytes()).hexdigest()
                     if row.get(field+'_md5','').lower()!=digest:raise RuntimeError('UE pose differs from its exact independent native payload')
-                    error=None
+                    error=axis_error=None
+                    if field=='points':
+                        for channel in('colors','uvs'):
+                            expected_digest=hashlib.md5(np.asarray(native.get(channel,[]),dtype='<f4').tobytes()).hexdigest()
+                            if row.get(channel+'_md5','').lower()!=expected_digest:raise RuntimeError('UE mutable foreground channel differs from native '+channel)
+                        m=np.asarray(native['transform'],dtype=float);points=np.asarray(native['points'],dtype=float).reshape(-1,3)@m[:9].reshape(3,3).T*m[12]+m[9:12]
+                        actual=np.asarray(row['first_person_vertex_positions'],dtype=float).reshape(-1,3)
+                        error=max(float(np.linalg.norm(projection(a,target)-projection(p,near['camera'])*w['first_person_depth_scale']))for a,p in zip(actual,points))
+                        if len(actual)!=len(points)or error>.002:raise RuntimeError('Native morph foreground projection diverged: '+str(error))
                     if field=='transform':
                         expected_ray=projection(native['transform'][9:12],near['camera'])*w['first_person_depth_scale']
                         actual_ray=projection(row['first_person_visual_position'],target);error=float(np.linalg.norm(expected_ray-actual_ray))
                         if error>.002:raise RuntimeError('Weapon camera-relative placement diverged: '+str(error))
-                    checks.append(dict(id=row['id'],kind=field,md5=digest,projection_error=error))
+                        m=np.asarray(native['transform'],dtype=float)
+                        expected_axes=projected_axes(m[:9].reshape(3,3).T*m[12],near['camera'])*w['first_person_depth_scale']
+                        actual_axes=projected_axes(row['first_person_visual_axes'],target)
+                        axis_error=float(np.max(np.abs(expected_axes-actual_axes)))
+                        if axis_error>2e-6:raise RuntimeError('Weapon orientation/affine shape diverged: '+str(axis_error))
+                    checks.append(dict(id=row['id'],kind=field,md5=digest,projection_error=error,axis_error=axis_error))
                 if len(checks)!=len(ids):raise RuntimeError('Missing near-pass witness entries')
                 report['walk'].append(dict(ms=(time.perf_counter()-began)*1000,world_sequence=s['sequence'],world_read_ms=s['read_ms'],preparation=s['preparation'],near_stamp=key,near_read_ms=near['read_ms'],near_age_ms=(w['unix_ns']-key)/1e6,lane_updates=w['first_person_lane_updates'],matches=checks,complete=not w.get('partial_geometry')))
                 if screenshots and len(report['shots'])<3 and time.perf_counter()-began-shot_at>2:

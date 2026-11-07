@@ -11,8 +11,13 @@ class UMWNativeSkinComponent : public UStaticMeshComponent {
 public:
     bool UseNativeBounds=true;
     FBoxSphereBounds NativeBounds=FBoxSphereBounds(FVector::ZeroVector,FVector(1),1);
-    virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override {return UseNativeBounds?NativeBounds:Super::CalcBounds(LocalToWorld);}
+    virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
+    const FMatrix& GetNativeMatrix() const {return NativeMatrix;}
     void SetNativeBounds(const FVector4f& Bound);
+    void SetNativeMatrix(const FMatrix& Matrix,const FVector& Anchor,float Scale);
+private:
+    bool HaveNativeMatrix=false;
+    FMatrix NativeMatrix=FMatrix::Identity;
 };
 bool MWLoadSkin(const FString& Path,FMWMeshData& Data);
 UTexture2D* MWFloatTexture(int32 Width,int32 Height,const TArray<FVector4f>& Values);
