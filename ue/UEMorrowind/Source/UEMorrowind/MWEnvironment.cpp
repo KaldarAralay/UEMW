@@ -1,5 +1,25 @@
 #include "MWEnvironment.h"
 #include "Dom/JsonObject.h"
+bool MWLayoutNativeLights(const FMWEnvironmentState& Source,TMap<FString,uint32>& Rows,TArray<FVector4f>& Pixels,bool Stable) {
+    if(Source.Pixels.Num()!=8*33 || Source.LightCount<0 || Source.LightCount>32 || Source.LightIds.Num()!=Source.LightCount)return false;
+    TSet<FString> Current;for(const auto& Id:Source.LightIds){if(Id.IsEmpty() || Current.Contains(Id))return false;Current.Add(Id);}
+    TMap<FString,uint32> Next;uint32 Used=0;
+    if(Stable)for(const auto& Pair:Rows)if(Current.Contains(Pair.Key)) {
+        const uint32 Bit=Pair.Value;if(!Bit || (Bit&(Bit-1)) || (Used&Bit))return false;
+        Next.Add(Pair.Key,Bit);Used|=Bit;
+    }
+    for(int32 I=0;I<Source.LightCount;++I)if(!Next.Contains(Source.LightIds[I])) {
+        int32 Slot=Stable?0:I;while(Slot<32 && (Used&(1u<<Slot)))++Slot;if(Slot==32)return false;
+        const uint32 Bit=1u<<Slot;Next.Add(Source.LightIds[I],Bit);Used|=Bit;
+    }
+    Pixels.SetNumZeroed(8*33);FMemory::Memzero(Pixels.GetData(),Pixels.Num()*sizeof(FVector4f));
+    FMemory::Memcpy(Pixels.GetData(),Source.Pixels.GetData(),8*sizeof(FVector4f));
+    for(int32 I=0;I<Source.LightCount;++I) {
+        const uint32 Bit=Next[Source.LightIds[I]];const int32 Slot=FMath::CountTrailingZeros(Bit);
+        FMemory::Memcpy(Pixels.GetData()+(Slot+1)*8,Source.Pixels.GetData()+(I+1)*8,8*sizeof(FVector4f));
+    }
+    Rows=MoveTemp(Next);return true;
+}
 namespace {
 bool Scalar(const TSharedPtr<FJsonObject>& J,const TCHAR* Name,double& Out,double Limit=1e8) {
     return J->TryGetNumberField(Name,Out) && FMath::IsFinite(Out) && FMath::Abs(Out)<=Limit;

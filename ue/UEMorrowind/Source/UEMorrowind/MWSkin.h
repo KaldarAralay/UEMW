@@ -5,6 +5,18 @@
 struct FMWMeshData;
 class UTexture2D;
 class UMaterialInstanceDynamic;
+class FTexture2DResource;
+// One owned payload per native apply, retained until the RHI consumes it.
+// This groups uploads only; every original palette is still submitted exactly.
+class FMWPaletteUploadBatch {
+public:
+    bool Add(UTexture2D* Texture,const TArray<float>& Palette);
+    void Submit();
+private:
+    struct FRegion {FTexture2DResource* Resource;int32 Rows,Offset;};
+    TArray<FRegion> Regions;
+    TArray<uint8> Pixels;
+};
 UCLASS()
 class UMWNativeSkinComponent : public UStaticMeshComponent {
     GENERATED_BODY()

@@ -46,6 +46,9 @@ using FMWResourceIdentity=TSharedPtr<const FString,ESPMode::ThreadSafe>;
 struct FMWTextureStage {int32 Slot=0,Clamp=3,Filter=2,UVSet=0;bool Supported=true;FString Texture,FrameGroup;TArray<FString> Frames;TArray<float> Bump;};
 struct FMWTextureEffectState {float Values[16]{};bool operator==(const FMWTextureEffectState& Other) const {return FMemory::Memcmp(Values,Other.Values,sizeof(Values))==0;}};
 struct FMWMeshData {
+    // Immutable catalog key; worker snapshots borrow this owned string rather
+    // than copying/hashing every resident asset on the game thread.
+    TSharedPtr<const FString,ESPMode::ThreadSafe> ResidentAssetKey;
     FMWResourceIdentity Continuity;
     TArray<FVector> Vertices;
     TArray<FVector> Normals;
@@ -192,10 +195,18 @@ public:
     void SetExteriorFidelity(bool Enabled);
     void SetExteriorFog(bool Enabled);
     UPROPERTY() TMap<FString,UMaterialInstanceDynamic*> NativeLightFunctions;
+    bool NativeLightMembershipCache=true;
+    bool WorkerResidentIndex=true;
+    bool NativeStableLightRows=true;
+    TMap<FString,uint32> NativeLightTextureRows;
+    TArray<FString> NativeLightTextureIds;
+    TArray<FVector4f> NativeLightUploadPixels;
+    mutable TMap<TWeakObjectPtr<UMaterialInstanceDynamic>,uint64> NativeLightParameterKeys;
+    mutable uint64 NativeLightParameterWrites=0,NativeLightParameterSkips=0;
     UPROPERTY() UMaterialInterface* NativeAttenuationMaterial=nullptr;
     void SetLightingFidelity(bool Enabled);
     void SetStableLighting(bool Enabled);
-    void ApplyNativeLightSet(UMaterialInstanceDynamic* Material,const FMWMeshData& Mesh) const;
+    void ApplyNativeLightSet(UMaterialInstanceDynamic* Material,const FMWMeshData& Mesh,const TMap<FString,uint32>* Rows=nullptr) const;
     int32 NativeLightSetInterior=-1;
     int32 NativeLightSetExterior=-1;
     bool BackgroundGeometryVisible=true; // explicit opt-in visual diagnostic

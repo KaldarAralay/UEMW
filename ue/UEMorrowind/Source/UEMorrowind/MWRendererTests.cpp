@@ -502,6 +502,27 @@ bool FMWLightingTest::RunTest(const FString&) {
     auto* Cube=LoadObject<UTextureCube>(nullptr,TEXT("/Game/UEMW/Materials/MW_InteriorAmbientProbe.MW_InteriorAmbientProbe"));TestNotNull(TEXT("Isotropic indoor ambient cube is cooked"),Cube);
     V->NativeInteriorSky->SetCubemap(Cube);V->ActiveCellKey=TEXT("interior");V->SceneEpoch=TEXT("owned-light-test");
     FMWEnvironmentState E;E.Pixels.SetNumZeroed(8*33);E.Pixels[0]=FVector4f(.1,.2,.3,1);E.Pixels[4].Y=7168;E.LightCount=3;E.LightIds={TEXT("a"),TEXT("b"),TEXT("c")};
+    {
+        FMWEnvironmentState Source;Source.Pixels.SetNumZeroed(8*33);Source.Pixels[0]=FVector4f(.13,.27,.59,1);Source.LightCount=32;
+        for(int32 I=0;I<32;++I){Source.LightIds.Add(FString::Printf(TEXT("row-%d"),I));for(int32 J=0;J<8;++J)Source.Pixels[(I+1)*8+J]=FVector4f(I+.25f,J+.5f,I*8+J,1);}
+        const auto Original=Source.Pixels;TMap<FString,uint32> Rows;TArray<FVector4f> Packed;
+        TestTrue(TEXT("A full original light table fits all GPU slots"),MWLayoutNativeLights(Source,Rows,Packed));
+        TestTrue(TEXT("Initial row layout leaves all source texels exact"),Packed==Original && Source.Pixels==Original);
+        Source.LightCount=1;Source.LightIds={TEXT("row-31")};for(int32 J=0;J<8;++J)Source.Pixels[8+J]=Original[32*8+J];
+        TestTrue(TEXT("A surviving high-slot light remains valid after the source shrinks"),MWLayoutNativeLights(Source,Rows,Packed));
+        TestEqual(TEXT("Shrinking the source cannot shift a survivor's material-mask bit"),Rows[TEXT("row-31")],uint32(1u<<31));
+        for(int32 J=0;J<8;++J)TestTrue(TEXT("Every high-slot light texel retains its original value"),Packed[32*8+J]==Original[32*8+J]);
+        TestTrue(TEXT("Vacated GPU slots are disabled instead of retaining retired lighting"),Packed[8]==FVector4f(0,0,0,0) && Packed[16]==FVector4f(0,0,0,0));
+        Source.LightCount=2;Source.LightIds={TEXT("replacement"),TEXT("row-31")};for(int32 J=0;J<8;++J){Source.Pixels[8+J]=FVector4f(100+J,200,300,1);Source.Pixels[16+J]=Original[32*8+J];}
+        const auto Input=Source.Pixels;TestTrue(TEXT("A new original light can reuse a vacant slot"),MWLayoutNativeLights(Source,Rows,Packed));
+        TestEqual(TEXT("A new light uses the freed low slot without shifting the survivor"),Rows[TEXT("replacement")],uint32(1));
+        for(int32 J=0;J<8;++J)TestTrue(TEXT("Replacement and survivor rows copy every captured channel exactly"),Packed[8+J]==Input[8+J] && Packed[32*8+J]==Input[16+J]);
+        TestTrue(TEXT("GPU layout cannot reorder or alter the authoritative source table"),Source.Pixels==Input && Source.LightIds[0]==TEXT("replacement"));
+        TestTrue(TEXT("The reference layout can restore compact source row order"),MWLayoutNativeLights(Source,Rows,Packed,false));
+        TestEqual(TEXT("Reference row assignment really shifts the survivor"),Rows[TEXT("row-31")],uint32(2));
+        Source.LightCount=0;Source.LightIds.Empty();TestTrue(TEXT("All native removals clear the GPU membership"),MWLayoutNativeLights(Source,Rows,Packed) && Rows.Num()==0);
+        for(int32 I=8;I<Packed.Num();++I)TestTrue(TEXT("No retired light survives a completely empty source"),Packed[I]==FVector4f(0,0,0,0));
+    }
     for(int32 I=0;I<3;++I){auto* R=&E.Pixels[(I+1)*8];R[0]=FVector4f(100+I*20,0,20,2);R[1].W=1;R[2]=FVector4f(1,.5,.25,256);R[4].X=1;}
     E.Pixels[16].W=3; // Exercise the shared point/spot path, not only point lights.
     V->UpdateNativeLighting(E);TestTrue(TEXT("Indoor fill uses converted native display ambient"),FMath::IsNearlyEqual(V->NativeInteriorSky->Intensity,MWNativeDisplayToLinear(.3f)));
@@ -524,6 +545,26 @@ bool FMWLightingTest::RunTest(const FString&) {
     TestTrue(TEXT("Native light component survives packet row reordering"),V->NativeLights[2]==NativeA);
     TestTrue(TEXT("Native attenuation function retains the same reference owner after reordering"),V->NativeLightFunctions.FindRef(TEXT("a"))==FunctionA);
     TestEqual(TEXT("Object light mask follows reordered native rows without changing source membership"),Surface->K2_GetVectorParameterValue(TEXT("NativeLightMask")).R,6.f);
+    {
+        const auto SavedIds=V->NativeLightIds;V->NativeLightIds.Empty();TMap<FString,uint32> Rows;
+        for(int32 I=0;I<32;++I){auto Id=FString::Printf(TEXT("owned-mask-%d"),I);V->NativeLightIds.Add(Id);Rows.Add(Id,1u<<I);}
+        for(int32 Phase=0;Phase<64;++Phase) {
+            FMWMeshData Membership;Membership.HaveNativeLightSet=true;Membership.NativeLightSet.Add(TEXT("absent"));
+            for(int32 I=0;I<32;++I)if((I+Phase)%7==0 || I==31)Membership.NativeLightSet.Add(V->NativeLightIds[I]);
+            V->ApplyNativeLightSet(Surface,Membership);const auto Expected=Surface->K2_GetVectorParameterValue(TEXT("NativeLightMask"));
+            const auto Writes=V->NativeLightParameterWrites,Skips=V->NativeLightParameterSkips;
+            V->ApplyNativeLightSet(Surface,Membership,&Rows);TestTrue(TEXT("Indexed native masks preserve all 32 bits and absent-light membership"),Surface->K2_GetVectorParameterValue(TEXT("NativeLightMask"))==Expected);
+            TestTrue(TEXT("Unchanged effective parameters bypass all material setter scans"),V->NativeLightParameterWrites==Writes && V->NativeLightParameterSkips==Skips+1);
+            V->NativeLightMembershipCache=false;V->ApplyNativeLightSet(Surface,Membership,&Rows);TestEqual(TEXT("The explicit reference really writes identical parameters"),V->NativeLightParameterWrites,Writes+1);V->NativeLightMembershipCache=true;
+        }
+        FMWMeshData Changed;Changed.HaveNativeLightSet=true;Changed.NativeLightSet={V->NativeLightIds[0]};V->ApplyNativeLightSet(Surface,Changed);
+        Changed.NativeLightSet={V->NativeLightIds[31]};V->ApplyNativeLightSet(Surface,Changed,&Rows);
+        TestEqual(TEXT("A partial cache update installs a changed high-bit mask"),Surface->K2_GetVectorParameterValue(TEXT("NativeLightMask")).G,32768.f);
+        TestEqual(TEXT("Mask-only changes preserve native interior diffuse mode"),Surface->K2_GetScalarParameterValue(TEXT("NativeInteriorDiffuse")),1.f);
+        Changed.NativeSunActive=false;V->ApplyNativeLightSet(Surface,Changed,&Rows);TestEqual(TEXT("Sun eligibility updates independently of an unchanged mask"),Surface->K2_GetScalarParameterValue(TEXT("NativeObjectSun")),0.f);
+        V->LightingFidelityEnabled=false;V->ApplyNativeLightSet(Surface,Changed,&Rows);TestEqual(TEXT("Lighting-mode changes update their scalar flags independently"),Surface->K2_GetScalarParameterValue(TEXT("NativeLightSetActive")),0.f);TestEqual(TEXT("Inactive native diffuse clears while its mask remains exact"),Surface->K2_GetScalarParameterValue(TEXT("NativeInteriorDiffuse")),0.f);
+        V->LightingFidelityEnabled=true;V->NativeLightIds=SavedIds;V->ApplyNativeLightSet(Surface,NativeSurface);
+    }
     E.Pixels[25].W=0;V->UpdateNativeLighting(E);TestEqual(TEXT("A native-disabled light immediately loses intensity"),V->NativeLights[2]->Intensity,0.f);TestFalse(TEXT("Native-disabled light loses its shadow"),V->NativeShadowIds.Contains(TEXT("a")));
     V->ActiveCellKey=TEXT("exterior:0,0");V->UpdateNativeLighting(E);TestFalse(TEXT("Interior ambient never remains active outside"),V->InteriorProbeActive);
     TestEqual(TEXT("Sun shadow volume follows the actual captured native horizon"),V->NativeSun->DynamicShadowDistanceMovableLight,7168.f);
@@ -1397,8 +1438,9 @@ bool FMWMaterialValueTest::RunTest(const FString&) {
     }else AddError(TEXT("Cold material actor missing"));
     View->Destroy();return true;
 }
-static void MWCheckMutableGPU(FAutomationTestBase& Test,UWorld* World) {
+static void MWCheckMutableGPU(FAutomationTestBase& Test,UWorld* World,bool Cached) {
     auto* Owner=World->SpawnActor<AActor>();auto* Native=NewObject<UMWMutableMeshComponent>(Owner);auto* Reference=NewObject<UProceduralMeshComponent>(Owner);
+    Native->NativeCachedDraws=Cached;
     auto* Base=LoadObject<UMaterialInterface>(nullptr,TEXT("/Game/UEMW/Materials/MW_Opaque.MW_Opaque"));auto* M=UMaterialInstanceDynamic::Create(Base,Owner);
     M->SetTextureParameterValue(TEXT("NativeEnvironment"),MWFloatTexture(8,33,{}));M->SetScalarParameterValue(TEXT("NativeLit"),0);M->SetScalarParameterValue(TEXT("NativeFog"),0);M->SetScalarParameterValue(TEXT("NativeEffectQuality"),0);
     auto* Texture=UTexture2D::CreateTransient(2,2,PF_B8G8R8A8);Texture->SRGB=false;Texture->NeverStream=true;
@@ -1408,12 +1450,16 @@ static void MWCheckMutableGPU(FAutomationTestBase& Test,UWorld* World) {
     auto* Target=UKismetRenderingLibrary::CreateRenderTarget2D(World,64,64,RTF_RGBA16f,FLinearColor::Black,false);auto* Capture=NewObject<USceneCaptureComponent2D>(Owner);Capture->SetWorldLocationAndRotation(FVector(0,0,500),FRotator(-90,0,0));Capture->TextureTarget=Target;Capture->CaptureSource=SCS_SceneColorHDRNoAlpha;Capture->bCaptureEveryFrame=false;Capture->bCaptureOnMovement=false;Capture->PrimitiveRenderMode=ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;Capture->RegisterComponent();
     auto Image=[&](UPrimitiveComponent* Component){World->SendAllEndOfFrameUpdates();Capture->ShowOnlyComponents={Component};Capture->CaptureScene();FlushRenderingCommands();TArray<FLinearColor> Pixels;Target->GameThread_GetRenderTargetResource()->ReadLinearColorPixels(Pixels);return Pixels;};
     TArray<FLinearColor> Initial;
-    for(int32 Phase=0;Phase<4;++Phase) {
+    for(int32 Phase=0;Phase<5;++Phase) {
         if(Phase==1){P[0].X+=90;N[0]=FVector(.2,0,1).GetSafeNormal();}
         if(Phase==2)UV[0]=FVector2D(.8,.8);
         if(Phase==3)C[0]=FLinearColor(.1,.4,.2,1);
+        if(Phase==4) {
+            auto* Flip=UTexture2D::CreateTransient(2,2,PF_B8G8R8A8);Flip->SRGB=false;Flip->NeverStream=true;
+            const FColor Pixels[]={FColor::Cyan,FColor::Yellow,FColor::Magenta,FColor::Black};auto& B=Flip->GetPlatformData()->Mips[0].BulkData;void* D=B.Lock(LOCK_READ_WRITE);FMemory::Memcpy(D,Pixels,sizeof(Pixels));B.Unlock();Flip->UpdateResource();M->SetTextureParameterValue(TEXT("SpriteTexture"),Flip);
+        }
         Test.TestTrue(TEXT("Owned mutable native update succeeds"),Native->UpdateNativeSection(P,N,UV,{},{},C));
-        if(Phase)Test.TestEqual(TEXT("Only the actually changed native channels are scheduled"),int32(Native->LastUploadMask),Phase==1?3:Phase==2?4:8);
+        if(Phase)Test.TestEqual(TEXT("Only the actually changed native channels are scheduled"),int32(Native->LastUploadMask),Phase==1?3:Phase==2?4:Phase==3?8:0);
         Reference->UpdateMeshSection_LinearColor(0,P,N,UV,C,T,false);
         const auto A=Image(Native),B=Image(Reference);Test.TestEqual(TEXT("Both real GPU paths return the whole image"),A.Num(),4096);Test.TestEqual(TEXT("Reference image extent matches"),B.Num(),A.Num());
         Test.TestTrue(TEXT("Ordinary mutable world geometry retains occlusion queries"),Native->SceneProxy && Native->SceneProxy->CanBeOccluded());
@@ -1486,7 +1532,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FMWVertexAttributeTest,"UEMW.Renderer.NativeVer
 bool FMWVertexAttributeTest::RunTest(const FString&) {
     UWorld* World=nullptr;for(const auto& Context:GEngine->GetWorldContexts())if(Context.WorldType==EWorldType::Game && Context.World()){World=Context.World();break;}
     if(!World){AddError(TEXT("Runtime test world missing"));return false;}
-    if(FApp::CanEverRender())MWCheckMutableGPU(*this,World);
+    if(FApp::CanEverRender()){MWCheckMutableGPU(*this,World,true);MWCheckMutableGPU(*this,World,false);}
     auto* View=World->SpawnActorDeferred<AMWLive>(AMWLive::StaticClass(),FTransform::Identity,nullptr,nullptr,ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
     if(!View){AddError(TEXT("Rendering actor missing"));return false;}
     View->AssetsPath=MWFixtureRoot();View->CreateGeometryMaterial();const FString Name=TEXT("catalog-native-attributes.json");View->LoadCatalog(Name);
@@ -2449,7 +2495,14 @@ bool FMWSkinGPUFixture::RunTest(const FString&) {
         if(Phase==5){Bones[3]=-40;Bones[15]=60;Bones[19]=-40;}
         P.Reset();N.Init(FVector::UpVector,3);
         for(int32 I=0;I<3;++I){const int32 B=int32(D.SkinWeights[I].X)*12;const double W=D.SkinWeights[I].Y;const auto& V=D.Vertices[I];const FVector Q((Bones[B]*V.X+Bones[B+1]*V.Y+Bones[B+2]*V.Z+Bones[B+3])*W,(Bones[B+4]*V.X+Bones[B+5]*V.Y+Bones[B+6]*V.Z+Bones[B+7])*W,(Bones[B+8]*V.X+Bones[B+9]*V.Y+Bones[B+10]*V.Z+Bones[B+11])*W);P.Add(Q);}
-        TestTrue(TEXT("Current native palette is uploaded"),MWUploadPalette(Palette,Bones));
+        // Distinct row counts and payload offsets share one command. Poison
+        // the caller's palette after Add: the queued upload must own a copy.
+        auto* OtherPalette=MWFloatTexture(4,1,{});FMWPaletteUploadBatch Uploads;
+        const TArray<float> Other={1,0,0,900,0,1,0,-900,0,0,1,0};
+        TestTrue(TEXT("A separate native palette joins the upload batch"),Uploads.Add(OtherPalette,Other));
+        TestTrue(TEXT("Current native palette joins the shared upload"),Uploads.Add(Palette,Bones));
+        TestTrue(TEXT("A repeated texture can follow another palette without corrupting its bytes"),Uploads.Add(OtherPalette,Other));
+        const auto SavedBones=Bones;for(float& Value:Bones)Value=99999;Uploads.Submit();Uploads.Submit();Bones=SavedBones;
         // Match the static vertex format/colour conversion while independently
         // baking the expected weighted pose on the CPU, without a skin shader.
         FMWMeshData RefData=D;RefData.Vertices=P;RefData.SkinBones=0;RefData.SkinUVs.Empty();RefData.SkinWeights.Empty();

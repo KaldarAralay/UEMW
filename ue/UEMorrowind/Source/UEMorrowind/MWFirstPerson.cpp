@@ -65,6 +65,7 @@ void AMWLive::ApplyFirstPersonLane(const FMWCameraSample& Sample,double Now) {
             Existing && !Existing->UseNativeBounds && MID && Mesh && Template && MID->GetMaterial()==Template->GetMaterial() && ViewCachedAssets.Contains(Row.Asset) &&
             !D->SkinBones && !D->NativeVertices && !D->Transparent && !D->Lines && !Row.Pose.Palette.Num()) {
             MID->ClearParameterValues();MID->CopyInterpParameters(Template);MID->SetScalarParameterValue(TEXT("NativeViewActive"),0);
+            NativeLightParameterKeys.Remove(TWeakObjectPtr<UMaterialInstanceDynamic>(MID));
             Existing->SetStaticMesh(Mesh);Existing->SetMaterial(0,MID);MWNativeDrawLayer(Existing,*D);SetNativeCastShadow(Existing,*D);
             SetInstanceAsset(Row.Id,Row.Asset);LastRigidTransforms.Remove(Row.Id);NativeResourceInvalidations.Add(Row.Id);
         }

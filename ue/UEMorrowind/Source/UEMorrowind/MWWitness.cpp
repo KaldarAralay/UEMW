@@ -14,6 +14,7 @@
 #include "MWFrame.h"
 #include "MWTextureStages.h"
 #include "MWSkin.h"
+#include "MWMutableMesh.h"
 #include "Camera/CameraComponent.h"
 #include "Engine/Texture2D.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -81,6 +82,9 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetNumberField(TEXT("rigid_component_pose_updates"),(double)RigidComponentPoseUpdates);
     Out->SetNumberField(TEXT("rigid_buffer_updates"),(double)RigidBufferUpdates);
     Out->SetBoolField(TEXT("mutable_scratch"),MutableScratchEnabled);
+    int32 CachedMutable=0,DynamicMutable=0;
+    for(const auto& Pair:GeometryComponents)if(const auto* C=Cast<UMWMutableMeshComponent>(Pair.Value)){if(C->UsesCachedNativeDraws())++CachedMutable;else ++DynamicMutable;}
+    Out->SetNumberField(TEXT("mutable_cached_draw_components"),CachedMutable);Out->SetNumberField(TEXT("mutable_dynamic_draw_components"),DynamicMutable);
     Out->SetNumberField(TEXT("scene_primitives_retiring"),RetiredScenePrimitives.Num());
     Out->SetNumberField(TEXT("scene_primitives_retired"),(double)ScenePrimitivesRetired);
     Out->SetNumberField(TEXT("prepared_mesh_builds"),(double)PreparedMeshBuilds);
@@ -173,6 +177,12 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetBoolField(TEXT("interior_ambient_probe"),InteriorProbeActive);
     Out->SetBoolField(TEXT("interior_probe_ready"),NativeInteriorSky && NativeInteriorSky->NativeProbeReady());
     Out->SetNumberField(TEXT("shadow_selection_changes"),(double)ShadowSelectionChanges);
+    Out->SetBoolField(TEXT("native_light_membership_cache"),NativeLightMembershipCache);
+    Out->SetBoolField(TEXT("worker_resident_index"),WorkerResidentIndex);
+    Out->SetBoolField(TEXT("native_stable_light_rows"),NativeStableLightRows);
+    auto LightSlots=MakeShared<FJsonObject>();for(const auto& Pair:NativeLightTextureRows)LightSlots->SetNumberField(Pair.Key,FMath::CountTrailingZeros(Pair.Value));Out->SetObjectField(TEXT("native_light_texture_slots"),LightSlots);
+    Out->SetNumberField(TEXT("native_light_parameter_writes"),(double)NativeLightParameterWrites);
+    Out->SetNumberField(TEXT("native_light_parameter_skips"),(double)NativeLightParameterSkips);
     TArray<TSharedPtr<FJsonValue>> ShadowIds,LightIds;
     for(const auto& Id:NativeShadowIds)ShadowIds.Add(MakeShared<FJsonValueString>(Id));
     for(const auto& Id:NativeLightIds)LightIds.Add(MakeShared<FJsonValueString>(Id));

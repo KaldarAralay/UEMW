@@ -1,5 +1,34 @@
 # Rendering hitches and transient visibility
 
+## Warm CPU submission and light-material updates (hitch07)
+
+The packaged build dated **2026-11-07T17:22:23.9146097Z**, executable SHA-256 **B3B8772C710F1C9117D0356B088D9C88322644D0F0320A0ED6DCD3F81E27A2C3**, reduces the observed warm CPU tail while retaining the normal visuals and original rendering. Two **normal, untraced 60-second walking-and-turning runs**, each reloading the same disposable Seyda Neen checkpoint, measure:
+
+| Metric, median / p95 / maximum in ms | First run | Reloaded repeat |
+| --- | --- | --- |
+| Game-thread frame interval | 16.667 / 16.667 / **35.122** | 16.667 / 16.667 / **27.368** |
+| Actor work | 6.263 / 9.407 / 33.492 | 6.383 / 9.371 / 26.153 |
+| Previous GPU timestamp duration | 2.860 / 3.905 / 5.151 | 2.794 / 3.992 / 5.113 |
+
+All **80 exact eighteen-section weapon observations and eight draws** pass, with zero resource-rebind hides. Draw observations take 394–523 ms including original animation and polling. D3D12/SM5, the RHI thread, mimalloc, native lighting/shadows/effects, original rendering and the normal 60 cap remain. The viewport is 1024x768 and observed VSync is on. Trace, CPU-thread probes, recording and presentation-statistics collection are off. These are CPU intervals/scopes and GPU timestamps, **not displayed FPS or input-to-photon measurements**.
+
+No 45 ms interval occurs in these two minutes, but **the remaining 35.122 ms interval is still a hitch**. This is a bounded improvement, not universal stall elimination or locked 60. The preceding pso01 normal run reached 45.358 ms over thirty seconds in a fixed view; duration, native time, view and allocation history differ, so that historical comparison does not isolate any one change. A turning diagnostic in this investigation genuinely reproduced **45.216 ms**, including a 41.143 ms actor scope and 38.836 ms main geometry application. One skin submission occupied 27.447 ms, without a deeper timer identifying its exact cause. Later traced tails repeatedly stacked native light-mask rebinding (roughly 9–12 ms) with catalog/application work. Optional Windows thread-time/cycle counts confirmed real scheduled work in the sampled slow actor ticks; thread-time quantization prevents exact per-frame CPU attribution.
+
+The implementation makes these changes:
+
+- Opaque/masked mutable native triangles use cached draw commands while retaining current native vertex-channel updates and bounds. Transparent/background submissions retain their dynamic path. Native deformation cannot reuse cached shadow maps. The first owned GPU attempt produced no geometry because LOD/GPU-scene setup was incomplete; it was rejected and corrected before acceptance.
+- Native bone palettes share one owned byte payload/render command per geometry apply. Every changed palette remains exact, with bytes retained through RHI consumption. Repeated skin bounds avoid redundant transform notifications.
+- Native light identities retain GPU texture slots across list changes. Vacated slots are disabled and replacements reuse them; the source environment table and native UE light-component order stay unchanged. An indexed membership calculation and weak-material parameter cache avoid unchanged setters; mask-only changes avoid redundant scalar searches. Copy/reset paths invalidate the relevant parameter keys.
+- Resident catalog snapshots capture immutable asset-name references and current classification bytes. Lookup-set/map construction runs on the loader worker, without accessing live actor maps or UObjects there. Classification, cancellation, incomplete resources, retirement and pose-freshness fences remain.
+
+The evidence supports narrower conclusions too. Matched same-binary cached/dynamic controls lower mesh-gather median/p95 from **0.1464/0.2294 ms** to **0.1122/0.1435 ms**, but both controls have CPU maxima below 25 ms; cached drawing alone does not explain the historic 45 ms tail. Targeted light-rebind samples fall from approximately **9.2–12.0 ms** to **5.1–6.8 ms** in subsequent traces, with only two or three such events per collection. The final resident-index trace places its **2.43–2.89 ms** construction scopes on background workers. Remaining game-thread catalog adoption/application still reaches 7.293 ms in that trace. These samples do not promise a hard whole-frame budget.
+
+Earlier candidates and failed checks are retained. An instrumented turning run reaches **113.490 ms** even though its largest engine-frame sample has only 1.076 ms of actor work; it must not be presented as a resolved skin-only stall. The pre-index normal candidate measures **36.758/32.908 ms** maxima. A first palette-batch headless check rejected missing NullRHI resources and consequently failed dependent tests; the headless path now validates logical inputs without submitting nonexistent GPU work, and the complete suite is rerun. Decoded-frame cleanup was measured at at most 0.330 ms in its diagnostic collection, so no speculative snapshot-retirement queue was added.
+
+Validation includes all **416 source tests**, **39 renderer tests** on both the new resident-index path and its retained reference, and **14 RHI checks**: ten threaded D3D12 cases plus D3D11 first-person, lighting, skin and mutable-vertex cases. The skin fixture batches distinct texture regions/sizes and mutates the caller's palette before queued work consumes it; actual pixels match an independently CPU-baked weighted pose. Mutable GPU comparisons include position/normal, UV, colour and texture changes on both draw paths. Lighting checks cover all 32 mask bits, sparse high slots, replacements/removals, partial flag updates and the full-write reference. The final live check also validates actual material masks against the exact source frame and reported GPU slots. All 32 protected saves and original/private executables/translation DLLs are preserved.
+
+Local evidence: `hitch07-*-live.json`, `hitch07-*-walk-benchmark.json`, `hitch07-*-weapon.json`, preserved traces/runtime logs, `hitch07-matched-render-comparison.json`, `hitch07-*-phases.json`, `hitch07-python-tests.log`, `hitch07-headless*.log`, `hitch07-gpu-results.json` and `hitch07-results.json`. The source archive contains only audited project source. Larger scenes, cold driver caches, long-session memory, native capture latency and sustained GPU/display pacing remain open.
+
 ## First-use pipeline preparation (pso01)
 
 A fresh trace on the weapon01 package reproduced a **547.859 ms** `FD3D12DynamicRHI::RHICreateGraphicsPipelineState` call, a 547.433 ms render-thread wait and a **554.919 ms** engine frame. Actor delta-based health reporting clamps that interval to 400 ms. This is direct evidence of a real first-use driver/pipeline bottleneck, rather than an inference from the earlier untraced cold-loading spikes.

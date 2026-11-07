@@ -23,17 +23,33 @@ void AMWLive::SetLightingFidelity(bool Enabled) {
     for(const auto& Pair:SkinMaterials){ApplyVisualParameters(Pair.Value);if(const auto* Asset=InstanceAssets.Find(Pair.Key))if(const auto* Mesh=MeshData.Find(*Asset))ApplyNativeLightSet(Pair.Value,*Mesh);}
     NativePoseValid=false;
 }
-void AMWLive::ApplyNativeLightSet(UMaterialInstanceDynamic* Material,const FMWMeshData& Mesh) const {
+void AMWLive::ApplyNativeLightSet(UMaterialInstanceDynamic* Material,const FMWMeshData& Mesh,const TMap<FString,uint32>* Rows) const {
     if(!Material)return;
     const bool Exterior=ActiveCellKey.StartsWith(TEXT("exterior:"));
     const bool Active=LightingFidelityEnabled && !VisualReference && (!Exterior || ExteriorFidelityActive()) && Mesh.HaveNativeLightSet && Mesh.Lit && !Mesh.Water && !Mesh.Background && !Mesh.FirstPerson;
+    const bool Bulk=Rows!=nullptr;
+    if(!Rows && NativeLightTextureIds==NativeLightIds)Rows=&NativeLightTextureRows;
     uint32 Mask=0;
-    for(int32 I=0;I<NativeLightIds.Num() && I<32;++I)if(Mesh.NativeLightSet.Contains(NativeLightIds[I]))Mask|=1u<<I;
-    Material->SetVectorParameterValue(TEXT("NativeLightMask"),FLinearColor(Mask&65535,Mask>>16,0,0));
-    Material->SetScalarParameterValue(TEXT("NativeLightSetActive"),Active?1:0);
-    Material->SetScalarParameterValue(TEXT("NativeInteriorDiffuse"),Active && !Exterior && !LightingReferenceMode?1:0);
-    Material->SetScalarParameterValue(TEXT("NativeExteriorDiffuse"),Active && Exterior && !LightingReferenceMode?1:0);
-    Material->SetScalarParameterValue(TEXT("NativeObjectSun"),Mesh.NativeSunActive?1:0);
+    if(Rows){for(const auto& Id:Mesh.NativeLightSet)if(const auto* Bit=Rows->Find(Id))Mask|=*Bit;}
+    else for(int32 I=0;I<NativeLightIds.Num() && I<32;++I)if(Mesh.NativeLightSet.Contains(NativeLightIds[I]))Mask|=1u<<I;
+    const bool InteriorDiffuse=Active && !Exterior && !LightingReferenceMode;
+    const bool ExteriorDiffuse=Active && Exterior && !LightingReferenceMode;
+    const uint64 Parameters=uint64(Mask)|(uint64(Active)<<32)|(uint64(InteriorDiffuse)<<33)|(uint64(ExteriorDiffuse)<<34)|(uint64(Mesh.NativeSunActive)<<35);
+    const TWeakObjectPtr<UMaterialInstanceDynamic> Key(Material);
+    // Only the bulk row-change path may skip. Explicit material refreshes
+    // always write and reseed the key, including definition/feature changes.
+    uint64 Changed=MAX_uint64;
+    if(Bulk && NativeLightMembershipCache)if(const auto* Previous=NativeLightParameterKeys.Find(Key))Changed=*Previous^Parameters;
+    if(!Changed){++NativeLightParameterSkips;return;}
+    static const FName MaskName(TEXT("NativeLightMask")),ActiveName(TEXT("NativeLightSetActive")),InteriorName(TEXT("NativeInteriorDiffuse")),ExteriorName(TEXT("NativeExteriorDiffuse")),SunName(TEXT("NativeObjectSun"));
+    // A light-row change ordinarily changes only the mask. Do not search all
+    // scalar overrides or rebind identical lighting-mode uniforms as well.
+    if(Changed&MAX_uint32)Material->SetVectorParameterValue(MaskName,FLinearColor(Mask&65535,Mask>>16,0,0));
+    if(Changed&(uint64(1)<<32))Material->SetScalarParameterValue(ActiveName,Active?1:0);
+    if(Changed&(uint64(1)<<33))Material->SetScalarParameterValue(InteriorName,InteriorDiffuse?1:0);
+    if(Changed&(uint64(1)<<34))Material->SetScalarParameterValue(ExteriorName,ExteriorDiffuse?1:0);
+    if(Changed&(uint64(1)<<35))Material->SetScalarParameterValue(SunName,Mesh.NativeSunActive?1:0);
+    NativeLightParameterKeys.Add(Key,Parameters);++NativeLightParameterWrites;
 }
 void AMWLive::SetStableLighting(bool Enabled) {
     StableLightingEnabled=Enabled;OutdoorLightingApplied=-1;UpdateOutdoorLighting();NativePoseValid=false;
@@ -157,8 +173,12 @@ void AMWLive::UpdateNativeLighting(const FMWEnvironmentState& Environment) {
     const bool LightRowsChanged=NativeLightIds!=Environment.LightIds || NativeLightSetInterior!=(Interior?1:0) || NativeLightSetExterior!=(ExteriorNative?1:0);
     NativeLights=MoveTemp(Current);NativeLightIds=Environment.LightIds;NativeLightSetInterior=Interior?1:0;NativeLightSetExterior=ExteriorNative?1:0;
     if(LightRowsChanged){
-        for(const auto& Pair:GeometryMaterials)if(const auto* Mesh=MeshData.Find(Pair.Key))ApplyNativeLightSet(Pair.Value,*Mesh);
-        for(const auto& Pair:SkinMaterials)if(const auto* Asset=InstanceAssets.Find(Pair.Key))if(const auto* Mesh=MeshData.Find(*Asset))ApplyNativeLightSet(Pair.Value,*Mesh);
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_RebindLightMembership);
+        // Construct the row lookup once, then visit only each object's actual
+        // native light membership. Most world surfaces have few local lights.
+        TMap<FString,uint32> Rows;if(NativeLightTextureIds==NativeLightIds)Rows=NativeLightTextureRows;else for(int32 I=0;I<NativeLightIds.Num() && I<32;++I)Rows.Add(NativeLightIds[I],1u<<I);
+        for(const auto& Pair:GeometryMaterials)if(const auto* Mesh=MeshData.Find(Pair.Key))ApplyNativeLightSet(Pair.Value,*Mesh,&Rows);
+        for(const auto& Pair:SkinMaterials)if(const auto* Asset=InstanceAssets.Find(Pair.Key))if(const auto* Mesh=MeshData.Find(*Asset))ApplyNativeLightSet(Pair.Value,*Mesh,&Rows);
     }
     LightingReady=true;SetLightingVisible(LightingSceneVisible);
 }

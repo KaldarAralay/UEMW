@@ -13,3 +13,6 @@ struct FMWEnvironmentState {
     int32 LightCount=0,OmittedLights=0;
 };
 bool MWDecodeEnvironment(const TSharedPtr<FJsonObject>& Json,FMWEnvironmentState& Out);
+// GPU-only row assignment. Source order/state remains unchanged; vacant rows
+// are zero and surviving identities retain their slots across budget changes.
+bool MWLayoutNativeLights(const FMWEnvironmentState& Source,TMap<FString,uint32>& Rows,TArray<FVector4f>& Pixels,bool Stable=true);

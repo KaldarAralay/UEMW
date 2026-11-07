@@ -6,6 +6,10 @@
 #include "Engine/StaticMesh.h"
 #include "Misc/FileHelper.h"
 #include "HAL/FileManager.h"
+#include "ProfilingDebugging/CpuProfilerTrace.h"
+#include "TextureResource.h"
+#include "Rendering/Texture2DResource.h"
+#include "RHICommandList.h"
 
 FBoxSphereBounds UMWNativeSkinComponent::CalcBounds(const FTransform& LocalToWorld) const {
     if(UseNativeBounds)return NativeBounds.TransformBy(GetComponentTransform().Inverse()*LocalToWorld);
@@ -31,6 +35,7 @@ void UMWNativeSkinComponent::SetNativeMatrix(const FMatrix& Matrix,const FVector
 
 void UMWNativeSkinComponent::SetNativeBounds(const FVector4f& B) {
     const float Radius=FMath::Max(1.f,B.W);
+    if(NativeBounds.Origin==FVector(B.Y,B.X,B.Z) && NativeBounds.SphereRadius==Radius)return;
     NativeBounds=FBoxSphereBounds(FVector(B.Y,B.X,B.Z),FVector(Radius),Radius);
     UpdateBounds();MarkRenderTransformDirty();
 }
@@ -72,13 +77,30 @@ UMaterialInstanceDynamic* MWMakeSkinMaterial(UObject* Owner,UMaterialInstanceDyn
     return Material;
 }
 bool MWUploadPalette(UTexture2D* Texture,const TArray<float>& Palette) {
-    if(!Texture || Palette.Num()%12 || Palette.Num()/12>Texture->GetSizeY())return false;
+    TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UploadBonePalette);
+    FMWPaletteUploadBatch Batch;if(!Batch.Add(Texture,Palette))return false;Batch.Submit();return true;
+}
+bool FMWPaletteUploadBatch::Add(UTexture2D* Texture,const TArray<float>& Palette) {
+    if(!Texture || Texture->GetSizeX()!=4 || !Palette.Num() || Palette.Num()%12 || Palette.Num()/12>Texture->GetSizeY())return false;
+    if(GUsingNullRHI)return true; // Owned headless tests have no GPU resources.
+    auto* Resource=Texture->GetResource()?Texture->GetResource()->GetTexture2DResource():nullptr;
+    if(!Resource)return false;
     const int32 Rows=Palette.Num()/12;
-    auto* Bytes=new uint8[Rows*64];FMemory::Memzero(Bytes,Rows*64);
+    const int32 Offset=Pixels.AddZeroed(Rows*64);auto* Bytes=Pixels.GetData()+Offset;
     for(int32 Bone=0;Bone<Rows;++Bone)FMemory::Memcpy(Bytes+Bone*64,Palette.GetData()+Bone*12,48);
-    auto* Region=new FUpdateTextureRegion2D(0,0,0,0,4,Rows);
-    Texture->UpdateTextureRegions(0,1,Region,64,16,Bytes,[](uint8* Data,const FUpdateTextureRegion2D* Regions){delete[] Data;delete Regions;});
+    Regions.Add({Resource,Rows,Offset});
     return true;
+}
+void FMWPaletteUploadBatch::Submit() {
+    if(!Regions.Num())return;
+    ENQUEUE_RENDER_COMMAND(UEMW_UpdateBonePalettes)([Regions=MoveTemp(Regions),Pixels=MoveTemp(Pixels)](FRHICommandListImmediate& RHICmdList)mutable {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UpdateBonePalettes);
+        for(const auto& Region:Regions)RHIUpdateTexture2D(Region.Resource->TextureRHI->GetTexture2D(),0,FUpdateTextureRegion2D(0,0,0,0,4,Region.Rows),64,Pixels.GetData()+Region.Offset);
+        // UpdateTexture2D may enqueue work for the separate RHI thread. Keep
+        // the shared byte payload alive past every update, as UE's region API
+        // does, rather than releasing it when this render command returns.
+        RHICmdList.EnqueueLambda([Pixels=MoveTemp(Pixels)](FRHICommandList&){});
+    });
 }
 bool MWUploadFloatPixels(UTexture2D* Texture,int32 Width,int32 Height,const TArray<FVector4f>& Values) {
     if(!Texture || Width!=Texture->GetSizeX() || Height!=Texture->GetSizeY() || Values.Num()!=Width*Height)return false;

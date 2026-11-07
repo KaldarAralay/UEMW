@@ -388,6 +388,7 @@ TSharedPtr<FMWCatalogData,ESPMode::ThreadSafe> MWReadCatalog(const FString& Name
         if(Count==0 || Count>65535 || IndexCount==0 || IndexCount>65535*3 || IndexCount%3 || Bytes.Num()!=12+(int64)Count*Stride+(int64)IndexCount*2) return nullptr;
         if(Distant && Count!=uint32((*Item)->GetNumberField(TEXT("vertices"))))return nullptr;
         FMWMeshData Data;
+        Data.ResidentAssetKey=MakeShared<const FString,ESPMode::ThreadSafe>(Definition.Key);
         Data.Lines=Lines;
         Data.TextureStages=MoveTemp(StageRecipe.TextureStages);Data.TextureApply=StageRecipe.TextureApply;Data.StageUVFile=MoveTemp(StageRecipe.StageUVFile);
         Data.TextureEffectGroup=MoveTemp(StageRecipe.TextureEffectGroup);Data.TextureEffectSupported=StageRecipe.TextureEffectSupported;

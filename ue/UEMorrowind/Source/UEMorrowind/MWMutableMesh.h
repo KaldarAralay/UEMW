@@ -10,7 +10,10 @@ UCLASS()
 class UMWMutableMeshComponent : public UProceduralMeshComponent {
     GENERATED_BODY()
 public:
+    UMWMutableMeshComponent(const FObjectInitializer& Initializer=FObjectInitializer::Get());
     bool NativeBackground=false;
+    bool NativeCachedDraws=true;
+    bool UsesCachedNativeDraws() const;
     uint8 LastUploadMask=0; // position=1, tangent/normal=2, UV=4, colour=8
     uint64 NativeUploadSubmissions=0;
     bool UpdateNativeSection(const TArray<FVector>& Points,const TArray<FVector>& Normals,const TArray<FVector2D>& UVs,const TArray<FVector2D>& Stage1,const TArray<FVector2D>& Stage2,const TArray<FLinearColor>& Colors);

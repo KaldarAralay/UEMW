@@ -376,6 +376,9 @@ struct FMWFrameReader {
 };
 
 AMWLive::AMWLive() {
+    WorkerResidentIndex=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_WORKER_RESIDENT_INDEX"))!=TEXT("0");
+    NativeLightMembershipCache=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_LIGHT_MEMBERSHIP_CACHE"))!=TEXT("0");
+    NativeStableLightRows=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_STABLE_LIGHT_ROWS"))!=TEXT("0");
     MutableScratchEnabled=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_MUTABLE_SCRATCH"))!=TEXT("0");
     PrimaryActorTick.bCanEverTick=true;
     Camera=CreateDefaultSubobject<UCameraComponent>(TEXT("AuthoritativeCamera"));
@@ -577,6 +580,7 @@ void AMWLive::RejectGeometry() {
 }
 
 void AMWLive::ResetScene() {
+    NativeLightParameterKeys.Empty();
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ResetScene);
     const double Began=FPlatformTime::Seconds();
     ON_SCOPE_EXIT {if(PerfSceneResetMs.Num()<120)PerfSceneResetMs.Add((FPlatformTime::Seconds()-Began)*1000);};
@@ -766,13 +770,22 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         Loader.TerrainMaterialKeys.Empty();Loader.TerrainMaterialIndex=0;
         Loader.DefinitionIndex=Loader.MeshIndex=Loader.TextureIndex=Loader.AliasIndex=Loader.TerrainStage=0;Loader.DefinitionBatches=0;Loader.DefinitionTotalMs=Loader.DefinitionMaxMs=0;Loader.Name=Name;Loader.DefinitionsCommitted=Loader.BindingsCommitted=false;Loader.Cancelled=false;Loader.Error.Empty();ResourceError.Empty();PendingTerrainColorPool=PendingTerrainDetailPool=nullptr;
         TSet<FString> KnownMeshes,KnownTextures;TMap<FString,uint8> KnownClassification;
+        using FResidentKey=TSharedPtr<const FString,ESPMode::ThreadSafe>;
+        TArray<TPair<FResidentKey,uint8>> KnownMeshRows;KnownMeshRows.Reserve(WorkerResidentIndex?MeshData.Num():0);
         TArray<FString> IncompleteMeshes;
-        KnownMeshes.Reserve(MeshData.Num());KnownClassification.Reserve(MeshData.Num());
+        if(!WorkerResidentIndex){KnownMeshes.Reserve(MeshData.Num());KnownClassification.Reserve(MeshData.Num());}
         KnownTextures.Reserve(GeometryTextures.Num()+MaskedTextures.Num()+BlendTextures.Num()+DetailTextures.Num()+UpgradedTextureKeys.Num());
         // A catalog may replace another before its material jobs finish. CPU
         // metadata alone is not a completed cache entry: the new catalog must
         // retain work for every definition whose material is still missing.
-        for(const auto& Pair:MeshData){if(GeometryMaterials.Contains(Pair.Key)){KnownMeshes.Add(Pair.Key);const auto& D=Pair.Value;KnownClassification.Add(Pair.Key,(D.FirstPerson?1:0)|(D.Rain?2:0)|(!D.MaterialValueGroup.IsEmpty() || !D.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(D)?4:0)|(D.CelestialKind==4?8:0));}else IncompleteMeshes.Add(Pair.Key);}
+        for(auto& Pair:MeshData)if(GeometryMaterials.Contains(Pair.Key)) {
+            auto& D=Pair.Value;const uint8 Classification=(D.FirstPerson?1:0)|(D.Rain?2:0)|(!D.MaterialValueGroup.IsEmpty() || !D.TextureFrameGroup.IsEmpty() || MWHasAnimatedStages(D)?4:0)|(D.CelestialKind==4?8:0);
+            if(WorkerResidentIndex) {
+                // Manually constructed owned fixtures retain a bounded fallback.
+                if(!D.ResidentAssetKey.IsValid() || *D.ResidentAssetKey!=Pair.Key)D.ResidentAssetKey=MakeShared<const FString,ESPMode::ThreadSafe>(Pair.Key);
+                KnownMeshRows.Emplace(D.ResidentAssetKey,Classification);
+            }else {KnownMeshes.Add(Pair.Key);KnownClassification.Add(Pair.Key,Classification);}
+        }else IncompleteMeshes.Add(Pair.Key);
         const double MeshSnapshotDone=FPlatformTime::Seconds();
         for(const auto& Pair:GeometryTextures)KnownTextures.Add(Pair.Key);
         for(const auto& Pair:MaskedTextures)KnownTextures.Add(Pair.Key+TEXT("|masked"));
@@ -790,7 +803,13 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         const double BindingsSnapshotDone=FPlatformTime::Seconds();
         const FThreadSafeBool* Cancel=&Loader.Cancelled;
         const auto IncomingBindings=SourceBindingCatalog==Name?SourceBindingSnapshot:nullptr;
-        Loader.Future=Async(EAsyncExecution::ThreadPool,[Name,Folder,KnownMeshes=MoveTemp(KnownMeshes),KnownClassification=MoveTemp(KnownClassification),KnownTextures=MoveTemp(KnownTextures),IncompleteMeshes=MoveTemp(IncompleteMeshes),Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool,PoseSourceCatalog,PoseSourceBindings=MoveTemp(PoseSourceBindings),IncomingBindings]()mutable {
+        Loader.Future=Async(EAsyncExecution::ThreadPool,[Name,Folder,KnownMeshRows=MoveTemp(KnownMeshRows),KnownMeshes=MoveTemp(KnownMeshes),KnownClassification=MoveTemp(KnownClassification),KnownTextures=MoveTemp(KnownTextures),IncompleteMeshes=MoveTemp(IncompleteMeshes),Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool,PoseSourceCatalog,PoseSourceBindings=MoveTemp(PoseSourceBindings),IncomingBindings]()mutable {
+            {
+                TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_PrepareResidentIndex);
+                KnownMeshes.Reserve(KnownMeshes.Num()+KnownMeshRows.Num());KnownClassification.Reserve(KnownClassification.Num()+KnownMeshRows.Num());
+                for(const auto& Row:KnownMeshRows){if(*Cancel)return FMWCatalogPtr();KnownMeshes.Add(*Row.Key);KnownClassification.Add(*Row.Key,Row.Value);}
+                KnownMeshRows.Empty();
+            }
             auto Data=MWReadCatalog(Name,Folder,KnownMeshes,KnownTextures,*Cancel,UpgradeFolder,Upgrades,KnownTerrain,KnownPool,&KnownClassification);
             if(Data.IsValid() && IncomingBindings.IsValid() && !MWEqualBindingTables(*IncomingBindings,Data->Bindings))return FMWCatalogPtr();
             if(Data.IsValid() && IncomingBindings.IsValid())Data->BindingSnapshot=IncomingBindings;
@@ -1180,6 +1199,8 @@ bool AMWLive::ApplyTextureEffects() {
 bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<FMWGeometryState>* Native,const TMap<FString,int32>* MaterialFrames,const TMap<FString,FMWMaterialValue>* MaterialValues,const TArray<FMWBinding>* IncomingBindings,const TMap<FString,int32>* IncomingIndex,const TMap<FString,FMWTextureEffectState>* TextureEffects) {
     TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UpdateGeometry);
     TRACE_CPUPROFILER_EVENT_SCOPE_TEXT(AuxiliaryGeometry?TEXT("UEMW_DistantGeometry"):TEXT("UEMW_NativeGeometry"));
+    FMWPaletteUploadBatch PaletteUploads;
+    ON_SCOPE_EXIT {PaletteUploads.Submit();};
     const double GeometryBegan=FPlatformTime::Seconds();double PartBegan=GeometryBegan;GeometryCpuMs.Empty();
     ON_SCOPE_EXIT {
         if(!AuxiliaryGeometry) {
@@ -1274,7 +1295,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
     // Catalog promotion can reorder or add a handful of bindings. Exact old
     // ID/asset/cell matches may still skip component work, but only after byte
     // comparison against THIS fresh source frame and resource invalidations.
-    if(Reuse){Unchanged.Init(false,StateCount);for(int32 I=0;I<StateCount;++I){const auto& B=GeometryBindings[I];const auto& S=(*Native)[I];
+    if(Reuse){TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_CompareNativeStates);Unchanged.Init(false,StateCount);for(int32 I=0;I<StateCount;++I){const auto& B=GeometryBindings[I];const auto& S=(*Native)[I];
         Unchanged[I]=(!RebasedCache || CacheMatches[I]) && (DenseTraits?!(BindingTraits[I]&1):!MeshData[B.Asset].FirstPerson) && MWGeometryStateEqual(Cached[I],S) && !NativeResourceInvalidations.Contains(B.Id) && (HadNativePose || (InstanceSubmitted(B.Id)==S.Visible && (!S.Visible || GeometryResourceReady(B,S))));}}
     if(Native && !EnsureGeometryResources(*Native,Reuse?&Unchanged:nullptr))return false;
     // The complete-world read has no coherent arms-camera capture. While the
@@ -1372,6 +1393,7 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
             auto* Component=SkinnedComponents.FindRef(Id);
             if(Component && AssetChanged){ReleaseGeometryPrimitive(Component);SkinnedComponents.Remove(Id);SkinMaterials.Remove(Id);PaletteTextures.Remove(Id);Component=nullptr;}
             if(!Component) {
+                TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_CreateSkinComponent);
                 auto* Mesh=SharedMeshes.FindRef(Asset);
                 if(!Mesh){Mesh=BuildSharedMesh(Asset);if(!Mesh)return false;SharedMeshes.Add(Asset,Mesh);++NewResources;}
                 auto* Palette=MWFloatTexture(4,Data->SkinBones,{});if(!Palette)return false;PaletteTextures.Add(Id,Palette);
@@ -1384,10 +1406,11 @@ bool AMWLive::UpdateGeometry(const TSharedPtr<FJsonObject>& Packet,const TArray<
                 Component->SetCollisionEnabled(ECollisionEnabled::NoCollision);Component->SetSimulatePhysics(false);SetNativeCastShadow(Component,*Data);Component->SetRenderCustomDepth(Data->Water);Component->SetCustomDepthStencilValue(1);
                 Component->SetNativeBounds(Typed->Bound);Component->RegisterComponent();SkinnedComponents.Add(Id,Component);TrackWaterReflectionMember(Component,Asset);
             }
-            SetPrimitiveShown(Component,true);Component->SetNativeBounds(Typed->Bound);
+            {TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ApplySkinBounds);SetPrimitiveShown(Component,true);Component->SetNativeBounds(Typed->Bound);}
             const auto* PreviousPalette=UploadedBonePalettes.Find(Id);
             if(!PreviousPalette || *PreviousPalette!=Typed->Palette) {
-                if(!MWUploadPalette(PaletteTextures.FindRef(Id),Typed->Palette))return false;
+                TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ApplySkinPalette);
+                if(!PaletteUploads.Add(PaletteTextures.FindRef(Id),Typed->Palette))return false;
                 UploadedBonePalettes.Add(Id,Typed->Palette);BonePoseChanged=true;
             }
             continue;
@@ -1797,6 +1820,18 @@ void AMWLive::ApplyCameraLane() {
 
 void AMWLive::Tick(float Delta) {
     const double TickBegan=FPlatformTime::Seconds();
+#if PLATFORM_WINDOWS
+    static const bool CPUSlices=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_CPU_SLICES"))==TEXT("1");
+    uint64 CyclesBefore=0;FILETIME Created{},Exited{},KernelBefore{},UserBefore{};
+    if(CPUSlices){QueryThreadCycleTime(GetCurrentThread(),&CyclesBefore);GetThreadTimes(GetCurrentThread(),&Created,&Exited,&KernelBefore,&UserBefore);}
+    ON_SCOPE_EXIT {
+        if(CPUSlices && FPlatformTime::Seconds()-TickBegan>.020) {
+            uint64 CyclesAfter=0;FILETIME KernelAfter{},UserAfter{};QueryThreadCycleTime(GetCurrentThread(),&CyclesAfter);GetThreadTimes(GetCurrentThread(),&Created,&Exited,&KernelAfter,&UserAfter);
+            auto Time=[](const FILETIME& T){return ((uint64)T.dwHighDateTime<<32)|T.dwLowDateTime;};
+            UE_LOG(LogTemp,Display,TEXT("UEMW CPU slice seq=%lld wall_ms=%.3f scheduled_ms=%.3f cycles=%llu"),Sequence,(FPlatformTime::Seconds()-TickBegan)*1000,(Time(KernelAfter)+Time(UserAfter)-Time(KernelBefore)-Time(UserBefore))*.0001,CyclesAfter-CyclesBefore);
+        }
+    };
+#endif
     SceneTickBegan=TickBegan;
     ON_SCOPE_EXIT {if(PerfTickMs.Num()<120)PerfTickMs.Add((FPlatformTime::Seconds()-TickBegan)*1000);};
     Super::Tick(Delta);
@@ -2022,7 +2057,13 @@ void AMWLive::Tick(float Delta) {
         return;
     }
     TSharedPtr<FJsonObject> Packet=MoveTemp(Decoded.Packet);
-    ON_SCOPE_EXIT {FrameReader->Recycle(Packet);};
+    ON_SCOPE_EXIT {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_ReleaseDecodedFrame);
+        FrameReader->Recycle(Packet);
+        // Same release order as the former implicit local destructor, now
+        // inside a scope so native snapshot cleanup is visible in traces.
+        Decoded=FMWDecodedFrame();
+    };
     if(PerfDecodeMs.Num()<120)PerfDecodeMs.Add(Decoded.DecodeMs);
     if(PerfManifestReadMs.Num()<120) {
         PerfManifestReadMs.Add(Decoded.ManifestReadMs);PerfManifestJsonMs.Add(Decoded.ManifestJsonMs);PerfChannelReadMs.Add(Decoded.ChannelReadMs);
@@ -2061,7 +2102,11 @@ void AMWLive::Tick(float Delta) {
     SourceBindingSnapshot=Decoded.Bindings;SourceBindingCatalog.Empty();Packet->TryGetStringField(TEXT("scene_catalog"),SourceBindingCatalog);
     UpdatePresentation(Packet); // Bind the original window without activating either application.
     const double ApplyStarted=FPlatformTime::Seconds();
-    if(Decoded.HaveEnvironment && !MWUploadFloatPixels(EnvironmentTexture,8,33,Decoded.Environment.Pixels)) {Status=TEXT("NATIVE ENVIRONMENT UPLOAD FAILED");HideScene();return;}
+    if(Decoded.HaveEnvironment) {
+        TRACE_CPUPROFILER_EVENT_SCOPE(UEMW_UploadEnvironment);
+        if(!MWLayoutNativeLights(Decoded.Environment,NativeLightTextureRows,NativeLightUploadPixels,NativeStableLightRows) || !MWUploadFloatPixels(EnvironmentTexture,8,33,NativeLightUploadPixels)){Status=TEXT("NATIVE ENVIRONMENT UPLOAD FAILED");HideScene();return;}
+        if(NativeLightTextureIds!=Decoded.Environment.LightIds)NativeLightTextureIds=Decoded.Environment.LightIds;
+    }
     if(Decoded.HaveEnvironment)UpdateNativeLighting(Decoded.Environment);
     else {LightingReady=false;SetLightingVisible(false);}
     if(Decoded.HaveEnvironment && BackgroundView) {

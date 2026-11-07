@@ -23,10 +23,14 @@ class FMWMutableProxy final : public FPrimitiveSceneProxy {
     FMaterialRenderProxy* Material;
     FMaterialRelevance Relevance;
     uint32 VertexCount=0;
-    bool NativeBackground=false;
+    bool NativeBackground=false,CachedDraws=false;
 public:
     explicit FMWMutableProxy(UMWMutableMeshComponent* Component)
-        :FPrimitiveSceneProxy(Component),Factory(GetScene().GetFeatureLevel(),"UEMWMutableMesh"),NativeBackground(Component->NativeBackground) {
+        :FPrimitiveSceneProxy(Component),Factory(GetScene().GetFeatureLevel(),"UEMWMutableMesh"),NativeBackground(Component->NativeBackground),CachedDraws(Component->UsesCachedNativeDraws()) {
+        bStaticElementsAlwaysUseProxyPrimitiveUniformBuffer=CachedDraws;
+        if(CachedDraws)EnableGPUSceneSupportFlags();
+        // Native vertices can change without a primitive transform change.
+        bGoodCandidateForCachedShadowmap=false;
         const auto* S=Component->GetProcMeshSection(0);
         auto* M=Component->GetMaterial(0);if(!M)M=UMaterial::GetDefaultMaterial(MD_Surface);
         Material=M->GetRenderProxy();Relevance=M->GetRelevance_Concurrent(GetScene().GetFeatureLevel());
@@ -48,11 +52,19 @@ public:
     // still occludes the rendered sky. Ordinary geometry keeps its queries.
     virtual bool CanBeOccluded() const override {return !NativeBackground && !Relevance.bDisableDepthTest;}
     virtual FPrimitiveViewRelevance GetViewRelevance(const FSceneView* View) const override {
-        FPrimitiveViewRelevance Out;Out.bDrawRelevance=IsShown(View);Out.bDynamicRelevance=true;Out.bShadowRelevance=IsShadowCast(View);
+        FPrimitiveViewRelevance Out;Out.bDrawRelevance=IsShown(View);Out.bDynamicRelevance=!CachedDraws;Out.bStaticRelevance=CachedDraws;Out.bShadowRelevance=IsShadowCast(View);
         Out.bRenderInMainPass=ShouldRenderInMainPass();Out.bRenderCustomDepth=ShouldRenderCustomDepth();Out.bUsesLightingChannels=GetLightingChannelMask()!=GetDefaultLightingChannelMask();
         Relevance.SetPrimitiveViewRelevance(Out);Out.bVelocityRelevance=IsMovable() && Out.bOpaque && Out.bRenderInMainPass;return Out;
     }
+    virtual void DrawStaticElements(FStaticPrimitiveDrawInterface* PDI) override {
+        if(!CachedDraws)return;
+        FMeshBatch Mesh;Mesh.Type=PT_TriangleList;Mesh.LODIndex=0;Mesh.VertexFactory=&Factory;Mesh.MaterialRenderProxy=Material;
+        Mesh.DepthPriorityGroup=SDPG_World;Mesh.ReverseCulling=IsLocalToWorldDeterminantNegative();Mesh.CastShadow=CastsDynamicShadow();
+        auto& E=Mesh.Elements[0];E.IndexBuffer=&Indices;E.FirstIndex=0;E.NumPrimitives=Indices.Indices.Num()/3;E.MinVertexIndex=0;E.MaxVertexIndex=VertexCount-1;
+        E.PrimitiveUniformBuffer=GetUniformBuffer();PDI->DrawMesh(Mesh,FLT_MAX);
+    }
     virtual void GetDynamicMeshElements(const TArray<const FSceneView*>& Views,const FSceneViewFamily&,uint32 Visible,FMeshElementCollector& Collector) const override {
+        if(CachedDraws)return;
         for(int32 I=0;I<Views.Num();++I)if(Visible&(1u<<I)) {
             auto& Mesh=Collector.AllocateMesh();Mesh.Type=PT_TriangleList;Mesh.VertexFactory=&Factory;Mesh.MaterialRenderProxy=Material;
             Mesh.DepthPriorityGroup=SDPG_World;Mesh.ReverseCulling=IsLocalToWorldDeterminantNegative();Mesh.CastShadow=IsShadowCast(Views[I]);
@@ -78,6 +90,10 @@ public:
         if(Mask&8){auto& B=Buffers.ColorVertexBuffer;Upload(B.VertexBufferRHI,B.GetVertexData(),B.GetNumVertices()*B.GetStride());}
     }
 };
+}
+UMWMutableMeshComponent::UMWMutableMeshComponent(const FObjectInitializer& Initializer):Super(Initializer){NativeCachedDraws=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_MUTABLE_CACHED_DRAWS"))!=TEXT("0");}
+bool UMWMutableMeshComponent::UsesCachedNativeDraws() const {
+    const auto* M=GetMaterial(0);return NativeCachedDraws && !NativeBackground && M && (M->GetBlendMode()==BLEND_Opaque || M->GetBlendMode()==BLEND_Masked);
 }
 FPrimitiveSceneProxy* UMWMutableMeshComponent::CreateSceneProxy() {
     const auto* S=GetProcMeshSection(0);if(!S || !S->ProcVertexBuffer.Num() || !S->ProcIndexBuffer.Num() || S->ProcIndexBuffer.Num()%3)return nullptr;
