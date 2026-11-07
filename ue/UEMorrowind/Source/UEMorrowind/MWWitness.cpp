@@ -1,4 +1,5 @@
 #include "MWLive.h"
+#include "MWPipeline.h"
 #include "MWMesh.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/InstancedStaticMeshComponent.h"
@@ -71,6 +72,11 @@ TSharedPtr<FJsonObject> AMWLive::BuildStateWitness(const TArray<FString>& Ids,do
     Out->SetBoolField(TEXT("catalog_classification_matches"),ClassificationMatches && ReferenceSuns==CelestialSunIds);
     Out->SetNumberField(TEXT("catalog_plan_commits"),(double)CatalogPlanCommits);Out->SetNumberField(TEXT("catalog_reference_commits"),(double)CatalogReferenceCommits);Out->SetNumberField(TEXT("empty_rigid_scans_skipped"),(double)EmptyRigidScansSkipped);
     Out->SetBoolField(TEXT("rigid_component_transforms"),RigidComponentTransforms);
+    Out->SetBoolField(TEXT("pso_precaching"),PipelineStateCache::IsPSOPrecachingEnabled());
+    Out->SetBoolField(TEXT("pso_warmup"),PipelineWarmup.IsValid());
+    Out->SetBoolField(TEXT("pso_warmup_ready"),PipelineWarmup && PipelineWarmup->Ready());
+    Out->SetNumberField(TEXT("pso_active_requests"),PipelineStateCache::NumActivePrecacheRequests());
+    if(PipelineWarmup){Out->SetNumberField(TEXT("pso_warmup_queued"),PipelineWarmup->Queued());Out->SetNumberField(TEXT("pso_warmup_pending"),PipelineWarmup->Pending());Out->SetNumberField(TEXT("pso_warmup_submitted"),PipelineWarmup->Submitted);Out->SetNumberField(TEXT("pso_warmup_completed"),PipelineWarmup->Completed);Out->SetNumberField(TEXT("pso_warmup_unavailable"),PipelineWarmup->Unavailable);Out->SetNumberField(TEXT("pso_warmup_submit_max_ms"),PipelineWarmup->MaximumSubmitMs);}
     Out->SetNumberField(TEXT("rigid_component_batches"),RigidComponentSlots.Num());
     Out->SetNumberField(TEXT("rigid_component_pose_updates"),(double)RigidComponentPoseUpdates);
     Out->SetNumberField(TEXT("rigid_buffer_updates"),(double)RigidBufferUpdates);

@@ -4,7 +4,7 @@ Initialize-UEMWEnvironment
 $ProjectRoot=Split-Path -Parent $PSScriptRoot
 $Folder=Join-Path $ProjectRoot 'local\bridge'
 $ExpectedExe=Join-Path $ProjectRoot 'local\client\Windows\UEMorrowind\Binaries\Win64\UEMorrowind.exe'
-$State=Get-Content -LiteralPath (Join-Path $Folder 'renderer-guard.json') -Raw|ConvertFrom-Json
+$State=Read-UEMWAtomicJson -Path (Join-Path $Folder 'renderer-guard.json')
 $RendererId=[int]$State.renderer_pid
 $Renderer=Get-CimInstance Win32_Process -Filter "ProcessId=$RendererId"
 if(!$Renderer){Write-Output 'The UE view is already closed. Original Morrowind was not touched.';return}
@@ -17,7 +17,7 @@ $Request=Join-Path $Folder 'renderer-stop.json'
 Move-Item -LiteralPath "$Request.launch.tmp" -Destination $Request -Force
 $Until=[datetime]::UtcNow.AddSeconds(5)
 do {
-    $Current=Get-Content -LiteralPath (Join-Path $Folder 'renderer-guard.json') -Raw|ConvertFrom-Json
+    $Current=Read-UEMWAtomicJson -Path (Join-Path $Folder 'renderer-guard.json')
     if($Current.run_token -eq $State.run_token -and $Current.event -eq 'stopped'){
         Write-Output "UE view stopped: $($Current.reason). Original Morrowind remains open.";return
     }

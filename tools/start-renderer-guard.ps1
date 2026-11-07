@@ -31,7 +31,10 @@ $Confirmed=$false
 $Until=[datetime]::UtcNow.AddSeconds(5)
 do {
     try {
-        $State=Get-Content -LiteralPath (Join-Path $StateRoot 'renderer-guard.json') -Raw -ErrorAction Stop|ConvertFrom-Json
+        # The guard publishes "started" once using an atomic rename. A
+        # Get-Content handle can deny that rename while this loop is polling,
+        # losing the only acknowledgment despite a healthy guard/renderer.
+        $State=Read-UEMWAtomicJson -Path (Join-Path $StateRoot 'renderer-guard.json')
         if($State.guard_pid -eq $GuardId -and $State.renderer_pid -eq $RendererProcessId -and $State.game_pid -eq $GameProcessId -and $State.event -eq 'started'){$Confirmed=$true;break}
     }catch{}
     Start-Sleep -Milliseconds 100

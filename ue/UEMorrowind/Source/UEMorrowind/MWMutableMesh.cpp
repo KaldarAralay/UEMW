@@ -1,4 +1,5 @@
 #include "MWMutableMesh.h"
+#include "MWPipeline.h"
 #include "PrimitiveSceneProxy.h"
 #include "DynamicMeshBuilder.h"
 #include "LocalVertexFactory.h"
@@ -82,6 +83,8 @@ FPrimitiveSceneProxy* UMWMutableMeshComponent::CreateSceneProxy() {
     const auto* S=GetProcMeshSection(0);if(!S || !S->ProcVertexBuffer.Num() || !S->ProcIndexBuffer.Num() || S->ProcIndexBuffer.Num()%3)return nullptr;
     return new FMWMutableProxy(this);
 }
+void UMWMutableMeshComponent::OnRegister(){Super::OnRegister();PrecachePSOs();}
+void UMWMutableMeshComponent::CollectPSOPrecacheData(const FPSOPrecacheParams& Params,FComponentPSOPrecacheParamsList& Out){MWCollectProceduralPSOs(this,Params,Out,PT_TriangleList);}
 FBoxSphereBounds UMWMutableMeshComponent::CalcBounds(const FTransform& LocalToWorld) const {
     const auto* S=const_cast<UMWMutableMeshComponent*>(this)->GetProcMeshSection(0);FBoxSphereBounds Out=S?FBoxSphereBounds(S->SectionLocalBox).TransformBy(LocalToWorld):FBoxSphereBounds(FVector::ZeroVector,FVector::ZeroVector,0);
     Out.BoxExtent*=BoundsScale;Out.SphereRadius*=BoundsScale;return Out;

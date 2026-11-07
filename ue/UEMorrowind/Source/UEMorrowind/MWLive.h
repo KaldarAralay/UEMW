@@ -8,6 +8,7 @@
 #include "MWRain.h"
 #include "MWReflection.h"
 #include "RenderCommandFence.h"
+#include "MWPipeline.h"
 #include "MWLive.generated.h"
 
 class UCameraComponent;
@@ -267,6 +268,7 @@ public:
     bool GameplayHudVisible() const;
     FVector2D Health,Magicka,Fatigue;
 private:
+    TUniquePtr<FMWPipelineWarmup> PipelineWarmup;
     friend struct FMWDistantView;
     friend struct FMWUIView;
     friend class FMWUITest;

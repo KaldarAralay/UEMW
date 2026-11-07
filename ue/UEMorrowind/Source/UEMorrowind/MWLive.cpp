@@ -1,4 +1,5 @@
 #include "MWLive.h"
+#include "MWPipeline.h"
 #include "HAL/PlatformOutputDevices.h"
 #include "MWDistant.h"
 #include "MWUI.h"
@@ -483,6 +484,10 @@ void AMWLive::BeginPlay() {
     if(AuxiliaryGeometry){Super::BeginPlay();SetActorTickEnabled(false);CreateGeometryMaterial();HideScene();return;}
     BackgroundView=FSceneViewExtensions::NewExtension<FMWBackgroundView>(GetWorld());
     Super::BeginPlay();
+    // Explicit fresh-process comparison. Keep normal draw/proxy behavior;
+    // disabling only our queue would leave component precaching enabled.
+    if(FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_PSO_PREWARM"))==TEXT("0"))
+        if(auto* Var=IConsoleManager::Get().FindConsoleVariable(TEXT("r.PSOPrecaching")))Var->Set(0,ECVF_SetByCode);
     for(const auto* Name:{TEXT("t.IdleWhenNotForeground"),TEXT("Slate.bAllowThrottling")}) {
         if(auto* Var=IConsoleManager::Get().FindConsoleVariable(Name)) Var->Set(0,ECVF_SetByCode);
     }
@@ -516,7 +521,9 @@ void AMWLive::BeginPlay() {
     }else UE_LOG(LogTemp,Error,TEXT("UEMW completed-water fog material is missing"));
     FrameReader=new FMWFrameReader(SnapshotPath);
     CameraReader=new FMWCameraReader(FPaths::GetPath(SnapshotPath)/TEXT("camera.json"));
+    if(FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_PSO_PREWARM"))!=TEXT("0") && PipelineStateCache::IsPSOPrecachingEnabled())PipelineWarmup=MakeUnique<FMWPipelineWarmup>();
     CreateGeometryMaterial();
+    UE_LOG(LogTemp,Display,TEXT("UEMW PSO precaching=%d startup_requests=%d skip_draw=%d proxy_delay=%d"),PipelineStateCache::IsPSOPrecachingEnabled()?1:0,PipelineWarmup?PipelineWarmup->Queued():0,IConsoleManager::Get().FindConsoleVariable(TEXT("r.SkipDrawOnPSOPrecaching"))->GetInt(),IConsoleManager::Get().FindConsoleVariable(TEXT("r.PSOPrecache.ProxyCreationWhenPSOReady"))->GetInt());
     DiagnosticScreenshots=FParse::Param(FCommandLine::Get(),TEXT("UEMWDiagnosticScreenshots"));
     DiagnosticMembership=FParse::Param(FCommandLine::Get(),TEXT("UEMWDiagnosticMembership")) || FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_MEMBERSHIP_DIAGNOSTICS"))==TEXT("1");
     DiagnosticVisibility=FPlatformMisc::GetEnvironmentVariable(TEXT("UEMW_VISIBILITY_DIAGNOSTICS"))==TEXT("1");
@@ -668,6 +675,15 @@ void AMWLive::CreateGeometryMaterial() {
         if(!Base || !Material){UE_LOG(LogTemp,Error,TEXT("UEMW cooked native blend materials missing: %s"),Mode);GeometryBaseMaterial=nullptr;return;}
         GeometryBaseMaterials.Add(Key,Base);
         SkinBaseMaterials.Add(Key,Material);
+        // Start with common families. Warming every unused blend/skin/env
+        // combination can monopolize the driver compiler for over a minute.
+        // Other families are deduplicated/requested when catalog definitions
+        // actually select them, before those definitions can create resources.
+        if(PipelineWarmup && !EnvironmentMap) {
+            const FString Family=Mode;
+            if(Family==TEXT("Opaque") || Family==TEXT("Masked") || Family==TEXT("Foliage") || Family==TEXT("Terrain") || Family==TEXT("Water") || Family==TEXT("Hair") || Family==TEXT("SunGlare"))PipelineWarmup->AddMaterial(Base,Family!=TEXT("SunGlare"),Family==TEXT("Water"));
+            if(Family==TEXT("Opaque") || Family==TEXT("Masked") || Family==TEXT("Hair"))PipelineWarmup->AddMaterial(Material,false,false);
+        }
       }
     }
     GeometryBaseMaterial=GeometryBaseMaterials.FindRef(TEXT("opaque"));
@@ -947,6 +963,7 @@ bool AMWLive::LoadCatalog(const FString& Name) {
         if(!Mesh->TextureEffectGroup.IsEmpty() && Mesh->TextureEffectSupported)Mode+=TEXT("-environment");
         auto* Base=Mesh->SkinBones?SkinBaseMaterials.FindRef(Mode):GeometryBaseMaterials.FindRef(Mode);
         if(!Base)return Fail(TEXT("Native material blend policy is unavailable"));
+        if(PipelineWarmup)PipelineWarmup->AddMaterial(Base,!Mesh->SkinBones && !Mesh->NativeVertices && !Mesh->Lines && !Mesh->FirstPerson,Mesh->Water);
         auto* Material=UMaterialInstanceDynamic::Create(Base,this);
         if(!Material)return Fail(TEXT("Native material allocation failed"));
         ApplyVisualParameters(Material);
@@ -1783,6 +1800,10 @@ void AMWLive::Tick(float Delta) {
     SceneTickBegan=TickBegan;
     ON_SCOPE_EXIT {if(PerfTickMs.Num()<120)PerfTickMs.Add((FPlatformTime::Seconds()-TickBegan)*1000);};
     Super::Tick(Delta);
+    if(PipelineWarmup && !PipelineWarmup->Ready()) {
+        PipelineWarmup->Advance();
+        if(PipelineWarmup->Ready())UE_LOG(LogTemp,Display,TEXT("UEMW PSO startup requests complete submitted=%d completed=%d unavailable=%d submit_max_ms=%.3f"),PipelineWarmup->Submitted,PipelineWarmup->Completed,PipelineWarmup->Unavailable,PipelineWarmup->MaximumSubmitMs);
+    }
     if(DiagnosticColourRamp && FPlatformTime::Seconds()>=DiagnosticColourRampUntil)SetDiagnosticColourRamp(false);
     if(PresentationSamples && GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
         MWPollPresentation(GEngine->GameViewport->Viewport->GetViewportRHI(),PresentationSamples.ToSharedRef());

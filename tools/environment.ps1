@@ -2,6 +2,18 @@
 # the current process environment; it installs nothing and writes no files.
 function Get-UEMWRoot { Split-Path -Parent $PSScriptRoot }
 
+function Read-UEMWAtomicJson {
+    param([Parameter(Mandatory)][string]$Path)
+    # Atomic publishers must be able to replace the name while a reader keeps
+    # its complete previous snapshot open. Never deny FILE_SHARE_DELETE.
+    $JsonStream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try {
+        $JsonReader=[IO.StreamReader]::new($JsonStream)
+        try {$JsonText=$JsonReader.ReadToEnd()}finally{$JsonReader.Dispose()}
+    }finally{$JsonStream.Dispose()}
+    return $JsonText|ConvertFrom-Json
+}
+
 function Get-UEMWAllocatorArgument {
     # UE 5.2.1's built-in mimalloc reduces the measured temporary-page cleanup
     # stall. Garbage collection and memory-trim callbacks remain enabled.

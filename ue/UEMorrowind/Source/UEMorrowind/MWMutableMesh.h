@@ -15,5 +15,7 @@ public:
     uint64 NativeUploadSubmissions=0;
     bool UpdateNativeSection(const TArray<FVector>& Points,const TArray<FVector>& Normals,const TArray<FVector2D>& UVs,const TArray<FVector2D>& Stage1,const TArray<FVector2D>& Stage2,const TArray<FLinearColor>& Colors);
     virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
+    virtual void OnRegister() override;
+    virtual void CollectPSOPrecacheData(const FPSOPrecacheParams& Params,FComponentPSOPrecacheParamsList& Out) override;
     virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
 };

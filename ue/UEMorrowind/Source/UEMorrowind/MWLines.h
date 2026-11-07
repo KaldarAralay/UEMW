@@ -11,4 +11,6 @@ class UMWNativeLineComponent : public UProceduralMeshComponent {
 public:
     bool SetNativeSection(const TArray<FVector>& Points,const TArray<int32>& Carrier,const TArray<FVector2D>& UVs,const TArray<FVector2D>& UV1,const TArray<FVector2D>& UV2,const TArray<FLinearColor>& Colors);
     virtual FPrimitiveSceneProxy* CreateSceneProxy() override;
+    virtual void OnRegister() override;
+    virtual void CollectPSOPrecacheData(const FPSOPrecacheParams& Params,FComponentPSOPrecacheParamsList& Out) override;
 };

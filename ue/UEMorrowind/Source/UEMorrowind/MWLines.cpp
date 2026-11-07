@@ -1,4 +1,5 @@
 #include "MWLines.h"
+#include "MWPipeline.h"
 #include "PrimitiveSceneProxy.h"
 #include "DynamicMeshBuilder.h"
 #include "LocalVertexFactory.h"
@@ -77,3 +78,5 @@ FPrimitiveSceneProxy* UMWNativeLineComponent::CreateSceneProxy() {
     for(int32 I=0;I<S->ProcIndexBuffer.Num();I+=3)if(S->ProcIndexBuffer[I]>=uint32(S->ProcVertexBuffer.Num()) || S->ProcIndexBuffer[I+1]>=uint32(S->ProcVertexBuffer.Num()) || S->ProcIndexBuffer[I+1]!=S->ProcIndexBuffer[I+2])return nullptr;
     return new FMWLineProxy(this);
 }
+void UMWNativeLineComponent::OnRegister(){Super::OnRegister();PrecachePSOs();}
+void UMWNativeLineComponent::CollectPSOPrecacheData(const FPSOPrecacheParams& Params,FComponentPSOPrecacheParamsList& Out){MWCollectProceduralPSOs(this,Params,Out,PT_LineList);}
